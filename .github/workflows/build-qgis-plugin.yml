@@ -39,7 +39,8 @@ jobs:
           rm -rf package
           mkdir -p package/ODN_Tools_Pro
 
-          # Copy only source files needed by the QGIS plugin.
+          # The QGIS-installable ZIP must contain exactly one top-level
+          # plugin directory named ODN_Tools_Pro.
           rsync -a \
             --exclude='.git/' \
             --exclude='.github/' \
@@ -70,10 +71,17 @@ jobs:
               if '=' in line and not line.startswith('#'):
                   k, v = line.split('=', 1)
                   values[k.strip()] = v.strip()
-          assert values.get('name') == 'ODN_Tools_Pro', values
+
+          # QGIS plugin directory and metadata display name are different
+          # concepts. The directory is fixed at ODN_Tools_Pro; the metadata
+          # name is the human-facing plugin name and may contain spaces.
+          assert values.get('name'), values
           assert values.get('version'), values
-          print('Plugin:', values['name'])
+          assert values.get('qgisMinimumVersion'), values
+          print('Plugin directory: ODN_Tools_Pro')
+          print('Plugin name:', values['name'])
           print('Version:', values['version'])
+          print('Minimum QGIS:', values['qgisMinimumVersion'])
           PY
 
       - name: Build inner QGIS plugin ZIP
@@ -86,6 +94,24 @@ jobs:
           unzip -l ODN_Tools_Pro.zip
           unzip -t ODN_Tools_Pro.zip
 
+      - name: Verify inner ZIP layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from zipfile import ZipFile
+          from pathlib import PurePosixPath
+
+          with ZipFile('ODN_Tools_Pro.zip') as zf:
+              names = [n for n in zf.namelist() if n and not n.endswith('/')]
+              assert names, 'Inner ZIP is empty'
+              top = {PurePosixPath(n).parts[0] for n in names}
+              assert top == {'ODN_Tools_Pro'}, top
+              assert 'ODN_Tools_Pro/metadata.txt' in names
+              assert 'ODN_Tools_Pro/__init__.py' in names
+              print('Inner ZIP is directly installable as a QGIS plugin.')
+          PY
+
       - name: Build outer delivery ZIP
         shell: bash
         run: |
@@ -94,6 +120,19 @@ jobs:
           zip ODN_Tools_Pro-QGIS-Plugin.ZIP ODN_Tools_Pro.zip
           unzip -l ODN_Tools_Pro-QGIS-Plugin.ZIP
           unzip -t ODN_Tools_Pro-QGIS-Plugin.ZIP
+
+      - name: Verify outer ZIP layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from zipfile import ZipFile
+
+          with ZipFile('ODN_Tools_Pro-QGIS-Plugin.ZIP') as zf:
+              files = [n for n in zf.namelist() if n and not n.endswith('/')]
+              assert files == ['ODN_Tools_Pro.zip'], files
+              print('Outer delivery ZIP contains ODN_Tools_Pro.zip only.')
+          PY
 
       - name: Upload plugin packages
         uses: actions/upload-artifact@v4
