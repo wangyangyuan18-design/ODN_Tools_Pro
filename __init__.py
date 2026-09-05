@@ -8,7 +8,6 @@ def classFactory(iface):
     """Load the project-driven ODN Tools Pro plugin."""
     from qgis.PyQt.QtGui import QIcon
     from qgis.PyQt.QtWidgets import QAction, QMenu
-
     from .pole_trace_connect import PoleTraceDialog
     from .overlength_pole import OverlengthPoleDialog
     from .odn_project_manager import OdnProjectManager, initialize_project_manager_context
@@ -17,23 +16,14 @@ def classFactory(iface):
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
     from .odn_project_config_fix import install_project_config_fix
-    from .scheme3_route_preview_fix import install_scheme3_route_preview_fix
-    from .scheme3_manual_link_planner import Scheme3Dialog, Scheme3Engine, Scheme3MapTool
-    from .scheme3_launcher import start_link_design
-    from .scheme3_project_ui import install_project_ui_policy
+    from .link_design import LinkDesignDialog
 
-    # The legacy parameter policy was intentionally removed: Link Design now
-    # follows the active ODN Project without exposing a FAT-count ceiling UI.
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
     install_project_config_fix(OdnProjectConfigDialog)
-    install_scheme3_route_preview_fix(Scheme3Dialog, Scheme3Engine, Scheme3MapTool)
-    install_project_ui_policy(Scheme3Dialog)
     initialize_project_manager_context()
 
     class ODNToolsPro:
-        """Main plugin controller."""
-
         def __init__(self, iface):
             self.iface = iface
             self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -47,7 +37,6 @@ def classFactory(iface):
             main_window.menuBar().addMenu(self.menu)
             self.toolbar = self.iface.addToolBar("ODN Tools Pro")
             self.toolbar.setObjectName("ODNToolsProToolbar")
-
             self._add("项目管理", self.project_manager, "icons/project_manager.svg")
             self._add("项目配置", self.project_config, "icons/project_config.svg")
             self._add("杆路轨迹自动连线", self.pole_trace_connect, "icons/pole_trace.svg")
@@ -55,12 +44,9 @@ def classFactory(iface):
             self._add("链路设计", self.link_design, "icons/link_design.svg")
 
         def _add(self, text, callback, icon_relpath):
-            path = os.path.join(self.plugin_dir, icon_relpath)
-            action = QAction(QIcon(path), text, self.iface.mainWindow())
+            action = QAction(QIcon(os.path.join(self.plugin_dir, icon_relpath)), text, self.iface.mainWindow())
             action.triggered.connect(callback)
-            self.menu.addAction(action)
-            self.toolbar.addAction(action)
-            self.actions.append(action)
+            self.menu.addAction(action); self.toolbar.addAction(action); self.actions.append(action)
 
         def project_manager(self):
             OdnProjectManager(self.iface, self.iface.mainWindow()).exec_()
@@ -75,27 +61,25 @@ def classFactory(iface):
             OverlengthPoleDialog(self.iface, self.iface.mainWindow()).exec_()
 
         def link_design(self):
-            self._scheme3_dialog = start_link_design(self.iface, self.iface.mainWindow())
+            self._link_design_dialog = LinkDesignDialog(self.iface, self.iface.mainWindow())
+            self._link_design_dialog.show()
+            self._link_design_dialog.raise_()
+            self._link_design_dialog.activateWindow()
 
         def unload(self):
             for action in self.actions:
-                try:
-                    action.deleteLater()
-                except Exception:
-                    pass
+                try: action.deleteLater()
+                except Exception: pass
             self.actions.clear()
             if self.toolbar is not None:
-                try:
-                    self.iface.mainWindow().removeToolBar(self.toolbar)
-                except Exception:
-                    pass
-            self.toolbar = None
+                try: self.iface.mainWindow().removeToolBar(self.toolbar)
+                except Exception: pass
+                self.toolbar = None
             if self.menu is not None:
                 try:
                     self.iface.mainWindow().menuBar().removeAction(self.menu.menuAction())
                     self.menu.deleteLater()
-                except Exception:
-                    pass
-            self.menu = None
+                except Exception: pass
+                self.menu = None
 
     return ODNToolsPro(iface)
