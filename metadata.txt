@@ -1,0 +1,17 @@
+[general]
+name=ODN Tools Pro
+qgisMinimumVersion=3.40
+description=ODN/FTTH design automation and quality control tools
+author=YUAN
+version=1.5.0
+about=ODN/FTTH design tools for cable naming, connection point naming, multi-node topology naming, cable splitting, validation, interactive pole trace connection and overlength pole insertion.
+category=Vector
+icon=connectionPointNaming.svg
+experimental=False
+deprecated=False
+hasProcessingProvider=no
+server=False
+tags=ODN, FTTH, telecom, fiber, cable, FAT, FDT, closure, branch box, validation, pole, trace, connect, overlength
+homepage=https://github.com/wangyangyuan18-design/ODN_Tools_Pro
+repository=https://github.com/wangyangyuan18-design/ODN_Tools_Pro
+tracker=https://github.com/wangyangyuan18-design/ODN_Tools_Pro/issues
