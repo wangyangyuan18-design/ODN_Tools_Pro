@@ -2,18 +2,16 @@
 """Project-driven overlength pole insertion tool."""
 
 from qgis.PyQt import QtWidgets
-from qgis.PyQt.QtCore import Qt, QVariant
 from qgis.core import (
-    QgsCoordinateTransform, QgsDistanceArea, QgsFeature, QgsField,
-    QgsGeometry, QgsMapLayerType, QgsPointXY, QgsProject, QgsSpatialIndex,
-    QgsVectorLayer, QgsWkbTypes,
+    QgsCoordinateTransform, QgsDistanceArea, QgsFeature, QgsGeometry,
+    QgsMapLayerType, QgsPointXY, QgsProject, QgsSpatialIndex, QgsWkbTypes,
 )
 
 from . import odn_project_context as context
 
 
 class OverlengthPoleDialog(QtWidgets.QDialog):
-    """Insert poles using only the active ODN Project's pole layers and spacing rules."""
+    """Add New Pole features so every Pole Edge span meets project rules."""
 
     def __init__(self, iface, parent=None):
         super().__init__(parent or iface.mainWindow())
@@ -24,7 +22,10 @@ class OverlengthPoleDialog(QtWidgets.QDialog):
         lay.setSpacing(9)
 
         title = QtWidgets.QLabel("超距增点")
-        font = title.font(); font.setBold(True); font.setPointSize(12); title.setFont(font)
+        font = title.font()
+        font.setBold(True)
+        font.setPointSize(12)
+        title.setFont(font)
         lay.addWidget(title)
 
         lay.addWidget(QtWidgets.QLabel("杆子图层（项目配置）"))
@@ -44,8 +45,9 @@ class OverlengthPoleDialog(QtWidgets.QDialog):
         lay.addWidget(self.rule_label)
 
         tip = QtWidgets.QLabel(
-            "以上规则来自当前 ODN Project 配置。超距增点根据 Pole Edge 两端的杆类型自动选择对应规则，"
-            "本功能不提供距离参数修改。新增杆位直接写入当前项目绑定的 New Pole 图层。"
+            "规则来自当前 ODN Project。程序按 Pole Edge 两端杆类型选择对应上限；"
+            "超距时先计算最少需要的新建 New Pole 数量，再在允许范围内均衡分配各段距离。"
+            "新增杆位全部写入项目配置的 New Pole 图层，本功能不提供距离参数修改。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#666; padding:4px 0;")
@@ -147,18 +149,11 @@ class OverlengthPoleDialog(QtWidgets.QDialog):
             return
 
         self.accept()
-        OverlengthPoleProcessor(
-            self.iface,
-            payload,
-            [("Existing Pole", existing), ("New Pole", new)],
-            edge,
-            distance_rules,
-        ).run()
+        OverlengthPoleProcessor(self.iface, payload, [("Existing Pole", existing), ("New Pole", new)], edge, distance_rules).run()
 
 
 class OverlengthPoleProcessor:
     SEARCH_METERS = 3.0
-    IMPROVEMENT_METERS = 5.0
 
     def __init__(self, iface, payload, pole_layers, line_layer, distance_rules):
         self.iface = iface
@@ -167,16 +162,12 @@ class OverlengthPoleProcessor:
         self.pole_layers = [(role, layer) for role, layer in pole_layers if layer is not None]
         self.new_pole_layer = next((layer for role, layer in self.pole_layers if role == "New Pole"), None)
         self.line_layer = line_layer
-        self.distance_rules = {
-            "existing_existing": float(distance_rules["existing_existing"]),
-            "existing_new": float(distance_rules["existing_new"]),
-            "new_new": float(distance_rules["new_new"]),
-        }
-        self.max_spacing = self.distance_rules["existing_existing"]
+        self.distance_rules = {key: float(value) for key, value in distance_rules.items()}
         self.da = QgsDistanceArea()
         self.da.setEllipsoid(self.project.ellipsoid())
         self._index = QgsSpatialIndex()
         self._idx_map = {}
+        self._next_index_id = 1
         self._created_ids = []
         self._stats = {"duplicates": 0, "over": 0, "new": 0, "segments": 0}
 
@@ -184,7 +175,7 @@ class OverlengthPoleProcessor:
         dst = self.line_layer.crs()
         self._index = QgsSpatialIndex()
         self._idx_map = {}
-        index_id = 1
+        self._next_index_id = 1
         for role, layer in self.pole_layers:
             if layer.type() != QgsMapLayerType.VectorLayer:
                 continue
@@ -200,14 +191,18 @@ class OverlengthPoleProcessor:
                     point = QgsPointXY(geometry.centroid().asPoint())
                     if transform:
                         point = QgsPointXY(transform.transform(point))
-                    spatial_feature = QgsFeature()
-                    spatial_feature.setId(index_id)
-                    spatial_feature.setGeometry(QgsGeometry.fromPointXY(point))
-                    self._index.addFeature(spatial_feature)
-                    self._idx_map[index_id] = (layer.id(), int(feature.id()), point, role)
-                    index_id += 1
+                    self._add_index_point(point, role, layer.id(), int(feature.id()))
                 except Exception:
                     continue
+
+    def _add_index_point(self, point, role, layer_id=None, feature_id=None):
+        index_id = self._next_index_id
+        self._next_index_id += 1
+        spatial_feature = QgsFeature()
+        spatial_feature.setId(index_id)
+        spatial_feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(point)))
+        self._index.addFeature(spatial_feature)
+        self._idx_map[index_id] = (layer_id, feature_id, QgsPointXY(point), role)
 
     def _meters_per_unit(self, point):
         self.da.setSourceCrs(self.line_layer.crs(), self.project.transformContext())
@@ -238,28 +233,29 @@ class OverlengthPoleProcessor:
                 pass
         return result
 
-    def _endpoint_role(self, endpoint, candidates):
+    def _endpoint_candidate(self, endpoint, candidates):
         best = None
         best_distance = float("inf")
-        for _, data, point in candidates:
+        target = QgsGeometry.fromPointXY(QgsPointXY(endpoint))
+        for item in candidates:
+            _, data, point = item
             try:
-                distance = QgsGeometry.fromPointXY(QgsPointXY(endpoint)).distance(
-                    QgsGeometry.fromPointXY(QgsPointXY(point))
-                )
+                distance = target.distance(QgsGeometry.fromPointXY(QgsPointXY(point)))
             except Exception:
                 continue
             if distance < best_distance:
                 best_distance = distance
-                best = data[3]
+                best = item
         return best
 
-    def _spacing_for_line(self, points, candidates):
-        start_role = self._endpoint_role(points[0], candidates)
-        end_role = self._endpoint_role(points[-1], candidates)
-        roles = {start_role, end_role}
-        if start_role == "New Pole" and end_role == "New Pole":
+    def _endpoint_role(self, endpoint, candidates):
+        item = self._endpoint_candidate(endpoint, candidates)
+        return item[1][3] if item else "Existing Pole"
+
+    def _pair_limit(self, left_role, right_role):
+        if left_role == "New Pole" and right_role == "New Pole":
             return self.distance_rules["new_new"]
-        if roles & {"New Pole"}:
+        if left_role == "New Pole" or right_role == "New Pole":
             return self.distance_rules["existing_new"]
         return self.distance_rules["existing_existing"]
 
@@ -290,68 +286,99 @@ class OverlengthPoleProcessor:
         cumulative, total = self._cum_lengths(points)
         a, b = QgsPointXY(points[segment]), QgsPointXY(points[segment + 1])
         segment_length = self.da.measureLine(a, b)
-        fraction = (
-            max(0.0, min(1.0, self.da.measureLine(a, projected) / segment_length))
-            if segment_length > 1e-12 else 0.0
-        )
+        fraction = max(0.0, min(1.0, self.da.measureLine(a, projected) / segment_length)) if segment_length > 1e-12 else 0.0
         return cumulative[segment] + segment_length * fraction, projected, total
 
-    @staticmethod
-    def _midpoint(cuts):
-        return (min(cuts) + max(cuts)) / 2.0 if cuts else 0.0
-
-    def _choose_existing(self, points, candidates):
-        locations = []
-        _, total = self._cum_lengths(points)
+    def _collect_poles_on_part(self, points):
+        part_geom = QgsGeometry.fromPolylineXY([QgsPointXY(point) for point in points])
+        candidates = self._query_poles(part_geom)
+        located = []
         for _, data, point in candidates:
             location = self._project_location(points, point)
             if not location:
                 continue
-            distance = location[0]
-            if distance <= 0.001 or total - distance <= 0.001:
-                continue
-            locations.append((distance, QgsPointXY(point)))
-        if not locations:
+            located.append((location[0], QgsPointXY(point), data[3]))
+        located.sort(key=lambda item: item[0])
+        unique = []
+        for item in located:
+            if unique and abs(item[0] - unique[-1][0]) < 0.01:
+                if unique[-1][2] != "New Pole" and item[2] == "New Pole":
+                    unique[-1] = item
+            else:
+                unique.append(item)
+        return unique, candidates
+
+    @staticmethod
+    def _balanced_lengths(total, caps):
+        if not caps:
+            return []
+        remaining = float(total)
+        active = list(range(len(caps)))
+        lengths = [0.0] * len(caps)
+        eps = 1e-9
+        while active:
+            average = remaining / len(active)
+            limited = [index for index in active if caps[index] < average - eps]
+            if not limited:
+                for index in active:
+                    lengths[index] = average
+                break
+            for index in limited:
+                lengths[index] = caps[index]
+                remaining -= caps[index]
+                active.remove(index)
+        return lengths
+
+    def _plan_gap(self, total, left_role, right_role):
+        direct_cap = self._pair_limit(left_role, right_role)
+        if total <= direct_cap + 1e-8:
             return []
 
-        selected = []
-        cuts = [0.0, total]
-        remaining = locations[:]
-        while remaining:
-            ordered = sorted(cuts)
-            current_max = max(b - a for a, b in zip(ordered[:-1], ordered[1:]))
-            best = None
-            best_gain = self.IMPROVEMENT_METERS
-            for distance, point in remaining:
-                if any(abs(distance - existing) < 0.01 for existing in cuts):
-                    continue
-                trial = sorted(cuts + [distance])
-                new_max = max(b - a for a, b in zip(trial[:-1], trial[1:]))
-                gain = current_max - new_max
-                midpoint = self._midpoint(cuts)
-                if (
-                    gain >= best_gain
-                    and (
-                        best is None
-                        or gain > best[0]
-                        or (abs(gain - best[0]) < 1e-9 and abs(distance - midpoint) < abs(best[1] - midpoint))
-                    )
-                ):
-                    best = (gain, distance, point)
-            if best is None:
+        segment_count = 2
+        while True:
+            caps = [self._pair_limit(left_role, "New Pole")]
+            if segment_count > 2:
+                caps.extend([self.distance_rules["new_new"] for _ in range(segment_count - 2)])
+            caps.append(self._pair_limit("New Pole", right_role))
+            if total <= sum(caps) + 1e-8:
                 break
-            _, distance, point = best
-            selected.append((distance, QgsPointXY(point)))
-            cuts.append(distance)
-            remaining = [item for item in remaining if abs(item[0] - distance) >= 0.01]
-        return sorted(selected, key=lambda item: item[0])
+            segment_count += 1
+            if segment_count > 10000:
+                raise RuntimeError("超距增点无法在当前项目规则下形成可行分段。")
 
-    def _has_overlength(self, cut_specs, total):
-        ordered = [(0.0,)] + [(distance,) for distance, _ in cut_specs] + [(total,)]
-        return any(
-            right[0] - left[0] > self.max_spacing + 1e-8
-            for left, right in zip(ordered[:-1], ordered[1:])
-        )
+        lengths = self._balanced_lengths(total, caps)
+        return [(length, index < segment_count - 1) for index, length in enumerate(lengths)]
+
+    def _add_new_pole(self, point):
+        if self.new_pole_layer is None:
+            raise RuntimeError("当前 ODN Project 未绑定 New Pole 图层。")
+        feature = QgsFeature(self.new_pole_layer.fields())
+        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(point)))
+        name_field = (self.payload.get("field_registry", {}).get("New Pole", {}) or {}).get("名称")
+        if name_field and name_field in self.new_pole_layer.fields().names():
+            feature[name_field] = ""
+        if not self.new_pole_layer.addFeature(feature):
+            raise RuntimeError("新增 New Pole 要素失败。")
+        self._created_ids.append(feature.id())
+        self._stats["new"] += 1
+        point = QgsPointXY(point)
+        self._add_index_point(point, "New Pole", self.new_pole_layer.id(), int(feature.id()))
+
+    def _split_gap(self, points, start_distance, end_distance, left_role, right_role):
+        total = end_distance - start_distance
+        plan = self._plan_gap(total, left_role, right_role)
+        if not plan:
+            return [], []
+
+        new_cuts = []
+        cursor = start_distance
+        for length, needs_new_pole in plan:
+            cursor += length
+            if needs_new_pole:
+                point = self._point_at_distance(points, cursor)
+                self._add_new_pole(point)
+                new_cuts.append((cursor, point, "New Pole"))
+        return new_cuts, plan
 
     def _point_at_distance(self, points, distance):
         cumulative, total = self._cum_lengths(points)
@@ -364,38 +391,13 @@ class OverlengthPoleProcessor:
                 span = cumulative[index + 1] - cumulative[index]
                 fraction = (distance - cumulative[index]) / span if span > 1e-12 else 0.0
                 a, b = QgsPointXY(points[index]), QgsPointXY(points[index + 1])
-                return QgsPointXY(
-                    a.x() + (b.x() - a.x()) * fraction,
-                    a.y() + (b.y() - a.y()) * fraction,
-                )
+                return QgsPointXY(a.x() + (b.x() - a.x()) * fraction, a.y() + (b.y() - a.y()) * fraction)
         return QgsPointXY(points[-1])
-
-    def _make_new_cuts(self, cut_specs, total):
-        boundaries = [(0.0, QgsPointXY(self._last_pts[0]))]
-        boundaries.extend(sorted(cut_specs, key=lambda item: item[0]))
-        boundaries.append((total, QgsPointXY(self._last_pts[-1])))
-        result = []
-        for left, right in zip(boundaries[:-1], boundaries[1:]):
-            cursor_distance = left[0]
-            right_distance = right[0]
-            while right_distance - cursor_distance > self.max_spacing + 1e-8:
-                step = self.max_spacing
-                if cursor_distance + step >= right_distance - 1e-8:
-                    break
-                new_distance = cursor_distance + step
-                new_point = self._point_at_distance(self._last_pts, new_distance)
-                result.append((new_distance, new_point))
-                self._add_new_pole(new_point)
-                cursor_distance = new_distance
-        return sorted(cut_specs + result, key=lambda item: item[0])
 
     def _subline(self, points, cut_specs):
         cumulative, total = self._cum_lengths(points)
         cuts = [(0.0, QgsPointXY(points[0]))]
-        cuts.extend(
-            (distance, QgsPointXY(point))
-            for distance, point in sorted(cut_specs, key=lambda item: item[0])
-        )
+        cuts.extend((distance, QgsPointXY(point)) for distance, point, *_ in sorted(cut_specs, key=lambda item: item[0]))
         cuts.append((total, QgsPointXY(points[-1])))
         output = []
         for (start_distance, start_point), (end_distance, end_point) in zip(cuts[:-1], cuts[1:]):
@@ -436,40 +438,23 @@ class OverlengthPoleProcessor:
                 unique.append(feature)
         return unique, duplicate_ids
 
-    def _name_field(self):
-        configured = (
-            self.payload.get("field_registry", {}).get("New Pole", {}) or {}
-        ).get("名称")
-        if configured and self.new_pole_layer and configured in self.new_pole_layer.fields().names():
-            return configured
-        return "Name" if self.new_pole_layer and "Name" in self.new_pole_layer.fields().names() else None
-
-    def _add_new_pole(self, point):
-        if self.new_pole_layer is None:
-            raise RuntimeError("当前 ODN Project 未绑定 New Pole 图层。")
-        feature = QgsFeature(self.new_pole_layer.fields())
-        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(point)))
-        name_field = self._name_field()
-        if name_field:
-            feature[name_field] = ""
-        if self.new_pole_layer.addFeature(feature):
-            self._created_ids.append(feature.id())
-            self._stats["new"] += 1
-
     def run(self):
         layer = self.line_layer
         if layer is None:
             self._msg("项目配置中的 Pole Edge 不存在。", 2)
             return
-
+        new_started = False
+        edge_started = False
         try:
             self._prepare_poles()
             if self.new_pole_layer.editBuffer() is None:
                 if not self.new_pole_layer.startEditing():
                     raise RuntimeError("New Pole 图层无法进入编辑状态。")
+                new_started = True
             if layer.editBuffer() is None:
                 if not layer.startEditing():
                     raise RuntimeError("Pole Edge 图层无法进入编辑状态。")
+                edge_started = True
 
             features = list(layer.getFeatures())
             unique, duplicate_ids = self._remove_duplicates(features)
@@ -488,25 +473,34 @@ class OverlengthPoleProcessor:
                 for points in parts:
                     if len(points) < 2:
                         continue
-                    self._last_pts = [QgsPointXY(point) for point in points]
-                    _, total = self._cum_lengths(points)
-                    candidates = self._query_poles(geometry)
-                    self.max_spacing = self._spacing_for_line(points, candidates)
-                    existing = self._choose_existing(points, candidates)
-                    if not self._has_overlength(existing, total):
-                        new_geometries.append(QgsGeometry.fromPolylineXY(self._last_pts))
+                    points = [QgsPointXY(point) for point in points]
+                    located, _ = self._collect_poles_on_part(points)
+                    if len(located) < 2:
+                        new_geometries.append(QgsGeometry.fromPolylineXY(points))
                         continue
 
-                    self._stats["over"] += 1
-                    changed = True
-                    dynamic = self._make_new_cuts(existing, total)
-                    while self._has_overlength(dynamic, total):
-                        before = len(dynamic)
-                        dynamic = self._make_new_cuts(dynamic, total)
-                        if len(dynamic) == before:
-                            break
-                    new_geometries.extend(self._subline(points, dynamic))
-                    self._stats["segments"] += len(new_geometries)
+                    all_cuts = []
+                    for left, right in zip(located[:-1], located[1:]):
+                        left_distance, left_point, left_role = left
+                        right_distance, right_point, right_role = right
+                        gap = right_distance - left_distance
+                        self.max_gap_for_debug = self._pair_limit(left_role, right_role)
+                        if gap <= self._pair_limit(left_role, right_role) + 1e-8:
+                            continue
+                        self._stats["over"] += 1
+                        changed = True
+                        new_cuts, _ = self._split_gap(points, left_distance, right_distance, left_role, right_role)
+                        all_cuts.extend(new_cuts)
+
+                    if changed:
+                        combined = [
+                            (distance, point, role) for distance, point, role in located
+                        ] + all_cuts
+                        combined.sort(key=lambda item: item[0])
+                        new_geometries.extend(self._subline(points, combined))
+                        self._stats["segments"] += len(new_geometries)
+                    else:
+                        new_geometries.append(QgsGeometry.fromPolylineXY(points))
 
                 if changed:
                     replacements.append((feature.id(), feature, new_geometries))
@@ -519,14 +513,14 @@ class OverlengthPoleProcessor:
                     new_feature.setAttributes(feature.attributes())
                     layer.addFeature(new_feature)
 
-            if not layer.commitChanges():
+            if edge_started and not layer.commitChanges():
                 raise RuntimeError("Pole Edge 修改无法提交。")
-            if not self.new_pole_layer.commitChanges():
+            if new_started and not self.new_pole_layer.commitChanges():
                 raise RuntimeError("New Pole 修改无法提交。")
         except Exception:
-            if self.new_pole_layer is not None and self.new_pole_layer.isEditable():
+            if new_started and self.new_pole_layer.isEditable():
                 self.new_pole_layer.rollBack()
-            if layer.isEditable():
+            if edge_started and layer.isEditable():
                 layer.rollBack()
             raise
 
@@ -534,7 +528,7 @@ class OverlengthPoleProcessor:
             self.new_pole_layer.selectByIds(self._created_ids)
         self.iface.mapCanvas().refresh()
         self._msg(
-            f"超距增点完成：检查超距线 {self._stats['over']} 条，"
+            f"超距增点完成：检查超距线 {self._stats['over']} 段，"
             f"新增 New Pole {self._stats['new']} 个，"
             f"删除重复线 {self._stats['duplicates']} 条。"
         )
