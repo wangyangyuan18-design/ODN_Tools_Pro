@@ -11,7 +11,7 @@ in QGIS do not leave stale "已写入" records.
 import json
 
 from qgis.PyQt.QtCore import QSettings
-from qgis.core import QgsFeatureRequest
+from qgis.core import QgsDistanceArea, QgsFeatureRequest, QgsGeometry, QgsPointXY, QgsUnitTypes
 
 from . import odn_project_context as context
 from .link_design_v2 import _project_state_key as _legacy_project_state_key
@@ -49,6 +49,7 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
                 if isinstance(draft, dict):
                     self._restore_draft(draft)
                 self._reconcile_written_state()
+                self._repair_saved_distances()
                 self._persist_state()
                 return
 
@@ -59,6 +60,7 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
             if isinstance(draft, dict):
                 self._restore_draft(draft)
         self._reconcile_written_state()
+        self._repair_saved_distances()
 
     def _project_state_key(self):
         # Link Design data belongs to the active ODN Project, not the QGIS
@@ -115,6 +117,89 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
         if changed:
             self._persist_state()
         return changed
+
+    def _distance_meters(self, points, source_crs):
+        if not source_crs or not source_crs.isValid() or len(points) < 2:
+            return None
+        geometry = QgsGeometry.fromPolylineXY(points)
+        distance = QgsDistanceArea()
+        distance.setSourceCrs(source_crs, context.QgsProject.instance().transformContext() if hasattr(context, "QgsProject") else None)
+        try:
+            ellipsoid = source_crs.ellipsoidAcronym()
+        except Exception:
+            ellipsoid = ""
+        if not ellipsoid or str(ellipsoid).upper() in ("NONE", "NONE(0)"):
+            ellipsoid = "WGS84"
+        try:
+            distance.setEllipsoid(str(ellipsoid))
+        except Exception:
+            distance.setEllipsoid("WGS84")
+        measured = float(distance.measureLength(geometry) or 0.0)
+        try:
+            return float(distance.convertLengthMeasurement(measured, distance.lengthUnits(), QgsUnitTypes.DistanceMeters))
+        except Exception:
+            return measured
+
+    def _repair_saved_distances(self):
+        """Repair legacy saved 0/degree-valued distances from their stored route points."""
+        if not self._designs:
+            return False
+        from qgis.core import QgsCoordinateReferenceSystem, QgsProject
+        changed = False
+        for design in self._designs:
+            raw_crs = design.get("source_crs")
+            if not raw_crs:
+                continue
+            source_crs = QgsCoordinateReferenceSystem(str(raw_crs))
+            if not source_crs.isValid():
+                continue
+            total = 0.0
+            valid_segments = 0
+            for segment in design.get("segments", []):
+                raw_points = segment.get("points", [])
+                try:
+                    points = [QgsPointXY(float(p[0]), float(p[1])) for p in raw_points]
+                except Exception:
+                    continue
+                measured = self._distance_meters_with_project(points, source_crs, QgsProject.instance())
+                if measured is None:
+                    continue
+                if abs(float(segment.get("distance", 0.0) or 0.0) - measured) > 0.05:
+                    segment["distance"] = round(measured, 3)
+                    changed = True
+                total += measured
+                valid_segments += 1
+            if valid_segments:
+                old_total = float(design.get("length", 0.0) or 0.0)
+                if abs(old_total - total) > 0.05:
+                    design["length"] = round(total, 3)
+                    changed = True
+        if changed:
+            self._persist_state()
+        return changed
+
+    @staticmethod
+    def _distance_meters_with_project(points, source_crs, project):
+        if not source_crs or not source_crs.isValid() or len(points) < 2:
+            return None
+        geometry = QgsGeometry.fromPolylineXY(points)
+        distance = QgsDistanceArea()
+        distance.setSourceCrs(source_crs, project.transformContext())
+        try:
+            ellipsoid = source_crs.ellipsoidAcronym()
+        except Exception:
+            ellipsoid = ""
+        if not ellipsoid or str(ellipsoid).upper() in ("NONE", "NONE(0)"):
+            ellipsoid = "WGS84"
+        try:
+            distance.setEllipsoid(str(ellipsoid))
+        except Exception:
+            distance.setEllipsoid("WGS84")
+        measured = float(distance.measureLength(geometry) or 0.0)
+        try:
+            return float(distance.convertLengthMeasurement(measured, distance.lengthUnits(), QgsUnitTypes.DistanceMeters))
+        except Exception:
+            return measured
 
     def _recover_written_fids(self, index):
         if index < 0 or index >= len(self._designs):
@@ -199,4 +284,5 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
         # Always reconcile against the live Distribution Cable layer immediately
         # before showing the completed-design browser.
         self._reconcile_written_state()
+        self._repair_saved_distances()
         return super().open_completed_designs()
