@@ -5,7 +5,10 @@ import os
 
 
 def classFactory(iface):
-    """Load the rebuilt ODN Tools Pro plugin."""
+    """Load the project-driven ODN Tools Pro plugin."""
+    from qgis.PyQt.QtGui import QIcon
+    from qgis.PyQt.QtWidgets import QAction, QMenu
+
     from .pole_trace_connect import PoleTraceDialog
     from .overlength_pole import OverlengthPoleDialog
     from .odn_project_manager import OdnProjectManager, initialize_project_manager_context
@@ -14,22 +17,22 @@ def classFactory(iface):
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
     from .odn_project_config_fix import install_project_config_fix
-    from .scheme3_policy import install_scheme3_policy
     from .scheme3_route_preview_fix import install_scheme3_route_preview_fix
     from .scheme3_manual_link_planner import Scheme3Dialog, Scheme3Engine, Scheme3MapTool
     from .scheme3_launcher import start_link_design
     from .scheme3_project_ui import install_project_ui_policy
 
+    # The legacy parameter policy was intentionally removed: Link Design now
+    # follows the active ODN Project without exposing a FAT-count ceiling UI.
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
     install_project_config_fix(OdnProjectConfigDialog)
-    install_scheme3_policy(Scheme3Dialog)
     install_scheme3_route_preview_fix(Scheme3Dialog, Scheme3Engine, Scheme3MapTool)
     install_project_ui_policy(Scheme3Dialog)
     initialize_project_manager_context()
 
     class ODNToolsPro:
-        """Main plugin controller for the rebuilt ODN Tools Pro."""
+        """Main plugin controller."""
 
         def __init__(self, iface):
             self.iface = iface
@@ -39,23 +42,21 @@ def classFactory(iface):
             self.toolbar = None
 
         def initGui(self):
-            from qgis.PyQt.QtWidgets import QAction, QMenu
-
             main_window = self.iface.mainWindow()
             self.menu = QMenu("ODN Tools Pro", main_window)
             main_window.menuBar().addMenu(self.menu)
             self.toolbar = self.iface.addToolBar("ODN Tools Pro")
             self.toolbar.setObjectName("ODNToolsProToolbar")
 
-            self._add("项目管理", self.project_manager)
-            self._add("项目配置", self.project_config)
-            self._add("杆路轨迹自动连线", self.pole_trace_connect)
-            self._add("超距增点", self.overlength_pole)
-            self._add("链路设计", self.link_design)
+            self._add("项目管理", self.project_manager, "icons/project_manager.svg")
+            self._add("项目配置", self.project_config, "icons/project_config.svg")
+            self._add("杆路轨迹自动连线", self.pole_trace_connect, "icons/pole_trace.svg")
+            self._add("超距增点", self.overlength_pole, "icons/overlength_pole.svg")
+            self._add("链路设计", self.link_design, "icons/link_design.svg")
 
-        def _add(self, text, callback):
-            from qgis.PyQt.QtWidgets import QAction
-            action = QAction(text, self.iface.mainWindow())
+        def _add(self, text, callback, icon_relpath):
+            path = os.path.join(self.plugin_dir, icon_relpath)
+            action = QAction(QIcon(path), text, self.iface.mainWindow())
             action.triggered.connect(callback)
             self.menu.addAction(action)
             self.toolbar.addAction(action)
