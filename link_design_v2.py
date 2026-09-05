@@ -32,7 +32,7 @@ SETTINGS_KEY = "ODNToolsPro/LinkDesign"
 
 
 def _fresh_payload(dialog):
-    """Reload the active ODN Project definition so config changes are immediate."""
+    """Reload the active ODN Project definition so saved config changes are immediate."""
     path = context.current_path()
     if path and os.path.isfile(path):
         try:
@@ -159,13 +159,6 @@ class LinkDesignDialog(QtWidgets.QDialog):
             self._designs = designs if isinstance(designs, list) else []
             if isinstance(draft, dict):
                 self._restore_draft(draft)
-        else:
-            ok, value = QgsProject.instance().readEntry(SETTINGS_KEY, "designs", "")
-            if ok and value:
-                try:
-                    self._designs = json.loads(value)
-                except Exception:
-                    self._designs = []
 
     def _restore_draft(self, draft):
         try:
@@ -202,18 +195,13 @@ class LinkDesignDialog(QtWidgets.QDialog):
         }
 
     def _persist_state(self):
+        """Persist Link Design state without writing malformed QGIS custom XML keys."""
         state = {"designs": self._designs, "draft": self._draft_payload()}
         raw = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
         try:
             settings = QSettings()
             settings.setValue(_project_state_key(), raw)
             settings.sync()
-        except Exception:
-            pass
-        try:
-            project = QgsProject.instance()
-            project.writeEntry(SETTINGS_KEY, "designs", json.dumps(self._designs, ensure_ascii=False))
-            project.writeEntry(SETTINGS_KEY, "draft", json.dumps(self._draft_payload(), ensure_ascii=False))
         except Exception:
             pass
 
@@ -307,11 +295,14 @@ class LinkDesignDialog(QtWidgets.QDialog):
             )
             return None
         if QgsWkbTypes.geometryType(fdt.wkbType()) != QgsWkbTypes.PointGeometry:
-            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FDT 不是点图层。"); return None
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FDT 不是点图层。")
+            return None
         if QgsWkbTypes.geometryType(fat.wkbType()) != QgsWkbTypes.PointGeometry:
-            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FAT 不是点图层。"); return None
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FAT 不是点图层。")
+            return None
         if QgsWkbTypes.geometryType(edge.wkbType()) != QgsWkbTypes.LineGeometry:
-            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 Pole Edge 不是线图层。"); return None
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 Pole Edge 不是线图层。")
+            return None
         if _max_links(self) is None or _max_fats(self) is None:
             QtWidgets.QMessageBox.warning(self, "链路设计", "当前项目没有有效的 FDT 最大 Link 数或每条 Link 最大 FAT 参数。")
             return None
@@ -339,13 +330,11 @@ class LinkDesignDialog(QtWidgets.QDialog):
         return True
 
     def start_design(self):
-        # Always rebuild from the latest project configuration, including
-        # fdt_max_links changes made in Project Configuration.
         self._engine = self._prepare_engine()
         if self._engine is None:
             return
         if self._draw_active:
-            self.status.setText("状态：正在规划中，请继续点击地图上的 FDT/FAT。")
+            self.status.setText("状态：正在规划中，请点击地图上的 FDT/FAT。")
         elif self._sequence:
             self.status.setText("状态：已恢复未完成规划，请继续点击 FDT/FAT。")
         else:
@@ -380,8 +369,6 @@ class LinkDesignDialog(QtWidgets.QDialog):
             return True
 
         if info["typ"] == "FAT":
-            # Duplicate FATs are allowed while planning. They are rejected
-            # only when the current Link is saved.
             if self._current_fdt and not self._sequence:
                 link = self._current_link or _next_link(self, self._current_fdt)
                 if link is None:
@@ -482,6 +469,14 @@ class LinkDesignDialog(QtWidgets.QDialog):
         if not link:
             self.status.setText(f"状态：{fdt_label} 没有可用的 Link 编号。")
             return None
+        max_links = _max_links(self)
+        try:
+            link_number = int(str(link).upper().removeprefix("L"))
+        except (TypeError, ValueError):
+            link_number = None
+        if max_links is None or link_number is None or link_number > max_links:
+            self.status.setText(f"状态：{fdt_label}/{link} 超过当前项目配置的最大 Link 数：{max_links}。")
+            return None
 
         local_seen = set()
         local_duplicates = []
@@ -578,13 +573,10 @@ class LinkDesignDialog(QtWidgets.QDialog):
 
         fdt, fdt_id, length = design["fdt"], design["fdt_id"], design["length"]
         self._clear_draft()
-        self._current_fdt = fdt
-        self._current_fdt_id = fdt_id
-        self._current_link = _next_link(self, fdt)
         self._persist_state()
         self._clear_saved_bands()
         self._refresh_ui()
-        self.status.setText(f"状态：{text}（{length:.1f} m），请继续规划下一条链路。")
+        self.status.setText(f"状态：{text}（{length:.1f} m），请在地图上点击下一个 FDT 开始下一条链路。")
         return True
 
     def load_design_for_edit(self, index):
@@ -1003,16 +995,19 @@ class LinkDesignMapTool(QgsMapTool):
         route = self.dialog.prospective_route(info)
         if route:
             self._draw_hover(route)
-            self.dialog._refresh_ui(hover_info=route)
+            # _refresh_ui recalculates both the committed segment distances and
+            # the current segment; it intentionally takes no hover-only arg.
+            self.dialog._refresh_ui()
         else:
             self._clear_hover()
-            self.dialog._refresh_ui()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Backspace:
-            self.dialog.undo_last(); return
+            self.dialog.undo_last()
+            return
         if event.key() == Qt.Key_Escape:
-            self.dialog._stop_tool(); return
+            self.dialog._stop_tool()
+            return
         super().keyPressEvent(event)
 
     def _to_canvas_points(self, route):
