@@ -2,8 +2,7 @@
 """Interactive ODN Link Design.
 
 The active ODN Project is the sole source of operational layers and design
-limits. A link is planned interactively, saved independently, and can be
-reviewed later without depending on the current planning session.
+limits. Link planning is saved independently from Distribution Cable writing.
 """
 from math import sqrt
 import json
@@ -11,7 +10,7 @@ import json
 from qgis.PyQt import QtWidgets
 from qgis.PyQt.QtCore import Qt, QSettings
 from qgis.core import (
-    QgsCoordinateTransform, QgsFeature, QgsGeometry, QgsProject,
+    QgsCoordinateTransform, QgsFeature, QgsGeometry, QgsPointXY, QgsProject,
     QgsRectangle, QgsSpatialIndex, QgsWkbTypes,
 )
 from qgis.gui import QgsMapTool, QgsRubberBand
@@ -43,9 +42,11 @@ def _max_fats(dialog):
     return _required_int(dialog, "max_fats_per_link")
 
 
-def _assigned_fat_ids(dialog, include_draft=True):
+def _assigned_fat_ids(dialog, include_draft=True, exclude_index=None):
     result = set()
-    for design in dialog._designs:
+    for index, design in enumerate(dialog._designs):
+        if exclude_index is not None and index == exclude_index:
+            continue
         for item in design.get("nodes", []):
             try:
                 result.add(int(item[0]))
@@ -89,13 +90,14 @@ def _project_state_key():
 
 
 class LinkDesignDialog(QtWidgets.QDialog):
-    """Interactive link planning with durable saved links and resumable drafts."""
+    """Compact Link planning dialog with persistent saved designs."""
 
     def __init__(self, iface, parent=None):
         super().__init__(parent or iface.mainWindow())
         self.iface = iface
         self.setWindowTitle("链路设计")
-        self.resize(520, 560)
+        self.resize(520, 410)
+        self.setMinimumWidth(480)
         self.setModal(False)
 
         self._designs = []
@@ -104,11 +106,11 @@ class LinkDesignDialog(QtWidgets.QDialog):
         self._current_fdt = None
         self._current_fdt_id = None
         self._current_link = None
+        self._editing_index = None
         self._draw_active = False
         self._engine = None
         self._tool = None
         self._saved_bands = []
-        self._browser_visible = False
 
         self._build_ui()
         self._load_saved_state()
@@ -153,6 +155,11 @@ class LinkDesignDialog(QtWidgets.QDialog):
         except (TypeError, ValueError):
             self._current_fdt_id = None
         self._current_link = draft.get("current_link")
+        value = draft.get("editing_index")
+        try:
+            self._editing_index = int(value) if value is not None else None
+        except (TypeError, ValueError):
+            self._editing_index = None
 
     def _draft_payload(self):
         if not self._sequence:
@@ -163,6 +170,7 @@ class LinkDesignDialog(QtWidgets.QDialog):
             "current_fdt": self._current_fdt,
             "current_fdt_id": self._current_fdt_id,
             "current_link": self._current_link,
+            "editing_index": self._editing_index,
         }
 
     def _persist_state(self):
@@ -190,28 +198,35 @@ class LinkDesignDialog(QtWidgets.QDialog):
         self._current_fdt = None
         self._current_fdt_id = None
         self._current_link = None
+        self._editing_index = None
 
-    # ------------------------------ UI ------------------------------
     def _build_ui(self):
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(5)
 
         title = QtWidgets.QLabel("链路设计")
-        font = title.font(); font.setBold(True); font.setPointSize(13); title.setFont(font)
+        font = title.font()
+        font.setBold(True)
+        font.setPointSize(13)
+        title.setFont(font)
         root.addWidget(title)
 
-        self.plan_label = QtWidgets.QLabel("① 规划中：等待开始")
+        self.plan_label = QtWidgets.QLabel("① 规划中")
         self.fdt_label = QtWidgets.QLabel("② 规划中 FDT：— | Link：—")
         self.link_count_label = QtWidgets.QLabel("已规划链路：0")
         self.planned_fat_label = QtWidgets.QLabel("已规划 FAT：0")
         self.total_fat_label = QtWidgets.QLabel("③ 总 FAT：0，已设计 FAT：0")
-        for widget in (self.plan_label, self.fdt_label, self.link_count_label,
-                       self.planned_fat_label, self.total_fat_label):
+        for widget in (
+            self.plan_label, self.fdt_label, self.link_count_label,
+            self.planned_fat_label, self.total_fat_label,
+        ):
             root.addWidget(widget)
 
-        line = QtWidgets.QFrame(); line.setFrameShape(QtWidgets.QFrame.HLine)
-        line.setFrameShadow(QtWidgets.QFrame.Sunken); root.addWidget(line)
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.HLine)
+        line.setFrameShadow(QtWidgets.QFrame.Sunken)
+        root.addWidget(line)
 
         details = QtWidgets.QGridLayout()
         details.setHorizontalSpacing(8)
@@ -238,23 +253,14 @@ class LinkDesignDialog(QtWidgets.QDialog):
         details.setColumnStretch(1, 1)
         root.addLayout(details)
 
-        self.browser_title = QtWidgets.QLabel("已完成设计")
-        self.browser_title.setVisible(False)
-        root.addWidget(self.browser_title)
-        self.design_tree = QtWidgets.QTreeWidget()
-        self.design_tree.setHeaderHidden(True)
-        self.design_tree.setMinimumHeight(150)
-        self.design_tree.setVisible(False)
-        self.design_tree.itemClicked.connect(self._on_design_tree_clicked)
-        root.addWidget(self.design_tree)
-
         row = QtWidgets.QHBoxLayout()
         self.start_btn = QtWidgets.QPushButton("开始规划")
         self.save_btn = QtWidgets.QPushButton("保存规划")
         self.done_btn = QtWidgets.QPushButton("已完成设计")
         self.exit_btn = QtWidgets.QPushButton("退出设计")
-        row.addWidget(self.start_btn); row.addWidget(self.save_btn)
-        row.addWidget(self.done_btn); row.addWidget(self.exit_btn)
+        for button in (self.start_btn, self.save_btn, self.done_btn, self.exit_btn):
+            button.setMinimumHeight(28)
+            row.addWidget(button)
         root.addLayout(row)
 
         self.status = QtWidgets.QLabel("状态：等待开始规划")
@@ -264,34 +270,51 @@ class LinkDesignDialog(QtWidgets.QDialog):
 
         self.start_btn.clicked.connect(self.start_design)
         self.save_btn.clicked.connect(self.save_current_link)
-        self.done_btn.clicked.connect(self.toggle_completed_designs)
+        self.done_btn.clicked.connect(self.open_completed_designs)
         self.exit_btn.clicked.connect(self.exit_design)
         self.save_btn.setEnabled(False)
 
-    # --------------------------- Engine -----------------------------
     def _prepare_engine(self):
         payload = _payload(self)
         fdt = context.project_layer(payload, "FDT")
         fat = context.project_layer(payload, "FAT")
         edge = context.project_layer(payload, "Pole Edge")
-        missing = [role for role, layer in (("FDT", fdt), ("FAT", fat), ("Pole Edge", edge)) if layer is None]
+        missing = [
+            role for role, layer in (("FDT", fdt), ("FAT", fat), ("Pole Edge", edge))
+            if layer is None
+        ]
         if missing:
-            QtWidgets.QMessageBox.warning(self, "链路设计", "当前项目缺少必要图层绑定：\n\n" + "\n".join(f"• {role}" for role in missing) + "\n\n请先在【项目配置】中修正。")
+            QtWidgets.QMessageBox.warning(
+                self, "链路设计",
+                "当前项目缺少必要图层绑定：\n\n"
+                + "\n".join(f"• {role}" for role in missing)
+                + "\n\n请先在【项目配置】中修正。"
+            )
             return None
         if QgsWkbTypes.geometryType(fdt.wkbType()) != QgsWkbTypes.PointGeometry:
-            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FDT 不是点图层。"); return None
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FDT 不是点图层。")
+            return None
         if QgsWkbTypes.geometryType(fat.wkbType()) != QgsWkbTypes.PointGeometry:
-            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FAT 不是点图层。"); return None
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FAT 不是点图层。")
+            return None
         if QgsWkbTypes.geometryType(edge.wkbType()) != QgsWkbTypes.LineGeometry:
-            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 Pole Edge 不是线图层。"); return None
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 Pole Edge 不是线图层。")
+            return None
         if _max_links(self) is None or _max_fats(self) is None:
-            QtWidgets.QMessageBox.warning(self, "链路设计", "当前 ODN Project 缺少有效的“FDT 最大 Link 数”或“每条 Link 最大 FAT”参数。\n\n请先在【项目配置 → 设计设置】中完成配置。")
+            QtWidgets.QMessageBox.warning(
+                self, "链路设计",
+                "当前 ODN Project 缺少有效的“FDT 最大 Link 数”或“每条 Link 最大 FAT”参数。\n\n"
+                "请先在【项目配置 → 设计设置】中完成配置。"
+            )
             return None
         params = payload.get("parameters", {}) or {}
         try:
             attach = float(params["fat_pole_max_distance"])
         except (KeyError, TypeError, ValueError):
-            QtWidgets.QMessageBox.warning(self, "链路设计", "当前 ODN Project 缺少有效的 FAT 挂杆最大距离参数，请先在【项目配置】中配置。")
+            QtWidgets.QMessageBox.warning(
+                self, "链路设计",
+                "当前 ODN Project 缺少有效的 FAT 挂杆最大距离参数，请先在【项目配置】中配置。"
+            )
             return None
         try:
             engine = OdnProjectRouteEngine(self.iface, payload, attach)
@@ -316,64 +339,65 @@ class LinkDesignDialog(QtWidgets.QDialog):
         return True
 
     def start_design(self):
-        # Rebuild the route engine so Pole Edge edits made outside this tool
-        # are immediately reflected without discarding the planning draft.
         self._engine = self._prepare_engine()
         if self._engine is None:
             return
         if self._draw_active:
-            if not self._activate_map_tool():
-                return
-            self.status.setText("状态：已恢复规划，请继续点击 FDT/FAT。")
-            self._refresh_ui()
-            return
-        if self._sequence:
+            self.status.setText("状态：正在规划中，请继续点击地图上的 FDT/FAT。")
+        elif self._sequence:
             self.status.setText("状态：已恢复未完成规划，请继续点击 FDT/FAT。")
         else:
             self._direction = None
             self._current_fdt = None
             self._current_fdt_id = None
             self._current_link = None
-            self.status.setText("状态：规划中——请选择 FDT 或 FAT 作为起点。")
-        self._activate_map_tool()
-        self._persist_state()
-        self._refresh_ui()
+            self._editing_index = None
+            self.status.setText("状态：规划中——请选择 FDT。")
+        if self._activate_map_tool():
+            self._persist_state()
+            self._refresh_ui()
 
     def _start_from_hit(self, info):
         if info["typ"] == "FDT":
-            link = _next_link(self, info["label"])
-            if link is None:
-                self.status.setText(f"状态：{info['label']} 已达到项目配置的最大 Link 数：{_max_links(self) or '未配置'}。")
+            if self._editing_index is not None and self._current_fdt == info["label"]:
+                link = self._current_link
+            else:
+                link = _next_link(self, info["label"])
+            if self._editing_index is None and link is None:
+                self.status.setText(
+                    f"状态：{info['label']} 已达到项目配置的最大 Link 数：{_max_links(self) or '未配置'}。"
+                )
                 return False
             self._direction = "FDT_TO_FAT"
             self._current_fdt = info["label"]
             self._current_fdt_id = info["feature_id"]
-            self._current_link = link
+            self._current_link = link or _next_link(self, info["label"])
             self._sequence = [("FDT", info["feature_id"], info["label"])]
-            self.status.setText(f"状态：{info['label']}/{link}，请继续点击 FAT。")
+            self.status.setText(f"状态：{info['label']}/{self._current_link}，请继续点击 FAT。")
             self._persist_state()
+            self._refresh_ui()
             return True
 
         if info["typ"] == "FAT":
-            if info["feature_id"] in _assigned_fat_ids(self, include_draft=False):
-                self.status.setText(f"状态：{info['label']} 已分配到其他 Link，不能重复使用。")
-                return False
-            # After saving a forward link, the next FAT click starts the next
-            # link under the same FDT automatically.
+            if info["feature_id"] in _assigned_fat_ids(
+                self, include_draft=False, exclude_index=self._editing_index
+            ):
+                self.status.setText(f"状态：{info['label']} 已分配到其他 Link，保存时会禁止重复使用。")
+                # Planning is still allowed: add it to the current draft.
             if self._current_fdt and not self._sequence:
-                next_link = _next_link(self, self._current_fdt)
+                next_link = self._current_link or _next_link(self, self._current_fdt)
                 if next_link is None:
                     self.status.setText(f"状态：{self._current_fdt} 已达到项目配置的最大 Link 数。")
                     return False
                 self._direction = "FDT_TO_FAT"
                 self._current_link = next_link
                 self._sequence = [("FDT", self._current_fdt_id, self._current_fdt)]
-                self.status.setText(f"状态：{self._current_fdt}/{next_link}，请继续点击 FAT。")
             else:
                 self._direction = "FAT_TO_FDT"
                 self._sequence = [("FAT", info["feature_id"], info["label"])]
-                self.status.setText("状态：已从 FAT 开始，请继续点击 FAT，最后点击 FDT 完成反向链路。")
+                self.status.setText("状态：已从 FAT 开始，请继续点击 FAT，最后点击 FDT。")
             self._persist_state()
+            self._refresh_ui()
             return True
         return False
 
@@ -382,13 +406,9 @@ class LinkDesignDialog(QtWidgets.QDialog):
             return
         if not self._sequence:
             self._start_from_hit(info)
-            self._refresh_ui()
             return
         if any(item[0] == "FAT" and item[1] == info["feature_id"] for item in self._sequence):
             self.status.setText(f"状态：{info['label']} 已在当前链路中。")
-            return
-        if info["feature_id"] in _assigned_fat_ids(self, include_draft=False):
-            self.status.setText(f"状态：{info['label']} 已分配到其他 Link，不能重复使用。")
             return
         max_fats = _max_fats(self)
         current_fats = sum(1 for item in self._sequence if item[0] == "FAT")
@@ -414,8 +434,12 @@ class LinkDesignDialog(QtWidgets.QDialog):
     def add_fdt(self, info):
         if not self._draw_active or info["typ"] != "FDT" or self._direction != "FAT_TO_FDT" or not self._sequence:
             return
-        link = _next_link(self, info["label"])
-        if link is None:
+        if self._editing_index is None:
+            link = _next_link(self, info["label"])
+        else:
+            current = self._designs[self._editing_index] if 0 <= self._editing_index < len(self._designs) else None
+            link = current.get("link") if current else _next_link(self, info["label"])
+        if not link:
             self.status.setText(f"状态：{info['label']} 已达到项目配置的最大 Link 数。")
             return
         previous = self._sequence[-1]
@@ -430,25 +454,62 @@ class LinkDesignDialog(QtWidgets.QDialog):
         self._persist_state()
         self._refresh_ui()
 
-    # ---------------------- Save / completed list -------------------
-    def _make_design(self):
+    def _validate_current_design(self):
         if not self._sequence:
-            self.status.setText("状态：当前没有可保存的规划。"); return None
+            self.status.setText("状态：当前没有可保存的规划。")
+            return None
         fats = [item for item in self._sequence if item[0] == "FAT"]
         if not fats:
-            self.status.setText("状态：当前链路至少需要 1 个 FAT。"); return None
+            self.status.setText("状态：当前链路至少需要 1 个 FAT。")
+            return None
         fdt_item = next((item for item in self._sequence if item[0] == "FDT"), None)
         if not fdt_item:
-            self.status.setText("状态：当前规划尚未确定 FDT，无法保存。"); return None
+            self.status.setText("状态：当前规划尚未确定 FDT，无法保存。")
+            return None
         fdt_label = self._current_fdt or fdt_item[2]
         fdt_id = self._current_fdt_id if self._current_fdt_id is not None else fdt_item[1]
         link = self._current_link or _next_link(self, fdt_label)
-        if not link:
-            self.status.setText(f"状态：{fdt_label} 没有可用的 Link 编号。"); return None
         max_fats = _max_fats(self)
-        if max_fats is None or len(fats) > max_fats:
-            self.status.setText(f"状态：当前 Link FAT 数 {len(fats)} 超过项目配置上限 {max_fats or '未配置'}。"); return None
+        if not link or max_fats is None or len(fats) > max_fats:
+            self.status.setText(
+                f"状态：当前 Link FAT 数 {len(fats)} 超过项目配置上限 {max_fats or '未配置'}，无法保存。"
+            )
+            return None
 
+        seen_local = set()
+        duplicate_local = []
+        for item in fats:
+            fid = int(item[1])
+            if fid in seen_local:
+                duplicate_local.append(item[2])
+            seen_local.add(fid)
+        if duplicate_local:
+            QtWidgets.QMessageBox.warning(
+                self, "无法保存规划",
+                "当前 Link 内存在重复 FAT：\n\n" + "、".join(duplicate_local)
+                + "\n\n可以继续规划，但需要修改后才能保存。"
+            )
+            self.status.setText("状态：当前 Link 内存在重复 FAT，未保存。")
+            return None
+
+        assigned_elsewhere = _assigned_fat_ids(
+            self, include_draft=False, exclude_index=self._editing_index
+        )
+        duplicate_other = [item[2] for item in fats if int(item[1]) in assigned_elsewhere]
+        if duplicate_other:
+            QtWidgets.QMessageBox.warning(
+                self, "无法保存规划",
+                "以下 FAT 已经被其他已保存 Link 使用：\n\n"
+                + "、".join(duplicate_other)
+                + "\n\n当前规划可以继续修改，但不能保存，除非调整 FAT 选择。"
+            )
+            self.status.setText("状态：存在已被其他 Link 使用的 FAT，当前规划未保存。")
+            return None
+
+        if self._engine is None:
+            self._engine = self._prepare_engine()
+        if self._engine is None:
+            return None
         routes = []
         for first, second in zip(self._sequence[:-1], self._sequence[1:]):
             route = self._engine.route(first[0], first[1], second[0], second[1])
@@ -466,96 +527,111 @@ class LinkDesignDialog(QtWidgets.QDialog):
             "sequence": [item[2] for item in self._sequence],
             "sequence_ids": [(item[0], item[1]) for item in self._sequence],
             "direction": self._direction,
+            "written": False,
             "segments": [
-                {"from": r["from_label"], "to": r["to_label"],
-                 "distance": round(r["distance"], 3),
-                 "pole_edge_distance": round(r["pole_edge_distance"], 3),
-                 "edge_count": len(r["edge_sequence"])}
+                {
+                    "from": r["from_label"],
+                    "to": r["to_label"],
+                    "distance": round(r["distance"], 3),
+                    "pole_edge_distance": round(r["pole_edge_distance"], 3),
+                    "edge_count": len(r["edge_sequence"]),
+                    "points": [[float(p.x()), float(p.y())] for p in r["points"]],
+                }
                 for r in routes
             ],
         }
 
     def save_current_link(self):
-        design = self._make_design()
+        design = self._validate_current_design()
         if not design:
             return False
-        existing = next((d for d in self._designs if d.get("fdt") == design["fdt"] and d.get("link") == design["link"]), None)
-        if existing is not None:
-            existing.clear(); existing.update(design)
+        if self._editing_index is not None:
+            index = self._editing_index
+            if 0 <= index < len(self._designs) and self._designs[index].get("written"):
+                QtWidgets.QMessageBox.warning(
+                    self, "已写入 Link",
+                    "该 Link 已经写入 Distribution Cable 图层，当前版本不能直接覆盖。"
+                )
+                return False
+            if 0 <= index < len(self._designs):
+                self._designs[index] = design
+            saved_text = f"已更新 {design['fdt']}/{design['link']}"
         else:
-            self._designs.append(design)
-        saved_fdt, saved_link, saved_len = design["fdt"], design["link"], design["length"]
+            existing_index = next(
+                (i for i, d in enumerate(self._designs)
+                 if d.get("fdt") == design["fdt"] and d.get("link") == design["link"]),
+                None,
+            )
+            if existing_index is not None:
+                if self._designs[existing_index].get("written"):
+                    QtWidgets.QMessageBox.warning(self, "已写入 Link", "当前 Link 已经写入图层，不能直接覆盖。")
+                    return False
+                self._designs[existing_index] = design
+            else:
+                self._designs.append(design)
+            saved_text = f"已保存 {design['fdt']}/{design['link']}"
+
+        saved_fdt = design["fdt"]
+        saved_link = design["link"]
+        saved_len = design["length"]
         self._clear_draft()
         self._current_fdt = saved_fdt
-        try:
-            self._current_fdt_id = int(design["fdt_id"])
-        except (TypeError, ValueError):
-            self._current_fdt_id = None
+        self._current_fdt_id = design["fdt_id"]
         self._current_link = _next_link(self, saved_fdt)
         self._persist_state()
-        self._refresh_completed_tree()
-        self._clear_saved_bands()
         self._refresh_ui()
-        self.status.setText(f"状态：已保存 {saved_fdt}/{saved_link}（{saved_len:.1f} m），请继续规划下一条链路。")
+        self._clear_saved_bands()
+        self.status.setText(f"状态：{saved_text}（{saved_len:.1f} m），请继续规划下一条链路。")
         return True
 
-    def toggle_completed_designs(self):
-        self._browser_visible = not self._browser_visible
-        self.browser_title.setVisible(self._browser_visible)
-        self.design_tree.setVisible(self._browser_visible)
-        self.done_btn.setText("隐藏已完成设计" if self._browser_visible else "已完成设计")
-        if self._browser_visible:
-            self._refresh_completed_tree()
-        else:
-            self._clear_saved_bands()
+    def load_design_for_edit(self, index):
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            return False
+        if index < 0 or index >= len(self._designs):
+            return False
+        design = self._designs[index]
+        if design.get("written"):
+            QtWidgets.QMessageBox.information(
+                self, "已写入 Link",
+                "该 Link 已经写入 Distribution Cable 图层。\n\n当前版本暂不能直接编辑已写入 Link。"
+            )
+            return False
+        try:
+            labels = design.get("sequence", [])
+            seq = design.get("sequence_ids", [])
+            self._sequence = [
+                (str(item[0]), int(item[1]), str(labels[pos]))
+                for pos, item in enumerate(seq)
+            ]
+        except Exception:
+            self.status.setText("状态：无法恢复该 Link 的规划数据。")
+            return False
+        self._direction = design.get("direction") or "FDT_TO_FAT"
+        self._current_fdt = str(design.get("fdt", ""))
+        try:
+            self._current_fdt_id = int(design.get("fdt_id"))
+        except (TypeError, ValueError):
+            self._current_fdt_id = self._sequence[0][1] if self._sequence else None
+        self._current_link = str(design.get("link", ""))
+        self._editing_index = index
+        self._engine = self._prepare_engine()
+        if self._engine is None:
+            return False
+        self.status.setText(f"状态：正在修改 {self._current_fdt}/{self._current_link}，请调整 FAT 后保存。")
+        self._refresh_ui()
+        if not self._activate_map_tool():
+            return False
+        self._persist_state()
+        return True
 
-    def _refresh_completed_tree(self):
-        current = self.design_tree.currentItem()
-        current_data = current.data(0, Qt.UserRole) if current else None
-        self.design_tree.clear()
-        grouped = {}
-        for index, design in enumerate(self._designs):
-            grouped.setdefault(str(design.get("fdt", "未知 FDT")), []).append((index, design))
-        for fdt, entries in sorted(grouped.items()):
-            root = QtWidgets.QTreeWidgetItem([fdt])
-            root.setData(0, Qt.UserRole, ("fdt", fdt))
-            self.design_tree.addTopLevelItem(root)
-            for index, design in sorted(entries, key=lambda x: str(x[1].get("link", ""))):
-                child = QtWidgets.QTreeWidgetItem([str(design.get("link", "L?"))])
-                child.setData(0, Qt.UserRole, ("link", index))
-                child.setToolTip(0, " → ".join(design.get("sequence", [])))
-                root.addChild(child)
-            root.setExpanded(False)
-        if current_data:
-            self._select_tree_data(current_data)
+    def open_completed_designs(self):
+        dialog = CompletedDesignDialog(self)
+        dialog.exec_()
+        self._refresh_ui()
 
-    def _select_tree_data(self, target):
-        for i in range(self.design_tree.topLevelItemCount()):
-            root = self.design_tree.topLevelItem(i)
-            if root.data(0, Qt.UserRole) == target:
-                self.design_tree.setCurrentItem(root); return
-            for j in range(root.childCount()):
-                child = root.child(j)
-                if child.data(0, Qt.UserRole) == target:
-                    self.design_tree.setCurrentItem(child); return
-
-    def _on_design_tree_clicked(self, item, column):
-        target = item.data(0, Qt.UserRole)
-        if not target:
-            return
-        if target[0] == "fdt":
-            fdt_label = target[1]
-            entries = [(i, d) for i, d in enumerate(self._designs) if d.get("fdt") == fdt_label]
-            self._show_saved_designs(entries)
-            self.status.setText(f"状态：已显示 {fdt_label} 的全部已完成 Link（{len(entries)} 条）。")
-        elif target[0] == "link":
-            index = int(target[1])
-            if 0 <= index < len(self._designs):
-                design = self._designs[index]
-                self._show_saved_designs([(index, design)])
-                self.status.setText(f"状态：已显示 {design.get('fdt', '')}/{design.get('link', '')}。")
-
-    def _show_saved_designs(self, entries):
+    def show_saved_designs(self, entries):
         self._clear_saved_bands()
         self._engine = self._prepare_engine()
         if self._engine is None:
@@ -564,44 +640,52 @@ class LinkDesignDialog(QtWidgets.QDialog):
         canvas_crs = canvas.mapSettings().destinationCrs()
         for _, design in entries:
             seq = design.get("sequence_ids", [])
-            for first, second in zip(seq[:-1], seq[1:]):
+            stored_segments = design.get("segments", [])
+            for idx, segment in enumerate(stored_segments):
                 try:
-                    route = self._engine.route(first[0], int(first[1]), second[0], int(second[1]))
+                    points = [QgsPointXY(float(p[0]), float(p[1])) for p in segment.get("points", [])]
                 except Exception:
-                    route = None
-                if route is None:
+                    points = []
+                if len(points) < 2 and idx < len(seq) - 1:
+                    try:
+                        first, second = seq[idx], seq[idx + 1]
+                        route = self._engine.route(first[0], int(first[1]), second[0], int(second[1]))
+                        points = route["points"] if route else []
+                    except Exception:
+                        points = []
+                if len(points) < 2:
                     continue
-                points = route["points"]
                 src = self._engine.edge_layer.crs()
                 if src != canvas_crs:
                     transform = QgsCoordinateTransform(src, canvas_crs, QgsProject.instance().transformContext())
                     points = [transform.transform(p) for p in points]
-                if len(points) < 2:
-                    continue
                 band = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
                 band.setWidth(5)
                 band.setColor(QtWidgets.QApplication.palette().highlight().color())
                 band.setToGeometry(QgsGeometry.fromPolylineXY(points), canvas_crs)
                 self._saved_bands.append(band)
 
-    # -------------------------- Display -----------------------------
-    def _refresh_ui(self, hover_info=None):
+    def _refresh_ui(self):
         self.link_count_label.setText(f"已规划链路：{len(self._designs)}")
         self.planned_fat_label.setText(f"已规划 FAT：{_planned_fats(self)}")
-        self.total_fat_label.setText(f"③ 总 FAT：{_total_fats(self)}，已设计 FAT：{_planned_fats(self)}")
-
+        self.total_fat_label.setText(
+            f"③ 总 FAT：{_total_fats(self)}，已设计 FAT：{_planned_fats(self)}"
+        )
         if not self._sequence:
-            self.plan_label.setText("① 规划中：等待开始")
-            self.fdt_label.setText(f"② 规划中 FDT：{self._current_fdt or '—'} | Link：{self._current_link or '—'}")
+            self.plan_label.setText("① 规划中")
+            self.fdt_label.setText(
+                f"② 规划中 FDT：{self._current_fdt or '—'} | Link：{self._current_link or '—'}"
+            )
             self.current_path_label.setText("—")
             self.distance_label.setText("—")
             self.segment_label.setText("—")
             self.route_label.setText("—")
             self.save_btn.setEnabled(False)
             return
-
-        self.plan_label.setText("① 规划中")
-        self.fdt_label.setText(f"② 规划中 FDT：{self._current_fdt or '等待 FDT'} | Link：{self._current_link or '待分配'}")
+        self.plan_label.setText("① 规划中" + (" · 修改" if self._editing_index is not None else ""))
+        self.fdt_label.setText(
+            f"② 规划中 FDT：{self._current_fdt or '等待 FDT'} | Link：{self._current_link or '待分配'}"
+        )
         self.current_path_label.setText(" - ".join(item[2] for item in self._sequence))
         routes = []
         if self._engine:
@@ -609,8 +693,8 @@ class LinkDesignDialog(QtWidgets.QDialog):
                 route = self._engine.route(first[0], first[1], second[0], second[1])
                 if route:
                     routes.append(route)
-        self.distance_label.setText("， ".join(f"{route['distance']:.1f}m" for route in routes) if routes else "—")
-        last = hover_info or (routes[-1] if routes else None)
+        self.distance_label.setText(", ".join(f"{route['distance']:.1f}m" for route in routes) if routes else "—")
+        last = routes[-1] if routes else None
         if last:
             self.segment_label.setText(f"{last['from_label']} - {last['to_label']}    {last['distance']:.1f}m")
             self.route_label.setText(f"实际路径 {last['pole_edge_distance']:.1f}m | 边段 {len(last['edge_sequence'])}")
@@ -679,14 +763,184 @@ class LinkDesignDialog(QtWidgets.QDialog):
         if info["typ"] == "FDT" and self._direction != "FAT_TO_FDT":
             return None
         if info["typ"] == "FAT":
-            if info["feature_id"] in _assigned_fat_ids(self, include_draft=False):
-                return None
             max_fats = _max_fats(self)
             current_fats = sum(1 for item in self._sequence if item[0] == "FAT")
             if max_fats is None or current_fats >= max_fats:
                 return None
         previous = self._sequence[-1]
         return self._engine.route(previous[0], previous[1], info["typ"], info["feature_id"])
+
+    def _distribution_cable_layer(self):
+        return context.project_layer(_payload(self), "Distribution Cable")
+
+    def write_planned_links(self):
+        layer = self._distribution_cable_layer()
+        if layer is None:
+            QtWidgets.QMessageBox.warning(self, "写入图层", "当前项目没有绑定 Distribution Cable 图层。")
+            return False
+        pending = [(i, d) for i, d in enumerate(self._designs) if not d.get("written")]
+        if not pending:
+            QtWidgets.QMessageBox.information(self, "写入图层", "没有待写入的已规划 Link。")
+            return True
+        if not layer.isEditable() and not layer.startEditing():
+            QtWidgets.QMessageBox.warning(self, "写入图层", f"无法进入 Distribution Cable 图层编辑状态：{layer.name()}")
+            return False
+        try:
+            added = 0
+            for index, design in pending:
+                segments = design.get("segments", [])
+                if not segments:
+                    raise ValueError(f"{design.get('fdt')}/{design.get('link')} 缺少有效路径段。")
+                for segment in segments:
+                    points = [QgsPointXY(float(p[0]), float(p[1])) for p in segment.get("points", [])]
+                    if len(points) < 2:
+                        raise ValueError(
+                            f"{design.get('fdt')}/{design.get('link')} 的 {segment.get('from')} → {segment.get('to')} 缺少线形。"
+                        )
+                    feature = QgsFeature(layer.fields())
+                    feature.setGeometry(QgsGeometry.fromPolylineXY(points))
+                    # Cable naming/attributes are intentionally left untouched.
+                    # Naming happens only after Link topology is finalized.
+                    if not layer.addFeature(feature):
+                        raise ValueError(f"无法写入 Distribution Cable：{design.get('fdt')}/{design.get('link')}")
+                    added += 1
+                design["written"] = True
+            layer.triggerRepaint()
+            self._persist_state()
+            self._refresh_ui()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "写入图层", f"写入 Distribution Cable 失败：\n{exc}")
+            return False
+
+        QtWidgets.QMessageBox.information(
+            self, "写入图层",
+            f"已将 {len(pending)} 条 Link、共 {added} 个线路段写入 Distribution Cable 图层。\n\n"
+            "Link 规划数据仍保留在“已完成设计”中。"
+        )
+        return True
+
+
+class CompletedDesignDialog(QtWidgets.QDialog):
+    """Browser for all saved Link designs, whether planned or written."""
+
+    def __init__(self, main_dialog):
+        super().__init__(main_dialog)
+        self.main_dialog = main_dialog
+        self.setWindowTitle("已完成设计")
+        self.resize(420, 440)
+        self.setMinimumSize(380, 370)
+        self._last_target = None
+        self._build_ui()
+        self._refresh_tree()
+
+    def _build_ui(self):
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(6)
+
+        title = QtWidgets.QLabel("已完成设计")
+        font = title.font()
+        font.setBold(True)
+        font.setPointSize(12)
+        title.setFont(font)
+        root.addWidget(title)
+
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setHeaderLabels(["FDT / Link", "状态"])
+        self.tree.setColumnWidth(0, 270)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.itemClicked.connect(self._on_clicked)
+        self.tree.itemDoubleClicked.connect(self._on_double_clicked)
+        root.addWidget(self.tree, 1)
+
+        self.info = QtWidgets.QLabel("点击 FDT 查看全部 Link；点击 Link 查看该 Link。")
+        self.info.setWordWrap(True)
+        self.info.setStyleSheet("color:#666;")
+        root.addWidget(self.info)
+
+        row = QtWidgets.QHBoxLayout()
+        self.modify_btn = QtWidgets.QPushButton("修改选中 Link")
+        self.write_btn = QtWidgets.QPushButton("确定并写入图层")
+        close_btn = QtWidgets.QPushButton("关闭")
+        row.addWidget(self.modify_btn)
+        row.addWidget(self.write_btn)
+        row.addWidget(close_btn)
+        root.addLayout(row)
+        self.modify_btn.clicked.connect(self._modify_selected)
+        self.write_btn.clicked.connect(self._write_all)
+        close_btn.clicked.connect(self.accept)
+
+    def _refresh_tree(self):
+        self.tree.clear()
+        grouped = {}
+        for index, design in enumerate(self.main_dialog._designs):
+            grouped.setdefault(str(design.get("fdt", "未知 FDT")), []).append((index, design))
+        for fdt in sorted(grouped):
+            root = QtWidgets.QTreeWidgetItem([fdt, ""])
+            root.setData(0, Qt.UserRole, ("fdt", fdt))
+            root.setToolTip(0, "点击显示该 FDT 的全部 Link")
+            self.tree.addTopLevelItem(root)
+            for index, design in sorted(grouped[fdt], key=lambda x: str(x[1].get("link", ""))):
+                status = "已写入" if design.get("written") else "已规划"
+                child = QtWidgets.QTreeWidgetItem([str(design.get("link", "L?")), status])
+                child.setData(0, Qt.UserRole, ("link", index))
+                child.setToolTip(0, " → ".join(design.get("sequence", [])))
+                root.addChild(child)
+        if self.tree.topLevelItemCount():
+            self.tree.topLevelItem(0).setExpanded(False)
+
+    def _on_clicked(self, item, column):
+        target = item.data(0, Qt.UserRole)
+        if not target:
+            return
+        self._last_target = target
+        if target[0] == "fdt":
+            fdt = target[1]
+            entries = [(i, d) for i, d in enumerate(self.main_dialog._designs) if d.get("fdt") == fdt]
+            self.main_dialog.show_saved_designs(entries)
+            self.info.setText(f"{fdt}：已显示全部 {len(entries)} 条 Link。")
+        else:
+            index = int(target[1])
+            if 0 <= index < len(self.main_dialog._designs):
+                design = self.main_dialog._designs[index]
+                self.main_dialog.show_saved_designs([(index, design)])
+                self.info.setText(
+                    f"{design.get('fdt', '')}/{design.get('link', '')}："
+                    f"{'已写入' if design.get('written') else '已规划'}。"
+                )
+
+    def _on_double_clicked(self, item, column):
+        target = item.data(0, Qt.UserRole)
+        if target and target[0] == "link":
+            self._modify_selected()
+
+    def _modify_selected(self):
+        current = self.tree.currentItem()
+        target = self._last_target or (current.data(0, Qt.UserRole) if current else None)
+        if not target or target[0] != "link":
+            QtWidgets.QMessageBox.information(self, "修改 Link", "请先选择一个 Link。")
+            return
+        index = int(target[1])
+        if index < 0 or index >= len(self.main_dialog._designs):
+            return
+        if self.main_dialog.load_design_for_edit(index):
+            self.accept()
+
+    def _write_all(self):
+        if self.main_dialog.write_planned_links():
+            self._refresh_tree()
+            if self._last_target:
+                self._on_target_refresh(self._last_target)
+
+    def _on_target_refresh(self, target):
+        if target[0] == "fdt":
+            fdt = target[1]
+            entries = [(i, d) for i, d in enumerate(self.main_dialog._designs) if d.get("fdt") == fdt]
+            self.main_dialog.show_saved_designs(entries)
+        elif target[0] == "link":
+            index = int(target[1])
+            if 0 <= index < len(self.main_dialog._designs):
+                self.main_dialog.show_saved_designs([(index, self.main_dialog._designs[index])])
 
 
 class LinkDesignMapTool(QgsMapTool):
@@ -703,7 +957,8 @@ class LinkDesignMapTool(QgsMapTool):
         self._index = QgsSpatialIndex()
         self._hover_band = None
         for key, info in engine.points.items():
-            feature = QgsFeature(); feature.setId(key[1])
+            feature = QgsFeature()
+            feature.setId(key[1])
             feature.setGeometry(QgsGeometry.fromPointXY(info["point"]))
             self._index.addFeature(feature)
             self._features.append((key, info))
@@ -714,8 +969,10 @@ class LinkDesignMapTool(QgsMapTool):
     def _nearest(self, pos):
         point = self.toMapCoordinates(pos)
         tolerance = self.canvas.mapUnitsPerPixel() * 24
-        rect = QgsRectangle(point.x() - tolerance, point.y() - tolerance,
-                            point.x() + tolerance, point.y() + tolerance)
+        rect = QgsRectangle(
+            point.x() - tolerance, point.y() - tolerance,
+            point.x() + tolerance, point.y() + tolerance,
+        )
         candidate_ids = self._index.intersects(rect)
         best = None
         for key, info in self._features:
@@ -756,14 +1013,15 @@ class LinkDesignMapTool(QgsMapTool):
             self._draw_hover(route)
         else:
             self._clear_hover()
-        # Deliberately do not display a live total distance.
         self.dialog._refresh_ui()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Backspace:
-            self.dialog.undo_last(); return
+            self.dialog.undo_last()
+            return
         if event.key() == Qt.Key_Escape:
-            self.dialog._stop_tool(); return
+            self.dialog._stop_tool()
+            return
         super().keyPressEvent(event)
 
     def _to_canvas_points(self, route):
@@ -789,7 +1047,10 @@ class LinkDesignMapTool(QgsMapTool):
             band = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
             band.setWidth(4)
             band.setColor(QtWidgets.QApplication.palette().highlight().color())
-            band.setToGeometry(QgsGeometry.fromPolylineXY(points), self.canvas.mapSettings().destinationCrs())
+            band.setToGeometry(
+                QgsGeometry.fromPolylineXY(points),
+                self.canvas.mapSettings().destinationCrs(),
+            )
             self._hover_band = band
 
     def _draw_hover(self, route):
@@ -800,7 +1061,10 @@ class LinkDesignMapTool(QgsMapTool):
         band = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
         band.setWidth(3)
         band.setColor(QtWidgets.QApplication.palette().highlight().color())
-        band.setToGeometry(QgsGeometry.fromPolylineXY(points), self.canvas.mapSettings().destinationCrs())
+        band.setToGeometry(
+            QgsGeometry.fromPolylineXY(points),
+            self.canvas.mapSettings().destinationCrs(),
+        )
         self._hover_band = band
 
     def _clear_hover(self):
@@ -810,6 +1074,3 @@ class LinkDesignMapTool(QgsMapTool):
             except Exception:
                 pass
             self._hover_band = None
-
-    def clear_preview_only(self):
-        self._clear_hover()
