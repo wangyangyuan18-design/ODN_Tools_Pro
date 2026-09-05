@@ -2,18 +2,16 @@
 """Compatibility layer for project-scoped Link Design management.
 
 Migrates the previous QGIS-project-scoped Link Design state into the active
-ODN Project scope when no project-scoped state exists. Written-link status is
+ODN Project scope. The active ODN Project remains the single source of truth
+for Link Design configuration and layer bindings. Written-link status is
 reconciled against the current Distribution Cable layer so manual edits made
-in QGIS do not leave stale "已写入" records. For old written Links without
-stored DC feature ids, recover ids only when every stored segment has exactly
-one matching Distribution Cable geometry; ambiguous matches are rejected
-rather than guessed.
+in QGIS do not leave stale "已写入" records.
 """
 
 import json
 
 from qgis.PyQt.QtCore import QSettings
-from qgis.core import QgsFeatureRequest, QgsGeometry
+from qgis.core import QgsFeatureRequest
 
 from . import odn_project_context as context
 from .link_design_v2 import _project_state_key as _legacy_project_state_key
@@ -45,7 +43,6 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
             except Exception:
                 state = None
             if isinstance(state, dict):
-                # Persist the migrated state immediately under this ODN Project.
                 designs = state.get("designs", [])
                 draft = state.get("draft")
                 self._designs = designs if isinstance(designs, list) else []
@@ -63,6 +60,16 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
                 self._restore_draft(draft)
         self._reconcile_written_state()
 
+    def _project_state_key(self):
+        # Link Design data belongs to the active ODN Project, not the QGIS
+        # .qgz file that happens to be open.
+        path = context.current_path()
+        if not path:
+            return "ODNToolsPro/LinkDesign/state/odn/__NO_ACTIVE_ODN_PROJECT__"
+        import os
+        normalized = os.path.normcase(os.path.abspath(path)).replace("\\", "/")
+        return f"ODNToolsPro/LinkDesign/state/odn/{normalized}"
+
     def _fresh_project_payload(self):
         # Reuse v2's authoritative reload so Project Configuration remains the
         # only source for layer bindings and operational parameters.
@@ -70,15 +77,7 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
         return _fresh_payload(self)
 
     def _reconcile_written_state(self):
-        """Make Link status reflect the actual Distribution Cable layer.
-
-        The QGIS layer is authoritative for whether a previously-written Link
-        still exists. When all recorded DC features are gone, the Link becomes
-        "已规划" again and can be written again. When only part of a Link was
-        manually deleted, its stored ownership is cleared and the Link becomes
-        "已规划" rather than guessing at which remaining features are safe to
-        keep or delete.
-        """
+        """Synchronize stored Link status with the actual Distribution Cable layer."""
         if not self._designs:
             return False
         layer = context.project_layer(self._fresh_project_payload(), "Distribution Cable")
@@ -91,23 +90,23 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
                 continue
             fids = design.get("written_fids") or []
             if not fids:
-                # Legacy records are handled lazily by _recover_written_fids.
+                # Legacy written records are handled lazily by geometry recovery.
                 continue
-            existing = []
+            all_present = True
             for fid in fids:
                 try:
                     feature = layer.getFeature(int(fid))
                 except Exception:
                     feature = None
-                if feature is not None and feature.isValid():
-                    existing.append(int(fid))
-            if len(existing) == len(fids):
+                if feature is None or not feature.isValid():
+                    all_present = False
+                    break
+            if all_present:
                 continue
 
-            # The user changed the DC layer outside Link Design. Do not keep a
-            # stale "已写入" flag. If every feature is gone, this cleanly makes
-            # the Link writable again. If only some are gone, we deliberately
-            # do not guess which remaining geometry should be removed.
+            # The user edited/deleted the DC feature(s) directly in QGIS.
+            # Do not keep a stale "已写入" state. The Link returns to the
+            # editable "已规划" state so it can be safely re-written.
             design["written"] = False
             design["written_fids"] = []
             design["external_change"] = "Distribution Cable 图层已被手动修改，Link 已重新标记为已规划。"
@@ -197,9 +196,7 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
         return super().delete_link(index)
 
     def open_completed_designs(self):
+        # Always reconcile against the live Distribution Cable layer immediately
+        # before showing the completed-design browser.
+        self._reconcile_written_state()
         return super().open_completed_designs()
-
-
-class CompletedDesignDialog(_ProjectScopedLinkDesignDialog.__mro__[1]):
-    """Unused compatibility declaration; actual dialog is injected below."""
-    pass
