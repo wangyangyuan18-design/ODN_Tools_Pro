@@ -19,7 +19,9 @@ from . import odn_project_context as context
 PARAM_DEFAULTS = {
     "fdt_max_links": 4,
     "max_fats_per_link": 4,
-    "pole_spacing_max": 65.0,
+    "existing_existing_max_distance": 65.0,
+    "existing_new_max_distance": 65.0,
+    "new_new_max_distance": 50.0,
     "fat_pole_max_distance": 3.0,
     "bb_return_threshold": 100.0,
 }
@@ -108,19 +110,23 @@ class OdnProjectConfigDialog(QDialog):
         params_layout = QFormLayout(param_box)
         self.fdt_max_links = self._spin(1, 999, 4)
         self.max_fats_per_link = self._spin(1, 999, 4)
-        self.pole_spacing_max = self._double_spin(0.01, 99999, 65.0)
+        self.existing_existing_max_distance = self._double_spin(0.01, 99999, 65.0)
+        self.existing_new_max_distance = self._double_spin(0.01, 99999, 65.0)
+        self.new_new_max_distance = self._double_spin(0.01, 99999, 50.0)
         self.fat_pole_max_distance = self._double_spin(0.01, 9999, 3.0)
         self.bb_return_threshold = self._double_spin(0.01, 999999, 100.0)
         params_layout.addRow("FDT 最大 Link 数：", self.fdt_max_links)
         params_layout.addRow("每条 Link 最大 FAT：", self.max_fats_per_link)
-        params_layout.addRow("杆间距最大值（m）：", self.pole_spacing_max)
+        params_layout.addRow("最大允许距离（米）· Existing Pole-Existing Pole：", self.existing_existing_max_distance)
+        params_layout.addRow("最大允许距离（米）· Existing Pole-New Pole：", self.existing_new_max_distance)
+        params_layout.addRow("最大允许距离（米）· New Pole-New Pole：", self.new_new_max_distance)
         params_layout.addRow("FAT 挂杆最大距离（m）：", self.fat_pole_max_distance)
         params_layout.addRow("BB 回程长度参考值（m）：", self.bb_return_threshold)
         outer.addWidget(param_box)
 
         info = QLabel(
-            "以上设置属于当前 ODN Project。ODN 2.0 / ODN 2.1 可以在这里切换；"
-            "切换版本不会自动删除已有图层绑定。保存后将按当前版本重新检查项目配置。"
+            "以上设置属于当前 ODN Project。杆间距采用三类端点组合规则；"
+            "超距增点只读取并执行这里保存的规则，不在功能界面重复设置。"
         )
         info.setStyleSheet("color:#666;padding:6px;")
         info.setWordWrap(True)
@@ -201,13 +207,33 @@ class OdnProjectConfigDialog(QDialog):
             cb.setChecked(role in (set(nodes) if nodes else defaults))
 
         params = payload.setdefault("parameters", {})
-        # Migrate old project parameter keys to the new five-parameter schema.
-        legacy_keys = ("fat_ideal_min", "fat_ideal_max", "fat_accept_min", "fat_capacity_max")
-        for key in legacy_keys:
-            params.pop(key, None)
+        # Migrate old project parameter keys to the new distance-rule schema.
+        legacy_spacing = params.pop("pole_spacing_max", None)
+        if legacy_spacing is not None:
+            try:
+                legacy_spacing = float(legacy_spacing)
+            except (TypeError, ValueError):
+                legacy_spacing = None
         self._set_value(self.fdt_max_links, params, "fdt_max_links", PARAM_DEFAULTS["fdt_max_links"])
         self._set_value(self.max_fats_per_link, params, "max_fats_per_link", PARAM_DEFAULTS["max_fats_per_link"])
-        self._set_value(self.pole_spacing_max, params, "pole_spacing_max", PARAM_DEFAULTS["pole_spacing_max"])
+        self._set_value(
+            self.existing_existing_max_distance,
+            params,
+            "existing_existing_max_distance",
+            legacy_spacing if legacy_spacing is not None else PARAM_DEFAULTS["existing_existing_max_distance"],
+        )
+        self._set_value(
+            self.existing_new_max_distance,
+            params,
+            "existing_new_max_distance",
+            legacy_spacing if legacy_spacing is not None else PARAM_DEFAULTS["existing_new_max_distance"],
+        )
+        self._set_value(
+            self.new_new_max_distance,
+            params,
+            "new_new_max_distance",
+            PARAM_DEFAULTS["new_new_max_distance"],
+        )
         self._set_value(self.fat_pole_max_distance, params, "fat_pole_max_distance", PARAM_DEFAULTS["fat_pole_max_distance"])
         self._set_value(self.bb_return_threshold, params, "bb_return_threshold", PARAM_DEFAULTS["bb_return_threshold"])
 
@@ -380,7 +406,6 @@ class OdnProjectConfigDialog(QDialog):
         self._update_field_state(role)
 
     def _update_field_state(self, role):
-        # Keep the status column dedicated to layer availability.
         return
 
     def _layer_changed(self, role, refresh_fields=True):
@@ -399,7 +424,6 @@ class OdnProjectConfigDialog(QDialog):
             field_registry.pop(role, None)
         else:
             registry[role] = self._serialize_layer(layer)
-            # Keep any existing field mapping, but refresh combos against the new layer.
         if refresh_fields:
             self._refresh_inline_fields(role, combo)
 
@@ -442,12 +466,15 @@ class OdnProjectConfigDialog(QDialog):
         project["design_standard"] = self.standard_combo.currentText().strip() or "默认设计标准"
         project["node_types"] = [role for role, cb in self.node_checks.items() if cb.isChecked()]
         params = self.payload.setdefault("parameters", {})
+        params.pop("pole_spacing_max", None)
         for key in ("fat_ideal_min", "fat_ideal_max", "fat_accept_min", "fat_capacity_max"):
             params.pop(key, None)
         params.update({
             "fdt_max_links": self.fdt_max_links.value(),
             "max_fats_per_link": self.max_fats_per_link.value(),
-            "pole_spacing_max": self.pole_spacing_max.value(),
+            "existing_existing_max_distance": self.existing_existing_max_distance.value(),
+            "existing_new_max_distance": self.existing_new_max_distance.value(),
+            "new_new_max_distance": self.new_new_max_distance.value(),
             "fat_pole_max_distance": self.fat_pole_max_distance.value(),
             "bb_return_threshold": self.bb_return_threshold.value(),
         })
@@ -511,11 +538,13 @@ class OdnProjectConfigDialog(QDialog):
 
         params = self.payload.get("parameters", {})
         messages.append(
-            "参数：FDT 最大 Link={0}，每条 Link 最大 FAT={1}，杆间距={2:g}m，"
-            "FAT 挂杆距离={3:g}m，BB 回程参考={4:g}m".format(
+            "参数：FDT 最大 Link={0}，每条 Link 最大 FAT={1}，"
+            "EE={2:g}m，EN={3:g}m，NN={4:g}m，FAT 挂杆距离={5:g}m，BB 回程参考={6:g}m".format(
                 params.get("fdt_max_links", 4),
                 params.get("max_fats_per_link", 4),
-                params.get("pole_spacing_max", 65.0),
+                params.get("existing_existing_max_distance", 65.0),
+                params.get("existing_new_max_distance", 65.0),
+                params.get("new_new_max_distance", 50.0),
                 params.get("fat_pole_max_distance", 3.0),
                 params.get("bb_return_threshold", 100.0),
             )
@@ -528,6 +557,16 @@ class OdnProjectConfigDialog(QDialog):
         )
         self.check_list.setText("\n".join(messages))
         return errors
+
+    def _serialize_layer(self, layer):
+        return {
+            "layer_id": layer.id(),
+            "display_name": layer.name(),
+            "provider": layer.providerType(),
+            "source": layer.source(),
+            "geometry": QgsWkbTypes.displayString(layer.wkbType()),
+            "crs": layer.crs().authid(),
+        }
 
     def _save(self):
         if not self.payload:
