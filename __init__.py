@@ -5,11 +5,11 @@ import os
 
 
 def classFactory(iface):
-    """Load the ODN Tools Pro plugin."""
+    """Load the rebuilt ODN Tools Pro plugin."""
     from .pole_trace_connect import PoleTraceDialog
     from .overlength_pole import OverlengthPoleDialog
     from .odn_project_manager import OdnProjectManager, initialize_project_manager_context
-    from .odn_project_config import open_project_config
+    from .odn_project_config import open_project_config, OdnProjectConfigDialog
     from .odn_project_validation import install_validation_page
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
@@ -22,7 +22,7 @@ def classFactory(iface):
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
-    install_project_config_fix(type(open_project_config).__name__ if False else object)
+    install_project_config_fix(OdnProjectConfigDialog)
     install_scheme3_policy(Scheme3Dialog)
     install_scheme3_route_preview_fix(Scheme3Dialog, Scheme3Engine, Scheme3MapTool)
     install_project_ui_policy(Scheme3Dialog)
@@ -39,7 +39,6 @@ def classFactory(iface):
             self.toolbar = None
 
         def initGui(self):
-            from qgis.PyQt.QtGui import QIcon
             from qgis.PyQt.QtWidgets import QAction, QMenu
 
             main_window = self.iface.mainWindow()
