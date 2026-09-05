@@ -1,0 +1,106 @@
+name: Build QGIS Plugin ZIP
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '.github/workflows/build-qgis-plugin.yml'
+      - 'ODN_Tools_Pro.zip'
+      - 'ODN_Tools_Pro-QGIS-Plugin.ZIP'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate QGIS plugin structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f metadata.txt
+          test -f __init__.py
+          test -s metadata.txt
+          grep -q '^name=' metadata.txt
+          grep -q '^version=' metadata.txt
+          grep -q 'def classFactory' __init__.py
+
+      - name: Prepare plugin package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf package
+          mkdir -p package/ODN_Tools_Pro
+
+          # Copy only source files needed by the QGIS plugin.
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='.gitignore' \
+            --exclude='package/' \
+            --exclude='ODN_Tools_Pro.zip' \
+            --exclude='ODN_Tools_Pro-QGIS-Plugin.ZIP' \
+            ./ package/ODN_Tools_Pro/
+
+          # Remove development/cache files that must not be shipped.
+          find package/ODN_Tools_Pro -type d \( -name '__pycache__' -o -name '.pytest_cache' \) -prune -exec rm -rf {} +
+          find package/ODN_Tools_Pro -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+
+      - name: Validate packaged plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f package/ODN_Tools_Pro/metadata.txt
+          test -f package/ODN_Tools_Pro/__init__.py
+          grep -q 'def classFactory' package/ODN_Tools_Pro/__init__.py
+
+          python - <<'PY'
+          from pathlib import Path
+          root = Path('package/ODN_Tools_Pro')
+          metadata = (root / 'metadata.txt').read_text(encoding='utf-8')
+          values = {}
+          for line in metadata.splitlines():
+              if '=' in line and not line.startswith('#'):
+                  k, v = line.split('=', 1)
+                  values[k.strip()] = v.strip()
+          assert values.get('name') == 'ODN_Tools_Pro', values
+          assert values.get('version'), values
+          print('Plugin:', values['name'])
+          print('Version:', values['version'])
+          PY
+
+      - name: Build inner QGIS plugin ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd package
+          zip -r ../ODN_Tools_Pro.zip ODN_Tools_Pro -x '*/__pycache__/*' '*.pyc' '*.pyo'
+          cd ..
+          unzip -l ODN_Tools_Pro.zip
+          unzip -t ODN_Tools_Pro.zip
+
+      - name: Build outer delivery ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f ODN_Tools_Pro-QGIS-Plugin.ZIP
+          zip ODN_Tools_Pro-QGIS-Plugin.ZIP ODN_Tools_Pro.zip
+          unzip -l ODN_Tools_Pro-QGIS-Plugin.ZIP
+          unzip -t ODN_Tools_Pro-QGIS-Plugin.ZIP
+
+      - name: Upload plugin packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ODN_Tools_Pro-QGIS-Plugin
+          path: |
+            ODN_Tools_Pro-QGIS-Plugin.ZIP
+            ODN_Tools_Pro.zip
+          if-no-files-found: error
+          retention-days: 30
