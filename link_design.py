@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Interactive ODN Link Design.
 
-Link Design is a user-facing ODN function.  It no longer depends on the
-historical Scheme 3 concept; physical routing is supplied by the ODN Project
-routing service.
+All operational layers and design limits come from the active ODN Project.
+This module contains only the user interaction; physical routing is provided
+by :mod:`odn_project_routing`.
 """
 from math import sqrt
 import json
@@ -26,30 +26,50 @@ def _payload(dialog):
     return context.current_payload() or getattr(dialog, "_odn_project_payload", None) or {}
 
 
-def _max_links(dialog):
+def _project_layers(payload):
+    return {
+        role: context.project_layer(payload, role)
+        for role in ("FDT", "FAT", "Existing Pole", "New Pole", "Pole Edge")
+    }
+
+
+def _required_int(dialog, key):
+    value = (_payload(dialog).get("parameters", {}) or {}).get(key)
     try:
-        return max(1, int((_payload(dialog).get("parameters", {}) or {}).get("fdt_max_links", 4)))
-    except Exception:
-        return 4
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 1 else None
 
 
-def _next_link(dialog, fdt_label):
-    used = {d.get("link") for d in dialog._designs if d.get("fdt") == fdt_label}
-    for index in range(1, _max_links(dialog) + 1):
-        link = f"L{index}"
-        if link not in used:
-            return link
-    return None
+def _max_links(dialog):
+    return _required_int(dialog, "fdt_max_links")
+
+
+def _max_fats(dialog):
+    return _required_int(dialog, "max_fats_per_link")
+
+
+def _assigned_fat_ids(dialog):
+    result = set()
+    for design in dialog._designs:
+        for item in design.get("nodes", []):
+            try:
+                result.add(int(item[0]))
+            except (TypeError, ValueError, IndexError):
+                continue
+    return result
 
 
 def _planned_fats(dialog):
-    labels = set()
-    for design in dialog._designs:
-        labels.update(x[1] for x in design.get("nodes", []))
+    ids = _assigned_fat_ids(dialog)
     for item in dialog._sequence:
         if item[0] == "FAT":
-            labels.add(item[2])
-    return len(labels)
+            try:
+                ids.add(int(item[1]))
+            except (TypeError, ValueError, IndexError):
+                pass
+    return len(ids)
 
 
 def _total_fats(dialog):
@@ -57,8 +77,28 @@ def _total_fats(dialog):
     return int(layer.featureCount()) if layer is not None else 0
 
 
+def _next_link(dialog, fdt_label):
+    limit = _max_links(dialog)
+    if limit is None:
+        return None
+    used = {d.get("link") for d in dialog._designs if d.get("fdt") == fdt_label}
+    for index in range(1, limit + 1):
+        candidate = f"L{index}"
+        if candidate not in used:
+            return candidate
+    return None
+
+
+def _points_are_expected(layer, geometry_type):
+    return (
+        layer is not None
+        and layer.type() == layer.VectorLayer
+        and QgsWkbTypes.geometryType(layer.wkbType()) == geometry_type
+    )
+
+
 class LinkDesignDialog(QtWidgets.QDialog):
-    """Compact, project-driven Link Design dialog."""
+    """Compact Link Design UI driven entirely by the active ODN Project."""
 
     def __init__(self, iface, parent=None):
         super().__init__(parent or iface.mainWindow())
@@ -143,8 +183,8 @@ class LinkDesignDialog(QtWidgets.QDialog):
 
     def _prepare_engine(self):
         payload = _payload(self)
-        missing = [role for role in ("FDT", "FAT", "Pole Edge")
-                   if context.project_layer(payload, role) is None]
+        layers = _project_layers(payload)
+        missing = [role for role in ("FDT", "FAT", "Pole Edge") if layers[role] is None]
         if missing:
             QtWidgets.QMessageBox.warning(
                 self, "链路设计",
@@ -153,11 +193,35 @@ class LinkDesignDialog(QtWidgets.QDialog):
                 + "\n\n请先在【项目配置】中修正。"
             )
             return None
+
+        if QgsWkbTypes.geometryType(layers["FDT"].wkbType()) != QgsWkbTypes.PointGeometry:
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FDT 不是点图层。")
+            return None
+        if QgsWkbTypes.geometryType(layers["FAT"].wkbType()) != QgsWkbTypes.PointGeometry:
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FAT 不是点图层。")
+            return None
+        if QgsWkbTypes.geometryType(layers["Pole Edge"].wkbType()) != QgsWkbTypes.LineGeometry:
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 Pole Edge 不是线图层。")
+            return None
+
+        if _max_links(self) is None or _max_fats(self) is None:
+            QtWidgets.QMessageBox.warning(
+                self, "链路设计",
+                "当前 ODN Project 缺少有效的“FDT 最大 Link 数”或“每条 Link 最大 FAT”参数。\n\n"
+                "请先在【项目配置 → 设计设置】中完成配置。"
+            )
+            return None
+
         params = payload.get("parameters", {}) or {}
         try:
-            attach = float(params.get("fat_pole_max_distance", 3.0))
-        except Exception:
-            attach = 3.0
+            attach = float(params["fat_pole_max_distance"])
+        except (KeyError, TypeError, ValueError):
+            QtWidgets.QMessageBox.warning(
+                self, "链路设计",
+                "当前 ODN Project 缺少有效的 FAT 挂杆最大距离参数，请先在【项目配置】中配置。"
+            )
+            return None
+
         engine = OdnProjectRouteEngine(self.iface, payload, attach)
         if not engine.ready():
             QtWidgets.QMessageBox.warning(self, "链路设计", "当前项目的 FDT、FAT 或 Pole Edge 无法使用。")
@@ -188,10 +252,9 @@ class LinkDesignDialog(QtWidgets.QDialog):
     def _start_from_hit(self, info):
         if info["typ"] == "FDT":
             link = _next_link(self, info["label"])
-            if not link:
-                QtWidgets.QMessageBox.warning(
-                    self, "链路设计",
-                    f"{info['label']} 已达到项目配置的最大 Link 数：{_max_links(self)}。"
+            if link is None:
+                self.status.setText(
+                    f"状态：{info['label']} 已达到项目配置的最大 Link 数：{_max_links(self) or '未配置'}。"
                 )
                 return False
             self._direction = "FDT_TO_FAT"
@@ -201,7 +264,11 @@ class LinkDesignDialog(QtWidgets.QDialog):
             self._sequence = [("FDT", info["feature_id"], info["label"])]
             self.status.setText(f"状态：{info['label']}/{link}，请继续点击 FAT。")
             return True
+
         if info["typ"] == "FAT":
+            if info["feature_id"] in _assigned_fat_ids(self):
+                self.status.setText(f"状态：{info['label']} 已分配到其他 Link，不能重复使用。")
+                return False
             self._direction = "FAT_TO_FDT"
             self._sequence = [("FAT", info["feature_id"], info["label"])]
             self.status.setText(
@@ -220,6 +287,19 @@ class LinkDesignDialog(QtWidgets.QDialog):
         if any(item[0] == "FAT" and item[1] == info["feature_id"] for item in self._sequence):
             self.status.setText(f"状态：{info['label']} 已在当前链路中。")
             return
+        if info["feature_id"] in _assigned_fat_ids(self):
+            self.status.setText(f"状态：{info['label']} 已分配到其他 Link，不能重复使用。")
+            return
+        max_fats = _max_fats(self)
+        current_fats = sum(1 for item in self._sequence if item[0] == "FAT")
+        if max_fats is None:
+            self.status.setText("状态：当前项目未配置“每条 Link 最大 FAT”。")
+            return
+        if current_fats >= max_fats:
+            self.status.setText(
+                f"状态：当前 Link 已达到项目配置的 FAT 上限：{max_fats}。"
+            )
+            return
         previous = self._sequence[-1]
         route = self._engine.route(previous[0], previous[1], "FAT", info["feature_id"])
         if route is None:
@@ -237,10 +317,9 @@ class LinkDesignDialog(QtWidgets.QDialog):
         if self._direction != "FAT_TO_FDT" or not self._sequence:
             return
         link = _next_link(self, info["label"])
-        if not link:
-            QtWidgets.QMessageBox.warning(
-                self, "链路设计",
-                f"{info['label']} 已达到项目配置的最大 Link 数：{_max_links(self)}。"
+        if link is None:
+            self.status.setText(
+                f"状态：{info['label']} 已达到项目配置的最大 Link 数：{_max_links(self) or '未配置'}。"
             )
             return
         previous = self._sequence[-1]
@@ -265,6 +344,14 @@ class LinkDesignDialog(QtWidgets.QDialog):
             self.status.setText("状态：当前链路至少需要 1 个 FAT。")
             return False
 
+        max_fats = _max_fats(self)
+        if max_fats is None:
+            self.status.setText("状态：当前项目未配置“每条 Link 最大 FAT”。")
+            return False
+        if len(fats) > max_fats:
+            self.status.setText(f"状态：当前 Link FAT 数 {len(fats)} 超过项目配置上限 {max_fats}。")
+            return False
+
         routes = []
         for first, second in zip(self._sequence[:-1], self._sequence[1:]):
             route = self._engine.route(first[0], first[1], second[0], second[1])
@@ -282,6 +369,7 @@ class LinkDesignDialog(QtWidgets.QDialog):
             "nodes": [(item[1], item[2]) for item in fats],
             "length": round(total, 3),
             "sequence": [item[2] for item in self._sequence],
+            "sequence_ids": [(item[0], item[1]) for item in self._sequence],
             "direction": self._direction,
             "segments": [
                 {"from": r["from_label"], "to": r["to_label"],
@@ -344,13 +432,15 @@ class LinkDesignDialog(QtWidgets.QDialog):
     def undo_last(self):
         if not self._sequence:
             return
-        self._sequence.pop()
+        removed = self._sequence.pop()
+        if removed[0] == "FAT":
+            self._refresh_ui()
         if not self._sequence:
             self._direction = None
             self._current_fdt = None
             self._current_fdt_id = None
             self._current_link = None
-        elif self._direction == "FAT_TO_FDT":
+        elif self._direction == "FAT_TO_FDT" and self._sequence[-1][0] == "FAT":
             self._current_fdt = None
             self._current_fdt_id = None
             self._current_link = None
@@ -361,17 +451,24 @@ class LinkDesignDialog(QtWidgets.QDialog):
     def prospective_route(self, info):
         if not self._sequence or not self._engine:
             return None
-        previous = self._sequence[-1]
-        if info["typ"] in ("FAT", "FDT"):
-            if info["typ"] == "FDT" and self._direction != "FAT_TO_FDT":
+        if info["typ"] == "FDT" and self._direction != "FAT_TO_FDT":
+            return None
+        if info["typ"] == "FAT":
+            if info["feature_id"] in _assigned_fat_ids(self):
                 return None
-            return self._engine.route(previous[0], previous[1], info["typ"], info["feature_id"])
-        return None
+            max_fats = _max_fats(self)
+            current_fats = sum(1 for item in self._sequence if item[0] == "FAT")
+            if max_fats is None or current_fats >= max_fats:
+                return None
+        previous = self._sequence[-1]
+        return self._engine.route(previous[0], previous[1], info["typ"], info["feature_id"])
 
     def _refresh_ui(self, hover_info=None):
         self.link_count_label.setText(f"已规划链路：{len(self._designs)}")
         self.planned_fat_label.setText(f"已规划 FAT：{_planned_fats(self)}")
-        self.total_fat_label.setText(f"③ 总 FAT：{_total_fats(self)}，已设计 FAT：{_planned_fats(self)}")
+        self.total_fat_label.setText(
+            f"③ 总 FAT：{_total_fats(self)}，已设计 FAT：{_planned_fats(self)}"
+        )
 
         if not self._sequence:
             self.plan_label.setText("① 规划中（显示实时距离）：等待开始")
@@ -413,7 +510,7 @@ class LinkDesignDialog(QtWidgets.QDialog):
 
 
 class LinkDesignMapTool(QgsMapTool):
-    """Canvas interaction for FDT/FAT Link Design."""
+    """Canvas interaction for project-configured FDT/FAT Link Design."""
 
     def __init__(self, iface, engine, dialog):
         super().__init__(iface.mapCanvas())
