@@ -13,13 +13,13 @@ from . import odn_project_context as context
 
 
 class OverlengthPoleDialog(QtWidgets.QDialog):
-    """Insert poles using only the active ODN Project's pole layers and spacing rule."""
+    """Insert poles using only the active ODN Project's pole layers and spacing rules."""
 
     def __init__(self, iface, parent=None):
         super().__init__(parent or iface.mainWindow())
         self.iface = iface
         self.setWindowTitle("超距增点")
-        self.setMinimumWidth(470)
+        self.setMinimumWidth(520)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setSpacing(9)
 
@@ -37,13 +37,15 @@ class OverlengthPoleDialog(QtWidgets.QDialog):
         self.line_label.setFrameStyle(QtWidgets.QFrame.StyledPanel | QtWidgets.QFrame.Sunken)
         lay.addWidget(self.line_label)
 
-        self.rule_label = QtWidgets.QLabel("杆间距最大值（项目配置）：—")
+        lay.addWidget(QtWidgets.QLabel("最大允许距离（米）"))
+        self.rule_label = QtWidgets.QLabel("—")
         self.rule_label.setFrameStyle(QtWidgets.QFrame.StyledPanel | QtWidgets.QFrame.Sunken)
+        self.rule_label.setStyleSheet("padding:6px;")
         lay.addWidget(self.rule_label)
 
         tip = QtWidgets.QLabel(
-            "新增杆位直接写入当前 ODN Project 绑定的 New Pole 图层；"
-            "Pole Edge 也只使用当前项目配置的图层。工具不提供独立工程距离参数。"
+            "以上规则来自当前 ODN Project 配置。超距增点根据 Pole Edge 两端的杆类型自动选择对应规则，"
+            "本功能不提供距离参数修改。新增杆位直接写入当前项目绑定的 New Pole 图层。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#666; padding:4px 0;")
@@ -56,6 +58,7 @@ class OverlengthPoleDialog(QtWidgets.QDialog):
         cancel.clicked.connect(self.reject)
         lay.addWidget(buttons)
         self._ok_button = ok
+        self._distance_rules = None
         self._load_project_layers()
 
     def _load_project_layers(self):
@@ -68,7 +71,12 @@ class OverlengthPoleDialog(QtWidgets.QDialog):
         new = context.project_layer(payload, "New Pole")
         edge = context.project_layer(payload, "Pole Edge")
         params = payload.get("parameters", {}) or {}
-        max_spacing = params.get("pole_spacing_max")
+        rules = {
+            "existing_existing": params.get("existing_existing_max_distance"),
+            "existing_new": params.get("existing_new_max_distance"),
+            "new_new": params.get("new_new_max_distance"),
+        }
+        self._distance_rules = rules
 
         names = []
         if existing is not None:
@@ -77,19 +85,27 @@ class OverlengthPoleDialog(QtWidgets.QDialog):
             names.append(f"New Pole：{new.name()}")
         self.pole_label.setText("\n".join(names) if names else "未绑定")
         self.line_label.setText(edge.name() if edge is not None else "未绑定")
+
+        def fmt(value):
+            try:
+                return f"{float(value):g} m"
+            except (TypeError, ValueError):
+                return "未配置"
+
         self.rule_label.setText(
-            "杆间距最大值（项目配置）："
-            + (f"{float(max_spacing):g} m" if max_spacing is not None else "未配置")
+            "Existing Pole - Existing Pole：" + fmt(rules["existing_existing"]) + "\n"
+            "Existing Pole - New Pole：" + fmt(rules["existing_new"]) + "\n"
+            "New Pole - New Pole：" + fmt(rules["new_new"])
         )
 
-        valid_spacing = False
-        try:
-            valid_spacing = float(max_spacing) > 0
-        except (TypeError, ValueError):
-            pass
+        valid_rules = True
+        for value in rules.values():
+            try:
+                if float(value) <= 0:
+                    valid_rules = False
+            except (TypeError, ValueError):
+                valid_rules = False
 
-        # A tool whose purpose is to add poles must have a project-configured
-        # New Pole layer. Existing poles are optional inputs.
         self._ok_button.setEnabled(
             new is not None
             and new.type() == QgsMapLayerType.VectorLayer
@@ -97,7 +113,7 @@ class OverlengthPoleDialog(QtWidgets.QDialog):
             and edge is not None
             and edge.type() == QgsMapLayerType.VectorLayer
             and QgsWkbTypes.geometryType(edge.wkbType()) == QgsWkbTypes.LineGeometry
-            and valid_spacing
+            and valid_rules
         )
 
     def _start(self):
@@ -107,10 +123,17 @@ class OverlengthPoleDialog(QtWidgets.QDialog):
         existing = context.project_layer(payload, "Existing Pole")
         new = context.project_layer(payload, "New Pole")
         edge = context.project_layer(payload, "Pole Edge")
+        params = payload.get("parameters", {}) or {}
         try:
-            max_spacing = float((payload.get("parameters", {}) or {})["pole_spacing_max"])
+            distance_rules = {
+                "existing_existing": float(params["existing_existing_max_distance"]),
+                "existing_new": float(params["existing_new_max_distance"]),
+                "new_new": float(params["new_new_max_distance"]),
+            }
+            if any(value <= 0 for value in distance_rules.values()):
+                raise ValueError
         except (KeyError, TypeError, ValueError):
-            QtWidgets.QMessageBox.warning(self, "超距增点", "当前 ODN Project 未配置有效的杆间距最大值。")
+            QtWidgets.QMessageBox.warning(self, "超距增点", "当前 ODN Project 未配置完整且有效的最大允许距离规则。")
             return
 
         if new is None or edge is None:
@@ -129,7 +152,7 @@ class OverlengthPoleDialog(QtWidgets.QDialog):
             payload,
             [("Existing Pole", existing), ("New Pole", new)],
             edge,
-            max_spacing,
+            distance_rules,
         ).run()
 
 
@@ -137,14 +160,19 @@ class OverlengthPoleProcessor:
     SEARCH_METERS = 3.0
     IMPROVEMENT_METERS = 5.0
 
-    def __init__(self, iface, payload, pole_layers, line_layer, max_spacing):
+    def __init__(self, iface, payload, pole_layers, line_layer, distance_rules):
         self.iface = iface
         self.project = QgsProject.instance()
         self.payload = payload or {}
         self.pole_layers = [(role, layer) for role, layer in pole_layers if layer is not None]
         self.new_pole_layer = next((layer for role, layer in self.pole_layers if role == "New Pole"), None)
         self.line_layer = line_layer
-        self.max_spacing = float(max_spacing)
+        self.distance_rules = {
+            "existing_existing": float(distance_rules["existing_existing"]),
+            "existing_new": float(distance_rules["existing_new"]),
+            "new_new": float(distance_rules["new_new"]),
+        }
+        self.max_spacing = self.distance_rules["existing_existing"]
         self.da = QgsDistanceArea()
         self.da.setEllipsoid(self.project.ellipsoid())
         self._index = QgsSpatialIndex()
@@ -209,6 +237,31 @@ class OverlengthPoleProcessor:
             except Exception:
                 pass
         return result
+
+    def _endpoint_role(self, endpoint, candidates):
+        best = None
+        best_distance = float("inf")
+        for _, data, point in candidates:
+            try:
+                distance = QgsGeometry.fromPointXY(QgsPointXY(endpoint)).distance(
+                    QgsGeometry.fromPointXY(QgsPointXY(point))
+                )
+            except Exception:
+                continue
+            if distance < best_distance:
+                best_distance = distance
+                best = data[3]
+        return best
+
+    def _spacing_for_line(self, points, candidates):
+        start_role = self._endpoint_role(points[0], candidates)
+        end_role = self._endpoint_role(points[-1], candidates)
+        roles = {start_role, end_role}
+        if start_role == "New Pole" and end_role == "New Pole":
+            return self.distance_rules["new_new"]
+        if roles & {"New Pole"}:
+            return self.distance_rules["existing_new"]
+        return self.distance_rules["existing_existing"]
 
     @staticmethod
     def _parts(geometry):
@@ -408,54 +461,56 @@ class OverlengthPoleProcessor:
         if layer is None:
             self._msg("项目配置中的 Pole Edge 不存在。", 2)
             return
-        self._prepare_poles()
-        features = list(layer.getFeatures())
-        unique, duplicate_ids = self._remove_duplicates(features)
-        if duplicate_ids:
-            layer.startEditing()
+
+        try:
+            self._prepare_poles()
+            if self.new_pole_layer.editBuffer() is None:
+                if not self.new_pole_layer.startEditing():
+                    raise RuntimeError("New Pole 图层无法进入编辑状态。")
+            if layer.editBuffer() is None:
+                if not layer.startEditing():
+                    raise RuntimeError("Pole Edge 图层无法进入编辑状态。")
+
+            features = list(layer.getFeatures())
+            unique, duplicate_ids = self._remove_duplicates(features)
             for feature_id in duplicate_ids:
                 layer.deleteFeature(feature_id)
-            layer.commitChanges()
             self._stats["duplicates"] = len(duplicate_ids)
 
-        replacements = []
-        for feature in unique:
-            geometry = feature.geometry()
-            if geometry.isEmpty():
-                continue
-            parts = self._parts(geometry)
-            changed = False
-            new_geometries = []
-            for points in parts:
-                if len(points) < 2:
+            replacements = []
+            for feature in unique:
+                geometry = feature.geometry()
+                if geometry.isEmpty():
                     continue
-                self._last_pts = [QgsPointXY(point) for point in points]
-                _, total = self._cum_lengths(points)
-                candidates = self._query_poles(geometry)
-                existing = self._choose_existing(points, candidates)
-                if not self._has_overlength(existing, total):
-                    new_geometries.append(QgsGeometry.fromPolylineXY(self._last_pts))
-                    continue
+                parts = self._parts(geometry)
+                changed = False
+                new_geometries = []
+                for points in parts:
+                    if len(points) < 2:
+                        continue
+                    self._last_pts = [QgsPointXY(point) for point in points]
+                    _, total = self._cum_lengths(points)
+                    candidates = self._query_poles(geometry)
+                    self.max_spacing = self._spacing_for_line(points, candidates)
+                    existing = self._choose_existing(points, candidates)
+                    if not self._has_overlength(existing, total):
+                        new_geometries.append(QgsGeometry.fromPolylineXY(self._last_pts))
+                        continue
 
-                self._stats["over"] += 1
-                changed = True
-                dynamic = self._make_new_cuts(existing, total)
-                while self._has_overlength(dynamic, total):
-                    before = len(dynamic)
-                    dynamic = self._make_new_cuts(dynamic, total)
-                    if len(dynamic) == before:
-                        break
-                new_geometries.extend(self._subline(points, dynamic))
-                self._stats["segments"] += len(new_geometries)
+                    self._stats["over"] += 1
+                    changed = True
+                    dynamic = self._make_new_cuts(existing, total)
+                    while self._has_overlength(dynamic, total):
+                        before = len(dynamic)
+                        dynamic = self._make_new_cuts(dynamic, total)
+                        if len(dynamic) == before:
+                            break
+                    new_geometries.extend(self._subline(points, dynamic))
+                    self._stats["segments"] += len(new_geometries)
 
-            if changed:
-                replacements.append((feature.id(), feature, new_geometries))
+                if changed:
+                    replacements.append((feature.id(), feature, new_geometries))
 
-        # Roll back project edits if writing the configured New Pole layer fails.
-        try:
-            if self.new_pole_layer.editBuffer() is None:
-                self.new_pole_layer.startEditing()
-            layer.startEditing()
             for feature_id, feature, geometries in replacements:
                 layer.deleteFeature(feature_id)
                 for geometry in geometries:
@@ -463,12 +518,13 @@ class OverlengthPoleProcessor:
                     new_feature.setGeometry(geometry)
                     new_feature.setAttributes(feature.attributes())
                     layer.addFeature(new_feature)
+
             if not layer.commitChanges():
                 raise RuntimeError("Pole Edge 修改无法提交。")
             if not self.new_pole_layer.commitChanges():
                 raise RuntimeError("New Pole 修改无法提交。")
         except Exception:
-            if self.new_pole_layer.isEditable():
+            if self.new_pole_layer is not None and self.new_pole_layer.isEditable():
                 self.new_pole_layer.rollBack()
             if layer.isEditable():
                 layer.rollBack()
