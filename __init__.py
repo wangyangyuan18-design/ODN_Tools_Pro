@@ -15,7 +15,7 @@ def classFactory(iface):
     from .odn_project_validation import install_validation_page
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
-    from .link_design import LinkDesignDialog
+    from .link_design_v2 import LinkDesignDialog
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
@@ -44,7 +44,9 @@ def classFactory(iface):
         def _add(self, text, callback, icon_relpath):
             action = QAction(QIcon(os.path.join(self.plugin_dir, icon_relpath)), text, self.iface.mainWindow())
             action.triggered.connect(callback)
-            self.menu.addAction(action); self.toolbar.addAction(action); self.actions.append(action)
+            self.menu.addAction(action)
+            self.toolbar.addAction(action)
+            self.actions.append(action)
 
         def project_manager(self):
             OdnProjectManager(self.iface, self.iface.mainWindow()).exec_()
@@ -66,18 +68,23 @@ def classFactory(iface):
 
         def unload(self):
             for action in self.actions:
-                try: action.deleteLater()
-                except Exception: pass
+                try:
+                    action.deleteLater()
+                except Exception:
+                    pass
             self.actions.clear()
             if self.toolbar is not None:
-                try: self.iface.mainWindow().removeToolBar(self.toolbar)
-                except Exception: pass
+                try:
+                    self.iface.mainWindow().removeToolBar(self.toolbar)
+                except Exception:
+                    pass
                 self.toolbar = None
             if self.menu is not None:
                 try:
                     self.iface.mainWindow().menuBar().removeAction(self.menu.menuAction())
                     self.menu.deleteLater()
-                except Exception: pass
+                except Exception:
+                    pass
                 self.menu = None
 
     return ODNToolsPro(iface)
