@@ -26,13 +26,6 @@ def _payload(dialog):
     return context.current_payload() or getattr(dialog, "_odn_project_payload", None) or {}
 
 
-def _project_layers(payload):
-    return {
-        role: context.project_layer(payload, role)
-        for role in ("FDT", "FAT", "Existing Pole", "New Pole", "Pole Edge")
-    }
-
-
 def _required_int(dialog, key):
     value = (_payload(dialog).get("parameters", {}) or {}).get(key)
     try:
@@ -87,14 +80,6 @@ def _next_link(dialog, fdt_label):
         if candidate not in used:
             return candidate
     return None
-
-
-def _points_are_expected(layer, geometry_type):
-    return (
-        layer is not None
-        and layer.type() == layer.VectorLayer
-        and QgsWkbTypes.geometryType(layer.wkbType()) == geometry_type
-    )
 
 
 class LinkDesignDialog(QtWidgets.QDialog):
@@ -183,8 +168,10 @@ class LinkDesignDialog(QtWidgets.QDialog):
 
     def _prepare_engine(self):
         payload = _payload(self)
-        layers = _project_layers(payload)
-        missing = [role for role in ("FDT", "FAT", "Pole Edge") if layers[role] is None]
+        fdt = context.project_layer(payload, "FDT")
+        fat = context.project_layer(payload, "FAT")
+        edge = context.project_layer(payload, "Pole Edge")
+        missing = [role for role, layer in (("FDT", fdt), ("FAT", fat), ("Pole Edge", edge)) if layer is None]
         if missing:
             QtWidgets.QMessageBox.warning(
                 self, "链路设计",
@@ -194,15 +181,12 @@ class LinkDesignDialog(QtWidgets.QDialog):
             )
             return None
 
-        if QgsWkbTypes.geometryType(layers["FDT"].wkbType()) != QgsWkbTypes.PointGeometry:
-            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FDT 不是点图层。")
-            return None
-        if QgsWkbTypes.geometryType(layers["FAT"].wkbType()) != QgsWkbTypes.PointGeometry:
-            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FAT 不是点图层。")
-            return None
-        if QgsWkbTypes.geometryType(layers["Pole Edge"].wkbType()) != QgsWkbTypes.LineGeometry:
-            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 Pole Edge 不是线图层。")
-            return None
+        if QgsWkbTypes.geometryType(fdt.wkbType()) != QgsWkbTypes.PointGeometry:
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FDT 不是点图层。"); return None
+        if QgsWkbTypes.geometryType(fat.wkbType()) != QgsWkbTypes.PointGeometry:
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 FAT 不是点图层。"); return None
+        if QgsWkbTypes.geometryType(edge.wkbType()) != QgsWkbTypes.LineGeometry:
+            QtWidgets.QMessageBox.warning(self, "链路设计", "项目配置中的 Pole Edge 不是线图层。"); return None
 
         if _max_links(self) is None or _max_fats(self) is None:
             QtWidgets.QMessageBox.warning(
@@ -296,9 +280,7 @@ class LinkDesignDialog(QtWidgets.QDialog):
             self.status.setText("状态：当前项目未配置“每条 Link 最大 FAT”。")
             return
         if current_fats >= max_fats:
-            self.status.setText(
-                f"状态：当前 Link 已达到项目配置的 FAT 上限：{max_fats}。"
-            )
+            self.status.setText(f"状态：当前 Link 已达到项目配置的 FAT 上限：{max_fats}。")
             return
         previous = self._sequence[-1]
         route = self._engine.route(previous[0], previous[1], "FAT", info["feature_id"])
@@ -337,20 +319,16 @@ class LinkDesignDialog(QtWidgets.QDialog):
 
     def finish_current_link(self):
         if not self._current_fdt:
-            self.status.setText("状态：当前链路尚未闭合到 FDT。")
-            return False
+            self.status.setText("状态：当前链路尚未闭合到 FDT。"); return False
         fats = [item for item in self._sequence if item[0] == "FAT"]
         if not fats:
-            self.status.setText("状态：当前链路至少需要 1 个 FAT。")
-            return False
+            self.status.setText("状态：当前链路至少需要 1 个 FAT。"); return False
 
         max_fats = _max_fats(self)
         if max_fats is None:
-            self.status.setText("状态：当前项目未配置“每条 Link 最大 FAT”。")
-            return False
+            self.status.setText("状态：当前项目未配置“每条 Link 最大 FAT”。"); return False
         if len(fats) > max_fats:
-            self.status.setText(f"状态：当前 Link FAT 数 {len(fats)} 超过项目配置上限 {max_fats}。")
-            return False
+            self.status.setText(f"状态：当前 Link FAT 数 {len(fats)} 超过项目配置上限 {max_fats}。"); return False
 
         routes = []
         for first, second in zip(self._sequence[:-1], self._sequence[1:]):
@@ -433,8 +411,6 @@ class LinkDesignDialog(QtWidgets.QDialog):
         if not self._sequence:
             return
         removed = self._sequence.pop()
-        if removed[0] == "FAT":
-            self._refresh_ui()
         if not self._sequence:
             self._direction = None
             self._current_fdt = None
