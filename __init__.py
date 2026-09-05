@@ -11,16 +11,14 @@ def classFactory(iface):
     from .pole_trace_connect import PoleTraceDialog
     from .overlength_pole import OverlengthPoleDialog
     from .odn_project_manager import OdnProjectManager, initialize_project_manager_context
-    from .odn_project_config import open_project_config, OdnProjectConfigDialog
+    from .odn_project_config import open_project_config
     from .odn_project_validation import install_validation_page
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
-    from .odn_project_config_fix import install_project_config_fix
     from .link_design import LinkDesignDialog
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
-    install_project_config_fix(OdnProjectConfigDialog)
     initialize_project_manager_context()
 
     class ODNToolsPro:
