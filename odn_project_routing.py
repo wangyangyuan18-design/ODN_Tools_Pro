@@ -11,7 +11,7 @@ from math import inf
 
 from qgis.core import (
     QgsCoordinateTransform, QgsDistanceArea, QgsGeometry,
-    QgsPointXY, QgsProject,
+    QgsPointXY, QgsProject, QgsUnitTypes,
 )
 
 
@@ -77,11 +77,38 @@ class OdnProjectRouteEngine:
         )
 
     def _measure(self, geometry):
+        """Measure geometry in meters regardless of the Pole Edge CRS units."""
         distance = QgsDistanceArea()
-        distance.setSourceCrs(
-            self.edge_layer.crs(), self.project.transformContext()
-        )
-        return distance.measureLength(geometry)
+        crs = self.edge_layer.crs()
+        distance.setSourceCrs(crs, self.project.transformContext())
+
+        # Explicitly enable ellipsoidal measurement.  Without this, a
+        # geographic CRS such as EPSG:4326 can return angular units (degrees),
+        # which then become 0.0 after the UI formats a short segment as meters.
+        try:
+            ellipsoid = crs.ellipsoidAcronym()
+        except Exception:
+            ellipsoid = ""
+        if not ellipsoid or str(ellipsoid).upper() in ("NONE", "NONE(0)"):
+            ellipsoid = "WGS84"
+        try:
+            distance.setEllipsoid(str(ellipsoid))
+        except Exception:
+            distance.setEllipsoid("WGS84")
+
+        measured = float(distance.measureLength(geometry) or 0.0)
+        try:
+            return float(
+                distance.convertLengthMeasurement(
+                    measured,
+                    distance.lengthUnits(),
+                    QgsUnitTypes.DistanceMeters,
+                )
+            )
+        except Exception:
+            # QgsDistanceArea normally reports meters after ellipsoidal
+            # measurement. Keep a safe fallback for older QGIS builds.
+            return measured
 
     def _build_graph(self):
         if self.edge_layer is None:
