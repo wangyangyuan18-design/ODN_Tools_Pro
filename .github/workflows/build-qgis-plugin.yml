@@ -84,6 +84,13 @@ jobs:
           print('Minimum QGIS:', values['qgisMinimumVersion'])
           PY
 
+      - name: Validate Python syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q package/ODN_Tools_Pro
+          find package/ODN_Tools_Pro -type d -name '__pycache__' -prune -exec rm -rf {} +
+
       - name: Build inner QGIS plugin ZIP
         shell: bash
         run: |
