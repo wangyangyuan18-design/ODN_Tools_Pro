@@ -15,3 +15,4 @@ tags=ODN, FTTH, telecom, fiber, FAT, FDT, pole, trace, connect, link design, pro
 homepage=https://github.com/wangyangyuan18-design/ODN_Tools_Pro
 repository=https://github.com/wangyangyuan18-design/ODN_Tools_Pro
 tracker=https://github.com/wangyangyuan18-design/ODN_Tools_Pro/issues
+# Automated package-build trigger; the visible plugin version remains 2.0.2.
