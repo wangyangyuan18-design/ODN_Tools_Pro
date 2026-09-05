@@ -15,7 +15,7 @@ def classFactory(iface):
     from .odn_project_validation import install_validation_page
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
-    from .link_design_v2 import LinkDesignDialog
+    from .link_design_v3 import LinkDesignDialog
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
