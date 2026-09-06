@@ -44,6 +44,10 @@ class LinkDesignDock(_v14.LinkDesignDock):
         )
         self._selected_fat_bands = []
         super().__init__(iface, parent)
+        # The map-tool refresh reads the shared controller state. Keep the
+        # checkbox preference mirrored there so toggling the UI immediately
+        # affects the gray completed-FAT markers.
+        self._controller._show_completed_fat_marks = self._show_completed_fat_marks
         self._install_ui_refinements()
 
     def _clear_selected_fat_highlights(self):
@@ -146,6 +150,7 @@ class LinkDesignDock(_v14.LinkDesignDock):
 
     def _toggle_completed_fat_marks(self, checked):
         self._show_completed_fat_marks = bool(checked)
+        self._controller._show_completed_fat_marks = self._show_completed_fat_marks
         QSettings().setValue(SHOW_COMPLETED_FAT_KEY, self._show_completed_fat_marks)
         QSettings().sync()
         tool = getattr(self._controller, "_tool", None)
