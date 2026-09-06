@@ -20,7 +20,7 @@ from qgis.core import QgsDistanceArea, QgsGeometry, QgsPointXY, QgsProject
 from . import link_design_v9 as _v9
 from . import odn_project_context as context
 
-SNAPSHOT_KEY_PREFIX = "ODNToolsPro/LinkDesign/change_snapshot/"
+SNAPSHOT_KEY_PREFIX = "ODNToolsPro/LinkDesign/change_snapshot_v2/"
 POINT_TOLERANCE_M = 0.05
 GEOMETRY_TOLERANCE_M = 0.20
 
@@ -209,7 +209,7 @@ def _deleted_fats(seq, fat_layer):
     return result
 
 
-def _rebuild_design_preview(controller, engine, candidate_seq):
+def _rebuild_design_preview(engine, candidate_seq):
     routes = []
     for first, second in zip(candidate_seq[:-1], candidate_seq[1:]):
         route = engine.route(first[0], first[1], second[0], second[1])
@@ -281,7 +281,7 @@ def detect_changes(controller):
             })
             continue
 
-        preview_segments, route_error = _rebuild_design_preview(controller, engine, candidate_seq)
+        preview_segments, route_error = _rebuild_design_preview(engine, candidate_seq)
         if preview_segments is None:
             changes.append({
                 "key": key,
