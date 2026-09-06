@@ -69,6 +69,11 @@ def classFactory(iface):
             self._link_design_dock.show()
             self._link_design_dock.raise_()
             self._link_design_dock.activateWindow()
+            try:
+                self._link_design_dock._overlay.show()
+                self._link_design_dock._overlay.raise_()
+            except Exception:
+                pass
 
         def unload(self):
             if self._link_design_dock is not None:
