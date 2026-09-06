@@ -129,7 +129,6 @@ class LinkDesignDock(_v12.LinkDesignDock):
 
     def refresh_from_core(self):
         super().refresh_from_core()
-        # Keep the action available whenever the Link Design dock is open.
         if self._change_button is not None:
             self._change_button.setEnabled(True)
 
@@ -143,6 +142,10 @@ class LinkDesignDock(_v12.LinkDesignDock):
             QtWidgets.QMessageBox.information(self, "变更检测", "当前没有已完成的 Link 可检测。")
             return
         try:
+            # The normal Link Design engine may cache the Pole Edge graph for
+            # interactive routing. Force a fresh graph before comparing source
+            # data so edits made after the previous confirmation are visible.
+            controller._engine = None
             result = detect_changes(controller)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "变更检测", f"变更检测失败：\n{exc}")
