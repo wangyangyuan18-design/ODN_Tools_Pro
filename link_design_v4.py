@@ -78,8 +78,44 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
         from .link_design_v2 import _fresh_payload
         return _fresh_payload(self)
 
+    @staticmethod
+    def _match_expected_features(layer, expected_features):
+        """Return unique live feature ids for expected geometries.
+
+        Each expected geometry must match exactly one current Distribution Cable
+        feature. A missing match means the saved Link was deleted or changed;
+        multiple matches are treated as ambiguous and are never guessed.
+        """
+        matched = []
+        used = set()
+        for expected in expected_features:
+            bbox = expected.geometry().boundingBox()
+            candidates = []
+            request = QgsFeatureRequest().setFilterRect(bbox)
+            for feature in layer.getFeatures(request):
+                if feature.id() in used:
+                    continue
+                try:
+                    if feature.geometry().equals(expected.geometry()):
+                        candidates.append(int(feature.id()))
+                except Exception:
+                    continue
+            if len(candidates) != 1:
+                return None
+            matched.append(candidates[0])
+            used.add(candidates[0])
+        return matched
+
     def _reconcile_written_state(self):
-        """Synchronize stored Link status with the actual Distribution Cable layer."""
+        """Synchronize saved Link state with the live Distribution Cable layer.
+
+        This handles both current records with stored feature IDs and legacy
+        records created before feature IDs were persisted. A saved Link is
+        considered "已写入" only while every expected cable segment still
+        exists with the same geometry. If a user deletes or edits the cable
+        directly in QGIS, the saved Link is downgraded to "已规划" so it can
+        be edited or deleted normally instead of becoming a locked stale item.
+        """
         if not self._designs:
             return False
         layer = context.project_layer(self._fresh_project_payload(), "Distribution Cable")
@@ -87,32 +123,92 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
             return False
 
         changed = False
-        for design in self._designs:
+        for index, design in enumerate(self._designs):
             if not design.get("written"):
                 continue
-            fids = design.get("written_fids") or []
-            if not fids:
-                # Legacy written records are handled lazily by geometry recovery.
-                continue
-            all_present = True
-            for fid in fids:
-                try:
-                    feature = layer.getFeature(int(fid))
-                except Exception:
-                    feature = None
-                if feature is None or not feature.isValid():
-                    all_present = False
-                    break
-            if all_present:
+
+            try:
+                expected_features = self._build_layer_features(layer, design)
+            except Exception:
+                # Do not mutate a record when its stored route cannot be
+                # reconstructed safely. It will remain written and the normal
+                # safety checks will refuse destructive guessing.
                 continue
 
-            # The user edited/deleted the DC feature(s) directly in QGIS.
-            # Do not keep a stale "已写入" state. The Link returns to the
-            # editable "已规划" state so it can be safely re-written.
-            design["written"] = False
-            design["written_fids"] = []
-            design["external_change"] = "Distribution Cable 图层已被手动修改，Link 已重新标记为已规划。"
-            changed = True
+            fids = design.get("written_fids") or []
+            if fids:
+                # Newer records: verify both existence and geometry, not just
+                # the feature ID. A manually moved/edited cable is external
+                # to the saved Link and must no longer be treated as written.
+                if len(fids) != len(expected_features):
+                    design["written"] = False
+                    design["written_fids"] = []
+                    design["external_change"] = "Distribution Cable 图层中的 Link 段数已被手动修改，Link 已重新标记为已规划。"
+                    changed = True
+                    continue
+
+                valid = True
+                for fid, expected in zip(fids, expected_features):
+                    try:
+                        feature = layer.getFeature(int(fid))
+                    except Exception:
+                        feature = None
+                    if feature is None or not feature.isValid():
+                        valid = False
+                        break
+                    try:
+                        if not feature.geometry().equals(expected.geometry()):
+                            valid = False
+                            break
+                    except Exception:
+                        valid = False
+                        break
+
+                if valid:
+                    continue
+
+                design["written"] = False
+                design["written_fids"] = []
+                design["external_change"] = "Distribution Cable 图层中的 Link 已被手动删除或修改，Link 已重新标记为已规划。"
+                changed = True
+                continue
+
+            # Legacy records: recover feature IDs from the stored route
+            # geometry. If every segment uniquely exists, save those IDs so
+            # future edit/delete operations become fully supported. If a
+            # segment no longer exists, mark the record as planned rather than
+            # leaving it permanently locked as "已写入".
+            recovered = self._match_expected_features(layer, expected_features)
+            if recovered is not None:
+                design["written_fids"] = recovered
+                changed = True
+                continue
+
+            # _match_expected_features returns None for both missing and
+            # ambiguous matches. Inspect the expected geometries once more to
+            # distinguish the safe missing case from an ambiguous case.
+            missing = False
+            used = set()
+            for expected in expected_features:
+                bbox = expected.geometry().boundingBox()
+                count = 0
+                request = QgsFeatureRequest().setFilterRect(bbox)
+                for feature in layer.getFeatures(request):
+                    if feature.id() in used:
+                        continue
+                    try:
+                        if feature.geometry().equals(expected.geometry()):
+                            count += 1
+                    except Exception:
+                        continue
+                if count == 0:
+                    missing = True
+                    break
+            if missing:
+                design["written"] = False
+                design["written_fids"] = []
+                design["external_change"] = "Distribution Cable 图层中找不到该 Link 的原有线路，Link 已重新标记为已规划。"
+                changed = True
 
         if changed:
             self._persist_state()
@@ -219,24 +315,9 @@ class LinkDesignDialog(_ProjectScopedLinkDesignDialog):
         except Exception:
             return None
 
-        matched = []
-        used = set()
-        for expected in expected_features:
-            bbox = expected.geometry().boundingBox()
-            candidates = []
-            request = QgsFeatureRequest().setFilterRect(bbox)
-            for feature in layer.getFeatures(request):
-                if feature.id() in used:
-                    continue
-                try:
-                    if feature.geometry().equals(expected.geometry()):
-                        candidates.append(int(feature.id()))
-                except Exception:
-                    continue
-            if len(candidates) != 1:
-                return None
-            matched.append(candidates[0])
-            used.add(candidates[0])
+        matched = self._match_expected_features(layer, expected_features)
+        if matched is None:
+            return None
 
         design["written_fids"] = matched
         self._persist_state()
