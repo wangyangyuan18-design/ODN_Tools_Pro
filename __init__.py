@@ -7,6 +7,7 @@ import os
 def classFactory(iface):
     """Load the project-driven ODN Tools Pro plugin."""
     from qgis.PyQt.QtGui import QIcon
+    from qgis.PyQt.QtCore import Qt
     from qgis.PyQt.QtWidgets import QAction, QMenu
     from .pole_trace_connect import PoleTraceDialog
     from .overlength_pole import OverlengthPoleDialog
@@ -64,7 +65,7 @@ def classFactory(iface):
         def link_design(self):
             if self._link_design_dock is None:
                 self._link_design_dock = LinkDesignDock(self.iface, self.iface.mainWindow())
-                self.iface.addDockWidget(2, self._link_design_dock)  # Qt.LeftDockWidgetArea
+                self.iface.addDockWidget(Qt.LeftDockWidgetArea, self._link_design_dock)
             self._link_design_dock.show()
             self._link_design_dock.raise_()
             self._link_design_dock.activateWindow()
