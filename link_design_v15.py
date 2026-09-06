@@ -5,22 +5,30 @@ This layer intentionally keeps the existing Link Design calculation engine
 unchanged. It only adds:
 - explicit exit-design behavior with save-before-exit confirmation;
 - a compact checkbox controlling the gray "completed FAT" markers;
-- clearing saved-link preview highlighting when clicking blank tree space.
+- clearing saved-link preview highlighting when clicking blank tree space;
+- highlighting the FATs that belong to the currently selected FDT/Link while
+  the saved route preview is displayed.
 """
 
 from qgis.PyQt import QtWidgets
 from qgis.PyQt.QtCore import QEvent, QSettings, Qt
+from qgis.PyQt.QtGui import QColor
+from qgis.core import (
+    QgsCoordinateTransform,
+    QgsGeometry,
+    QgsPointXY,
+    QgsProject,
+    QgsWkbTypes,
+)
+from qgis.gui import QgsRubberBand
 
 from . import link_design_v14 as _v14
 from . import link_design_v11 as _v11
+from . import odn_project_context as context
 
 SHOW_COMPLETED_FAT_KEY = "ODNToolsPro/LinkDesign/show_completed_fat_marks"
 
 
-# -----------------------------------------------------------------------------
-# Keep the existing v11 marker implementation, but make its gray completed-FAT
-# layer user-controllable. Yellow active-planning markers remain unchanged.
-# -----------------------------------------------------------------------------
 _original_refresh_planning_state = _v11.LinkDesignMapToolV11.refresh_planning_state
 
 
@@ -44,17 +52,80 @@ class LinkDesignDock(_v14.LinkDesignDock):
         self._show_completed_fat_marks = bool(
             QSettings().value(SHOW_COMPLETED_FAT_KEY, True, type=bool)
         )
+        self._selected_fat_bands = []
         super().__init__(iface, parent)
         self._install_ui_refinements()
+
+    # ----- selected-Link FAT highlighting -----------------------------------
+    def _clear_selected_fat_highlights(self):
+        for band in list(self._selected_fat_bands):
+            try:
+                self.iface.mapCanvas().scene().removeItem(band)
+            except Exception:
+                pass
+        self._selected_fat_bands = []
+
+    def _highlight_selected_fats(self, indexes):
+        self._clear_selected_fat_highlights()
+        if not indexes:
+            return
+
+        controller = self._controller
+        payload = controller._v9_payload()
+        fat_layer = context.project_layer(payload, "FAT")
+        if fat_layer is None:
+            return
+
+        canvas = self.iface.mapCanvas()
+        dst = canvas.mapSettings().destinationCrs()
+        transform = None
+        if fat_layer.crs() != dst:
+            try:
+                transform = QgsCoordinateTransform(
+                    fat_layer.crs(), dst, QgsProject.instance().transformContext()
+                )
+            except Exception:
+                return
+
+        fat_ids = set()
+        for index in indexes:
+            if index < 0 or index >= len(controller._designs):
+                continue
+            design = controller._designs[index]
+            for item in design.get("sequence_ids", []) or []:
+                if len(item) >= 2 and str(item[0]) == "FAT":
+                    try:
+                        fat_ids.add(int(item[1]))
+                    except (TypeError, ValueError):
+                        pass
+
+        for fid in sorted(fat_ids):
+            try:
+                feature = fat_layer.getFeature(int(fid))
+            except Exception:
+                continue
+            if not feature.isValid() or feature.geometry().isEmpty():
+                continue
+            try:
+                point = QgsPointXY(feature.geometry().asPoint())
+                if transform is not None:
+                    point = transform.transform(point)
+            except Exception:
+                continue
+
+            band = QgsRubberBand(canvas, QgsWkbTypes.PointGeometry)
+            band.setColor(QColor(255, 165, 0, 235))
+            band.setWidth(4)
+            band.setIcon(QgsRubberBand.ICON_CIRCLE)
+            band.setIconSize(17)
+            band.setToGeometry(QgsGeometry.fromPointXY(point), dst)
+            self._selected_fat_bands.append(band)
 
     # ----- completed-FAT marker checkbox -------------------------------------
     def _install_ui_refinements(self):
         self._replace_summary_row()
         self.tree.viewport().installEventFilter(self)
 
-        # The v14 overlay's Exit button originally calls controller.exit_design.
-        # Replace only that connection so the dock can hide the overlay and ask
-        # whether an unfinished Link should be saved first.
         try:
             self._overlay.exit.clicked.disconnect(self._controller.exit_design)
         except Exception:
@@ -124,9 +195,16 @@ class LinkDesignDock(_v14.LinkDesignDock):
                     self.tree.clearSelection()
                     self.tree.setCurrentItem(None)
                     self._controller._clear_saved_bands()
+                    self._clear_selected_fat_highlights()
                     self.info.setText("—")
                     return True
         return super().eventFilter(obj, event)
+
+    # ----- keep FAT highlights synchronized with saved Link selection --------
+    def _tree_selection_changed(self):
+        super()._tree_selection_changed()
+        indexes = self._tree_selected_links()
+        self._highlight_selected_fats(indexes)
 
     # ----- exit design --------------------------------------------------------
     def _has_unfinished_design(self):
@@ -185,6 +263,7 @@ class LinkDesignDock(_v14.LinkDesignDock):
         except Exception:
             pass
 
+        self._clear_selected_fat_highlights()
         c._draw_active = False
         c._sequence = []
         c._current_fdt = None
@@ -238,8 +317,6 @@ class LinkDesignDock(_v14.LinkDesignDock):
                 f"已完成Link:{len(c._designs)}    已完成FAT:{len(used_fats)}/{total_fats}"
             )
 
-        # Make the overlay visible again whenever Link Design is actively used
-        # after it was explicitly hidden by "退出设计".
         try:
             if getattr(c, "_draw_active", False) or getattr(c, "_sequence", None):
                 self._overlay.show()
