@@ -15,7 +15,7 @@ def classFactory(iface):
     from .odn_project_validation import install_validation_page
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
-    from .link_design_v8 import LinkDesignDialog
+    from .link_design_v9 import LinkDesignDock
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
@@ -28,6 +28,7 @@ def classFactory(iface):
             self.actions = []
             self.menu = None
             self.toolbar = None
+            self._link_design_dock = None
 
         def initGui(self):
             main_window = self.iface.mainWindow()
@@ -61,12 +62,20 @@ def classFactory(iface):
             OverlengthPoleDialog(self.iface, self.iface.mainWindow()).exec_()
 
         def link_design(self):
-            self._link_design_dialog = LinkDesignDialog(self.iface, self.iface.mainWindow())
-            self._link_design_dialog.show()
-            self._link_design_dialog.raise_()
-            self._link_design_dialog.activateWindow()
+            if self._link_design_dock is None:
+                self._link_design_dock = LinkDesignDock(self.iface, self.iface.mainWindow())
+                self.iface.addDockWidget(2, self._link_design_dock)  # Qt.LeftDockWidgetArea
+            self._link_design_dock.show()
+            self._link_design_dock.raise_()
+            self._link_design_dock.activateWindow()
 
         def unload(self):
+            if self._link_design_dock is not None:
+                try:
+                    self._link_design_dock.close()
+                except Exception:
+                    pass
+                self._link_design_dock = None
             for action in self.actions:
                 try:
                     action.deleteLater()
