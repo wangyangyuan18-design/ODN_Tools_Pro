@@ -11,7 +11,7 @@ from qgis.PyQt import QtWidgets
 from . import link_design_v12 as _v12
 from . import link_design_v9 as _v9
 from .cable_offset_layout_v2 import apply_layout_to_designs
-from .change_detection import ChangeDetectionDialog, detect_changes, save_snapshot
+from .change_detection_adapter import ChangeDetectionDialog, detect_changes, save_snapshot
 
 
 _ORIGINAL_WRITE = _v9._CoreController.write_planned_links
@@ -142,9 +142,6 @@ class LinkDesignDock(_v12.LinkDesignDock):
             QtWidgets.QMessageBox.information(self, "变更检测", "当前没有已完成的 Link 可检测。")
             return
         try:
-            # The normal Link Design engine may cache the Pole Edge graph for
-            # interactive routing. Force a fresh graph before comparing source
-            # data so edits made after the previous confirmation are visible.
             controller._engine = None
             result = detect_changes(controller)
         except Exception as exc:
