@@ -35,7 +35,6 @@ def _v14_save_current_link(self):
         try:
             save_snapshot(self)
         except Exception as exc:
-            # Snapshot failure must never invalidate an already successful Link save.
             self.status.setText(f"状态：Link 已保存，但变更检测基准保存失败：{exc}")
     return result
 
@@ -80,8 +79,6 @@ def _v14_write_planned_links(self):
     result = _ORIGINAL_WRITE(self)
     if result:
         try:
-            # The physical cable layer is now synchronized to the same design
-            # state that is considered the confirmed source baseline.
             save_snapshot(self)
         except Exception as exc:
             self.status.setText(f"状态：图层已写入，但变更检测基准保存失败：{exc}")
@@ -96,8 +93,10 @@ class LinkDesignDock(_v12.LinkDesignDock):
     """v14 dock: v12 cable synchronization plus automatic overlap layout and change detection."""
 
     def __init__(self, iface, parent=None):
-        super().__init__(iface, parent)
+        # Parent constructors call refresh_from_core(). The button attribute
+        # must exist before that happens, otherwise initialization crashes.
         self._change_button = None
+        super().__init__(iface, parent)
         self._install_change_detection_button()
 
     def _install_change_detection_button(self):
