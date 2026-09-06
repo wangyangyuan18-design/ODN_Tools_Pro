@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """Link Design v11 visual-state fix.
 
-Keeps the v10 dock behavior and makes planning-state highlighting explicit:
-- Existing/planned FAT features keep their normal layer style; they are never
-  grayed just because they already belong to a saved Link.
-- The FDT chosen to start the current Link is highlighted yellow.
-- FATs already confirmed in the current planning sequence are highlighted
-  yellow as well.
-- These planning markers are independent from saved-Link selection bands.
+Planning-state display:
+- Unplanned FATs keep their normal layer style.
+- FATs already assigned to a saved Link are shown gray so planned vs.
+  unplanned FATs are immediately distinguishable.
+- FATs in the current planning draft are highlighted yellow and are not gray.
+- The FDT selected to start the current Link is highlighted yellow.
+- Planning markers are independent from saved-Link selection bands.
 """
 
 from qgis.PyQt.QtGui import QColor
@@ -19,19 +19,24 @@ from . import link_design_v10 as _v10
 
 
 class LinkDesignMapToolV11(_v9.LinkDesignMapToolV9):
-    """v9 map tool plus persistent yellow FDT/FAT planning markers."""
+    """Map tool with explicit three-state FAT/FDT planning display."""
 
     def __init__(self, iface, engine, controller):
         super().__init__(iface, engine, controller)
         self._planning_state_bands = []
+        self._planned_fat_bands = []
 
-    def _clear_planning_state_bands(self):
-        for band in list(self._planning_state_bands):
+    def _remove_bands(self, bands):
+        for band in list(bands):
             try:
                 self.canvas.scene().removeItem(band)
             except Exception:
                 pass
-        self._planning_state_bands = []
+        bands[:] = []
+
+    def _clear_planning_state_bands(self):
+        self._remove_bands(self._planning_state_bands)
+        self._remove_bands(self._planned_fat_bands)
 
     def _point_in_canvas(self, info):
         if not info:
@@ -48,42 +53,61 @@ class LinkDesignMapToolV11(_v9.LinkDesignMapToolV9):
                 return None
         return point
 
-    def _add_planning_marker(self, info, size, width=3):
+    def _add_marker(self, info, color, size, width, target):
         point = self._point_in_canvas(info)
         if point is None:
             return
         band = QgsRubberBand(self.canvas, QgsWkbTypes.PointGeometry)
-        band.setColor(QColor(255, 215, 0, 235))
+        band.setColor(color)
         band.setWidth(width)
         band.setIcon(QgsRubberBand.ICON_CIRCLE)
         band.setIconSize(size)
         band.setToGeometry(
-            QgsGeometry.fromPointXY(point), self.canvas.mapSettings().destinationCrs()
+            QgsGeometry.fromPointXY(point),
+            self.canvas.mapSettings().destinationCrs(),
         )
-        self._planning_state_bands.append(band)
+        target.append(band)
 
     def refresh_planning_state(self):
         self._clear_planning_state_bands()
         controller = self.controller
         seq = list(getattr(controller, "_sequence", []) or [])
+
+        # 1) Planned FATs: gray, except FATs that are part of the active draft.
+        active_fat_ids = {
+            int(item[1])
+            for item in seq
+            if len(item) >= 2 and str(item[0]) == "FAT"
+        }
+        planned_ids = set()
+        for design in getattr(controller, "_designs", []) or []:
+            for item in design.get("nodes", []) or []:
+                try:
+                    planned_ids.add(int(item[0]))
+                except (TypeError, ValueError, IndexError):
+                    continue
+        planned_ids -= active_fat_ids
+
+        for fid in sorted(planned_ids):
+            info = self.engine.points.get(("FAT", int(fid)))
+            # Gray ring clearly communicates "already planned" while keeping
+            # the underlying layer style visible.
+            self._add_marker(info, QColor(150, 150, 150, 225), 14, 3, self._planned_fat_bands)
+
+        # Nothing yellow until a draft has actually started.
         if not seq:
             return
 
-        # Highlight the active FDT first. This remains visible throughout the
-        # current Link planning session, including while hovering FATs.
+        # 2) Active FDT: yellow throughout the current planning session.
         fdt_id = getattr(controller, "_current_fdt_id", None)
         if fdt_id is not None:
             info = self.engine.points.get(("FDT", int(fdt_id)))
-            self._add_planning_marker(info, 20, 3)
+            self._add_marker(info, QColor(255, 215, 0, 235), 20, 4, self._planning_state_bands)
 
-        # Current Link FATs are the active planning state. FATs belonging to
-        # other saved Links are deliberately untouched: their original layer
-        # style remains visible instead of being grayed out.
-        for typ, fid, _label in seq:
-            if str(typ) != "FAT":
-                continue
+        # 3) FATs confirmed in the current draft: yellow, overriding gray.
+        for fid in sorted(active_fat_ids):
             info = self.engine.points.get(("FAT", int(fid)))
-            self._add_planning_marker(info, 16, 3)
+            self._add_marker(info, QColor(255, 215, 0, 235), 16, 4, self._planning_state_bands)
 
     def start(self):
         super().start()
@@ -94,13 +118,14 @@ class LinkDesignMapToolV11(_v9.LinkDesignMapToolV9):
         self.refresh_planning_state()
 
     def clear_preview_only(self):
-        # Pause/source-edit clears route preview but keeps the yellow planning
-        # state visible so the draft is still obvious before Continue Planning.
+        # Route preview is cleared on pause/source-edit, but planning-state
+        # markers stay visible so the draft remains identifiable.
         super().clear_preview_only()
+        self.refresh_planning_state()
 
 
-# v9's controller creates its map tool through this module-global symbol. Keep
-# the stable controller/dock logic while substituting only the enhanced tool.
+# v9's controller creates the map tool through this module-global symbol.
+# Substitute only the enhanced visual map tool while keeping v10 dock logic.
 _v9.LinkDesignMapToolV9 = LinkDesignMapToolV11
 
 
