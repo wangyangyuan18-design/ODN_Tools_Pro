@@ -33,91 +33,170 @@ def _same_point_segment(points, tolerance=1e-9):
         return False
 
 
-def _first_nonzero_offset_on_link(design, pos, work_crs, edge_crs, source_crs, spacing):
-    """Find the first real non-zero offset location after the coincident FDT/FAT."""
-    segments = design.get("segments", []) or []
+def _segment_offset_sign(segment, work_crs, edge_crs, source_crs, spacing):
+    """Return the first reliable non-zero left/right offset sign on a segment."""
+    points = _v6._geometry_points(segment.get("points", []) or [])
+    if len(points) < 2:
+        return None
+
+    edges, nodes = _v6._route_edges_nodes(segment, work_crs, source_crs, edge_crs)
+    if not edges or len(nodes) != len(edges) + 1:
+        return None
+
+    work_points = _v6._transform_points(points, source_crs, work_crs)
     threshold = max(float(spacing) * 0.25, 0.01)
 
-    for seg_index in range(max(0, int(pos)), len(segments)):
-        segment = segments[seg_index]
-        points = _v6._geometry_points(segment.get("points", []) or [])
-        if len(points) < 2:
+    for edge_index in range(len(edges)):
+        a, b = nodes[edge_index], nodes[edge_index + 1]
+        edge_len = hypot(b.x() - a.x(), b.y() - a.y())
+        if edge_len <= 1e-9:
             continue
 
-        edges, nodes = _v6._route_edges_nodes(
-            segment, work_crs, source_crs, edge_crs
-        )
-        if not edges or len(nodes) != len(edges) + 1:
+        tx, ty = _v6._unit(a, b)
+        best_signed = None
+        for p in work_points:
+            along = (p.x() - a.x()) * tx + (p.y() - a.y()) * ty
+            if -0.25 <= along <= edge_len + 0.25:
+                signed = (p.x() - a.x()) * (-ty) + (p.y() - a.y()) * tx
+                if best_signed is None or abs(signed) > abs(best_signed):
+                    best_signed = signed
+
+        if best_signed is None:
             continue
-
-        work_points = _v6._transform_points(points, source_crs, work_crs)
-        slots = []
-        for edge_index in range(len(edges)):
-            a, b = nodes[edge_index], nodes[edge_index + 1]
-            edge_len = hypot(b.x() - a.x(), b.y() - a.y())
-            if edge_len <= 1e-9:
-                slots.append((edge_index, 0.0))
-                continue
-
-            tx, ty = _v6._unit(a, b)
-            best_signed = None
-            for p in work_points:
-                along = (p.x() - a.x()) * tx + (p.y() - a.y()) * ty
-                if -0.25 <= along <= edge_len + 0.25:
-                    signed = (p.x() - a.x()) * (-ty) + (p.y() - a.y()) * tx
-                    if best_signed is None or abs(signed) > abs(best_signed):
-                        best_signed = signed
-            if best_signed is None:
-                best_signed = 0.0
-            snapped = round(float(best_signed) / float(spacing)) * float(spacing)
-            slots.append((edge_index, float(snapped)))
-
-        for edge_index, signed in slots:
-            if abs(signed) < threshold:
-                continue
-            a, b = nodes[edge_index], nodes[edge_index + 1]
-            tangent = _v6._unit(a, b)
-            anchor = QgsPointXY(a)
-            target = _v6._offset_point(anchor, tangent, signed)
+        snapped = round(float(best_signed) / float(spacing)) * float(spacing)
+        if abs(snapped) >= threshold:
             _log(
-                f"[fat-landing-coincident-search] design=?; segment={seg_index}; "
-                f"edge_index={edge_index}; offset={signed:+.3f}m; "
-                "first_nonzero_offset_point=found"
+                f"[fat-landing-coincident-side] offset={snapped:+.3f}m; "
+                f"edge_index={edge_index}; side={'left' if snapped > 0 else 'right'}"
             )
-            return target, signed, seg_index, edge_index
+            return float(snapped), edge_index
 
     return None
 
 
-def _coincident_target(ref, design, work_crs, edge_crs, spacing):
+def _first_nonzero_offset_sign_on_link(design, pos, work_crs, edge_crs, source_crs, spacing):
+    """Find only the left/right side from the first non-zero offset later in the Link.
+
+    The actual FAT target is NOT taken from that later point. The target is
+    generated at the coincident FDT position, exactly one control distance
+    perpendicular to the local main-line direction.
+    """
+    segments = design.get("segments", []) or []
+    start = max(0, int(pos))
+    for seg_index in range(start, len(segments)):
+        result = _segment_offset_sign(
+            segments[seg_index], work_crs, edge_crs, source_crs, spacing
+        )
+        if result is not None:
+            signed, edge_index = result
+            return signed, seg_index, edge_index
+    return None
+
+
+def _local_mainline(ref, design, work_crs, edge_crs, source_crs):
+    """Return the coincident FDT anchor and the local main-line tangent."""
+    segments = design.get("segments", []) or []
+    pos = int(ref.get("sequence_pos", -1))
+
+    incoming_index = pos - 1 if 0 <= pos - 1 < len(segments) else None
+    outgoing_index = pos if 0 <= pos < len(segments) else None
+
+    incoming = segments[incoming_index] if incoming_index is not None else None
+    outgoing = segments[outgoing_index] if outgoing_index is not None else None
+
+    in_edges, in_nodes = _v6._route_edges_nodes(incoming, work_crs, source_crs, edge_crs)
+    out_edges, out_nodes = _v6._route_edges_nodes(outgoing, work_crs, source_crs, edge_crs)
+
+    # For FDT=FAT the incoming segment is the logical zero-length segment.
+    # The actual main-line direction therefore comes from the outgoing route.
+    if len(out_nodes) >= 2:
+        anchor = QgsPointXY(out_nodes[0])
+        tangent = _v6._unit(out_nodes[0], out_nodes[1])
+        if hypot(tangent[0], tangent[1]) > 1e-12:
+            return anchor, tangent, "outgoing"
+
+    # Defensive fallback for an unusual sequence representation.
+    if len(in_nodes) >= 2:
+        anchor = QgsPointXY(in_nodes[-1])
+        tangent = _v6._unit(in_nodes[-2], in_nodes[-1])
+        if hypot(tangent[0], tangent[1]) > 1e-12:
+            return anchor, tangent, "incoming"
+
+    return None
+
+
+def _coincident_target(ref, design, fat_feature, fat_layer, work_crs, edge_crs, spacing, control_distance):
     segments = design.get("segments", []) or []
     pos = int(ref.get("sequence_pos", -1))
     incoming_index = pos - 1 if 0 <= pos - 1 < len(segments) else None
     incoming = segments[incoming_index] if incoming_index is not None else None
     incoming_points = list(incoming.get("points", []) or []) if incoming else []
+
     if not _same_point_segment(incoming_points):
         return None
 
     source_crs = _v6._crs_from_authid(design.get("source_crs")) or edge_crs
-    result = _first_nonzero_offset_on_link(
-        design, pos, work_crs, edge_crs, source_crs, float(spacing)
-    )
-    if result is None:
+    local = _local_mainline(ref, design, work_crs, edge_crs, source_crs)
+    if local is None:
+        _log(
+            f"[fat-landing-coincident-skip] design={ref.get('design_index')}; "
+            f"seq_pos={pos}; reason=无法确定FDT处主线方向",
+            Qgis.Warning,
+        )
         return None
 
-    target, signed, seg_index, edge_index = result
+    anchor, tangent, tangent_source = local
+
+    # We only inspect the offset geometry to determine LEFT or RIGHT.
+    # The landing distance itself is always the configured control distance.
+    side_info = _first_nonzero_offset_sign_on_link(
+        design, pos, work_crs, edge_crs, source_crs, float(spacing)
+    )
+    if side_info is None:
+        _log(
+            f"[fat-landing-coincident-skip] design={ref.get('design_index')}; "
+            f"seq_pos={pos}; reason=无法确定后续线路偏移左右方向",
+            Qgis.Warning,
+        )
+        return None
+
+    side_signed, source_segment_index, source_edge_index = side_info
+    distance = float(control_distance)
+    signed_control = distance if side_signed > 0 else -distance
+    target = _v6._offset_point(anchor, tangent, signed_control)
+
+    _log(
+        f"[fat-landing-coincident-target] design={ref.get('design_index')}; "
+        f"seq_pos={pos}; tangent_source={tangent_source}; "
+        f"side={'left' if side_signed > 0 else 'right'}; "
+        f"control_distance={distance:.3f}m; "
+        f"source_segment={source_segment_index}; source_edge={source_edge_index}; "
+        "target=fixed perpendicular control-distance from coincident FDT"
+    )
+
     return target, {
-        "mode": "coincident_fallback",
+        "mode": "coincident_control",
         "turn_angle": 0.0,
-        "offset": signed,
-        "anchor": QgsPointXY(target),
-        "side": "first_nonzero_offset_on_link",
-        "source_segment_index": seg_index,
-        "source_edge_index": edge_index,
+        # Keep the real offset sign for diagnostics. The target distance is
+        # controlled independently by control_distance.
+        "offset": side_signed,
+        "anchor": QgsPointXY(anchor),
+        "side": "left" if side_signed > 0 else "right",
+        "control_distance": distance,
     }
 
 
-def _patched_target_for_fat(ref, design, fat_feature, fat_layer, work_crs, edge_crs, spacing, control_distance, corner_threshold_deg):
+def _patched_target_for_fat(
+    ref,
+    design,
+    fat_feature,
+    fat_layer,
+    work_crs,
+    edge_crs,
+    spacing,
+    control_distance,
+    corner_threshold_deg,
+):
     target, info = _ORIGINAL_TARGET_FOR_FAT(
         ref,
         design,
@@ -130,22 +209,25 @@ def _patched_target_for_fat(ref, design, fat_feature, fat_layer, work_crs, edge_
         corner_threshold_deg,
     )
 
-    fallback = _coincident_target(ref, design, work_crs, edge_crs, spacing)
+    fallback = _coincident_target(
+        ref,
+        design,
+        fat_feature,
+        fat_layer,
+        work_crs,
+        edge_crs,
+        spacing,
+        control_distance,
+    )
     if fallback is None:
         return target, info
 
     fallback_target, fallback_info = fallback
-    try:
-        existing_offset = abs(float(info.get("offset"))) if info and info.get("offset") is not None else 0.0
-    except Exception:
-        existing_offset = 0.0
-    if target is not None and existing_offset > max(float(spacing) * 0.25, 0.01):
-        return target, info
-
     _log(
         f"[fat-landing-coincident-fallback] design={ref.get('design_index')}; "
-        f"seq_pos={ref.get('sequence_pos')}; offset={float(fallback_info['offset']):+.3f}m; "
-        "FDT/FAT initially coincident; target derived from first nonzero offset on full Link"
+        f"seq_pos={ref.get('sequence_pos')}; "
+        "FDT/FAT initially coincident; FAT moved to fixed control-distance "
+        "perpendicular landing point"
     )
     return fallback_target, fallback_info
 
