@@ -9,9 +9,9 @@ FAT landing rule used by Link Design:
    used by Link Design's route engine/configuration.
 2. The FAT's owning Link, not the POLE, determines its final displayed point.
 3. If the Link continues straight through that POLE, the FAT is placed on the
-   Link's offset run at the configured lateral spacing.
+   Link's parallel offset at the configured lateral spacing.
 4. If the Link makes a real corner at that POLE, the FAT is placed on the
-   generated offset corner / control-distance transition point.
+   generated offset corner / control-distance bend.
 5. Cable segment endpoints are updated to the same FAT point so the written
    Distribution Cable remains topologically connected to the moved FAT.
 
@@ -21,10 +21,12 @@ remain authoritative.
 
 from math import acos, degrees, hypot
 
+from qgis.PyQt.QtCore import QSettings
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsGeometry,
+    QgsMessageLog,
     QgsPointXY,
     QgsProject,
     Qgis,
@@ -32,6 +34,10 @@ from qgis.core import (
 
 from . import cable_offset_layout_v5 as _v5
 
+DEFAULT_SPACING_M = _v5.DEFAULT_SPACING_M
+DEFAULT_CONTROL_DISTANCE_M = _v5.DEFAULT_CONTROL_DISTANCE_M
+SPACING_KEY = "ODNToolsPro/CableOffsetLayout/spacing_m"
+CONTROL_DISTANCE_KEY = "ODNToolsPro/CableOffsetLayout/control_distance_m"
 DEFAULT_CORNER_THRESHOLD_DEG = 20.0
 DEFAULT_FAT_MAX_DISTANCE_M = 3.0
 LOG_TAG = "ODN_Tools_Pro / Cable Offset"
@@ -44,12 +50,28 @@ def _log(message, level=Qgis.Info):
         pass
 
 
-# QgsMessageLog is imported lazily above for older QGIS builds where the
-# symbol may be unavailable through some minimal imports.
-try:
-    from qgis.core import QgsMessageLog
-except Exception:  # pragma: no cover
-    QgsMessageLog = None
+def get_settings():
+    """Return persisted offset settings; kept compatible with v5 UI callers."""
+    try:
+        spacing = float(QSettings().value(SPACING_KEY, DEFAULT_SPACING_M))
+    except Exception:
+        spacing = DEFAULT_SPACING_M
+    try:
+        control_distance = float(
+            QSettings().value(CONTROL_DISTANCE_KEY, DEFAULT_CONTROL_DISTANCE_M)
+        )
+    except Exception:
+        control_distance = DEFAULT_CONTROL_DISTANCE_M
+    return max(0.01, spacing), max(0.01, control_distance)
+
+
+def save_settings(spacing, control_distance):
+    spacing = max(0.01, float(spacing))
+    control_distance = max(0.01, float(control_distance))
+    settings = QSettings()
+    settings.setValue(SPACING_KEY, spacing)
+    settings.setValue(CONTROL_DISTANCE_KEY, control_distance)
+    settings.sync()
 
 
 def _unit(a, b):
@@ -102,12 +124,12 @@ def _route_edges_nodes(segment, work_crs, source_crs, edge_crs):
             segment, work_crs, source_crs, edge_crs
         )
         return edges, nodes
-    except Exception:
+    except Exception as exc:
+        _log(f"[fat-route-node-error] {type(exc).__name__}: {exc}", Qgis.Warning)
         return [], []
 
 
 def _estimate_signed_offset(segment, segment_points, edge_index, work_crs, source_crs, edge_crs, spacing):
-    """Estimate the actual slot offset on one authoritative Pole Edge."""
     edges, nodes = _route_edges_nodes(segment, work_crs, source_crs, edge_crs)
     if edge_index < 0 or edge_index >= len(edges) or edge_index >= len(nodes) - 1:
         return 0.0
@@ -132,9 +154,6 @@ def _estimate_signed_offset(segment, segment_points, edge_index, work_crs, sourc
         return 0.0
     tx, ty = _unit(a, b)
     signed = (p.x() - midpoint.x()) * (-ty) + (p.y() - midpoint.y()) * tx
-    # Quantize to the actual configured corridor. This suppresses tiny
-    # numerical/digitizing noise and makes the FAT point agree with the
-    # selected cable slot (0, +/-spacing, +/-2*spacing, ...).
     if abs(signed) < max(spacing * 0.25, 0.01):
         return 0.0
     slot = round(signed / spacing)
@@ -161,7 +180,6 @@ def _flatten_local_points(incoming, outgoing, anchor, work_crs, source_crs):
 
 
 def _find_corner_candidate(points, anchor, control_distance, max_radius):
-    """Choose the generated offset bend closest to the control line distance."""
     if len(points) < 3:
         return None
     candidates = []
@@ -177,9 +195,6 @@ def _find_corner_candidate(points, anchor, control_distance, max_radius):
         turn = _turn_angle_deg(v1, v2)
         if turn < 5.0:
             continue
-        # The first criterion enforces the control-distance concept; the
-        # second prefers the actual geometric bend over an almost-straight
-        # transition vertex when several candidates are similarly placed.
         score = (abs(dist - control_distance), -turn, dist)
         candidates.append((score, here, turn, dist))
     if not candidates:
@@ -196,6 +211,20 @@ def _classify_corner(incoming_nodes, outgoing_nodes, threshold_deg):
     vin = _unit(incoming_nodes[-2], incoming_nodes[-1])
     vout = _unit(outgoing_nodes[0], outgoing_nodes[1])
     angle = _turn_angle_deg(vin, vout)
+    return angle >= threshold_deg, angle
+
+
+def _classify_endpoint_corner(nodes, outgoing=True, threshold_deg=DEFAULT_CORNER_THRESHOLD_DEG):
+    """Classify a bend when the FAT is the first/last item in a Link sequence."""
+    if len(nodes) < 3:
+        return False, 0.0
+    if outgoing:
+        v1 = _unit(nodes[0], nodes[1])
+        v2 = _unit(nodes[1], nodes[2])
+    else:
+        v1 = _unit(nodes[-3], nodes[-2])
+        v2 = _unit(nodes[-2], nodes[-1])
+    angle = _turn_angle_deg(v1, v2)
     return angle >= threshold_deg, angle
 
 
@@ -230,6 +259,7 @@ def _fat_sequence_refs(designs):
                 continue
             if fid in refs:
                 duplicates.add(fid)
+                continue
             refs[fid] = {
                 "design_index": di,
                 "sequence_pos": pos,
@@ -238,16 +268,7 @@ def _fat_sequence_refs(designs):
     return refs, duplicates
 
 
-def _segment_points_map(design):
-    return {
-        index: list(segment.get("points", []) or [])
-        for index, segment in enumerate(design.get("segments", []) or [])
-    }
-
-
 def _find_segment_for_sequence_pos(pos, segment_count):
-    # Segment i connects sequence[i] -> sequence[i+1]. A FAT at sequence
-    # position p therefore has incoming segment p-1 and outgoing segment p.
     incoming = pos - 1 if pos > 0 and pos - 1 < segment_count else None
     outgoing = pos if pos < segment_count else None
     return incoming, outgoing
@@ -290,7 +311,21 @@ def _target_for_fat(
     if anchor is None:
         return None, {"reason": "无法确定 FAT 所属 Pole Edge 节点"}
 
-    is_corner, turn_angle = _classify_corner(in_nodes, out_nodes, corner_threshold_deg)
+    has_both = bool(in_nodes and out_nodes)
+    if has_both:
+        is_corner, turn_angle = _classify_corner(
+            in_nodes, out_nodes, corner_threshold_deg
+        )
+    elif out_nodes:
+        is_corner, turn_angle = _classify_endpoint_corner(
+            out_nodes, outgoing=True, threshold_deg=corner_threshold_deg
+        )
+    elif in_nodes:
+        is_corner, turn_angle = _classify_endpoint_corner(
+            in_nodes, outgoing=False, threshold_deg=corner_threshold_deg
+        )
+    else:
+        is_corner, turn_angle = False, 0.0
 
     incoming_points = list(incoming_segment.get("points", []) or []) if incoming_segment else []
     outgoing_points = list(outgoing_segment.get("points", []) or []) if outgoing_segment else []
@@ -307,7 +342,8 @@ def _target_for_fat(
                 edge_crs,
                 spacing,
             )
-            candidates.append((abs(signed), signed, _unit(in_nodes[-2], in_nodes[-1])))
+            tangent = _unit(in_nodes[-2], in_nodes[-1])
+            candidates.append((abs(signed), signed, tangent))
         if out_edges and out_nodes and len(out_nodes) >= 2:
             signed = _estimate_signed_offset(
                 outgoing_segment,
@@ -318,7 +354,8 @@ def _target_for_fat(
                 edge_crs,
                 spacing,
             )
-            candidates.append((abs(signed), signed, _unit(out_nodes[0], out_nodes[1])))
+            tangent = _unit(out_nodes[0], out_nodes[1])
+            candidates.append((abs(signed), signed, tangent))
         if not candidates:
             return None, {"reason": "无法估计 FAT 对应 Link 的偏移槽位"}
         candidates.sort(key=lambda item: item[0], reverse=True)
@@ -336,9 +373,6 @@ def _target_for_fat(
             "outgoing": outgoing_index,
         }
 
-    # Large corner: prefer the actual generated offset bend that lies close
-    # to the fixed control-distance line. This makes the FAT a real cable bend
-    # point instead of leaving it at the POLE where L1 may visually capture it.
     local_points = _flatten_local_points(
         incoming_points,
         outgoing_points,
@@ -361,8 +395,6 @@ def _target_for_fat(
             "control_distance": control_distance,
         }
 
-    # Safe geometric fallback: use the incoming control line if available,
-    # otherwise the outgoing one, while preserving the estimated cable side.
     fallback_info = None
     if in_edges and in_nodes:
         signed = _estimate_signed_offset(
@@ -408,7 +440,6 @@ def _target_for_fat(
 
 
 def _replace_fat_endpoints(designs, moves, edge_crs):
-    """Make copied Link geometries terminate/start at the moved FAT point."""
     changed = 0
     for fid, move in moves.items():
         design_index = move["design_index"]
@@ -443,12 +474,12 @@ def _replace_fat_endpoints(designs, moves, edge_crs):
 
     for design in designs or []:
         total = 0.0
+        source_crs = _v5._v3._crs_from_authid(design.get("source_crs")) or edge_crs
         for segment in design.get("segments", []) or []:
             points = _geometry_points(segment.get("points", []) or [])
             if len(points) < 2:
                 continue
             try:
-                source_crs = _v5._v3._crs_from_authid(design.get("source_crs")) or edge_crs
                 work_points = _transform_points(points, source_crs, edge_crs)
                 total += QgsGeometry.fromPolylineXY(work_points).length()
             except Exception:
@@ -471,7 +502,7 @@ def _apply_fat_moves(fat_layer, moves):
         if geom is None or geom.isEmpty():
             raise RuntimeError(f"FAT feature {fid} 几何为空，无法更新 FAT 落点。")
         new_geom = QgsGeometry.fromPointXY(QgsPointXY(target))
-        if geom != new_geom:
+        if geom.distance(new_geom) > 1e-9:
             feature.setGeometry(new_geom)
             if not fat_layer.updateFeature(feature):
                 raise RuntimeError(f"无法写入 FAT feature {fid} 的新落点。")
@@ -519,6 +550,7 @@ def prepare_fat_landing_points(
         point = _feature_point_in_work(feature, fat_layer, work_crs)
         if point is None:
             stats["skipped"] += 1
+            _log(f"[fat-landing-skip] fid={fid}; reason=无法读取FAT点位置", Qgis.Warning)
             continue
         design = designs[ref["design_index"]]
         target_work, info = _target_for_fat(
@@ -543,8 +575,6 @@ def prepare_fat_landing_points(
             continue
 
         current_distance = hypot(point.x() - target_work.x(), point.y() - target_work.y())
-        # FAT must already be near a POLE according to the project's physical
-        # attachment rule. Refuse to silently relocate a remote FAT.
         anchor = info.get("anchor")
         if anchor is not None:
             from_anchor = hypot(point.x() - anchor.x(), point.y() - anchor.y())
@@ -590,8 +620,8 @@ def apply_explicit_layout_to_designs(
     designs,
     distribution_layer,
     edge_layer,
-    spacing=_v5.DEFAULT_SPACING_M,
-    control_distance_m=_v5.DEFAULT_CONTROL_DISTANCE_M,
+    spacing=DEFAULT_SPACING_M,
+    control_distance_m=DEFAULT_CONTROL_DISTANCE_M,
     fat_layer=None,
     fat_max_distance_m=DEFAULT_FAT_MAX_DISTANCE_M,
     corner_threshold_deg=DEFAULT_CORNER_THRESHOLD_DEG,
