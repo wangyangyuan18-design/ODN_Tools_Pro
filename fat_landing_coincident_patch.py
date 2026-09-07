@@ -69,12 +69,13 @@ def _fallback_signed_offset(segment, edge_nodes, work_crs, source_crs, spacing):
         along = (p.x() - a.x()) * tx + (p.y() - a.y()) * ty
         if -0.25 <= along <= edge_len + 0.25:
             signed = (p.x() - a.x()) * (-ty) + (p.y() - a.y()) * tx
-            samples.append(abs(float(signed)), float(signed))
+            samples.append((abs(float(signed)), float(signed)))
 
     if not samples:
         return None
 
-    # Use the strongest non-trivial lateral displacement on the first edge.
+    # Use the strongest non-trivial lateral displacement on the first edge,
+    # then snap it to the configured offset spacing.
     samples.sort(key=lambda item: item[0], reverse=True)
     threshold = max(float(spacing) * 0.25, 0.01)
     for _, signed in samples:
@@ -103,11 +104,12 @@ def _coincident_target(ref, design, work_crs, edge_crs, spacing):
     if len(out_nodes) < 2:
         return None
 
+    source_crs = _v6._crs_from_authid(design.get("source_crs")) or edge_crs
     signed = _fallback_signed_offset(
         outgoing,
         out_nodes,
         work_crs,
-        edge_crs,
+        source_crs,
         float(spacing),
     )
     if signed is None:
@@ -138,8 +140,8 @@ def _patched_target_for_fat(ref, design, fat_feature, fat_layer, work_crs, edge_
         corner_threshold_deg,
     )
 
-    # Only intervene for the exact failure mode: the FAT is the first node
-    # after FDT and the incoming Segment is geometrically coincident.
+    # Only intervene for the exact failure mode: the FAT is immediately after
+    # FDT and the incoming Segment is geometrically coincident.
     fallback = _coincident_target(ref, design, work_crs, edge_crs, spacing)
     if fallback is None:
         return target, info
