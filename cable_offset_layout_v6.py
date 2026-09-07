@@ -190,6 +190,13 @@ def _find_generated_bend(points, anchor, control_distance):
     return candidates[0][2], candidates[0][3]
 
 
+def _feature_point_in_work(feature, layer, work_crs):
+    try:
+        return _transform_point(QgsPointXY(feature.geometry().centroid().asPoint()), layer.crs(), work_crs)
+    except Exception:
+        return None
+
+
 def _target_for_fat(ref, design, fat_feature, fat_layer, work_crs, edge_crs, spacing, control_distance, corner_threshold_deg):
     segments = design.get("segments", []) or []
     pos = int(ref["sequence_pos"])
@@ -212,9 +219,6 @@ def _target_for_fat(ref, design, fat_feature, fat_layer, work_crs, edge_crs, spa
         is_corner, turn = _classify_endpoint_corner(in_nodes, False, corner_threshold_deg)
     else:
         is_corner, turn = False, 0.0
-
-    in_points = list(incoming.get("points", []) or []) if incoming else []
-    out_points = list(outgoing.get("points", []) or []) if outgoing else []
 
     if not is_corner:
         candidates = []
@@ -258,13 +262,6 @@ def _target_for_fat(ref, design, fat_feature, fat_layer, work_crs, edge_crs, spa
     return target, {"mode": "corner_control", "turn_angle": turn, "offset": signed, "anchor": anchor, "control_distance": control_distance}
 
 
-def _feature_point_in_work(feature, layer, work_crs):
-    try:
-        return _transform_point(QgsPointXY(feature.geometry().centroid().asPoint()), layer.crs(), work_crs)
-    except Exception:
-        return None
-
-
 def _make_fat_index(fat_layer):
     return {int(feature.id()): feature for feature in fat_layer.getFeatures()} if fat_layer is not None else {}
 
@@ -302,19 +299,72 @@ def _replace_fat_endpoints(designs, moves, edge_crs):
         incoming, outgoing = _find_segment_for_sequence_pos(pos, len(design.get("segments", []) or []))
         touched = False
         if incoming is not None:
-            pts = list(design["segments"][incoming].get("points", []) or [])
+            segment = design["segments"][incoming]
+            pts = list(segment.get("points", []) or [])
             if pts:
+                if len(pts) == 1:
+                    # FDT and FAT originally occupy the same coordinate.  The
+                    # FAT landing point is the authoritative new endpoint, so
+                    # turn the logical one-point segment into a real FDT -> FAT
+                    # line instead of allowing it to reach the DC writer as an
+                    # invalid/empty geometry.
+                    pts.append(list(pts[0]))
+                    _log(
+                        f"[fat-landing-zero-segment] design={di}; sequence_pos={pos}; "
+                        "FDT/FAT initially coincident; expanded segment before writing",
+                        Qgis.Info,
+                    )
                 pts[-1] = [float(target.x()), float(target.y())]
-                design["segments"][incoming]["points"] = pts
+                segment["points"] = pts
+                segment["distance"] = _polyline_distance(pts, source_crs)
+                segment["zero_length"] = False
                 touched = True
+            else:
+                anchor = move.get("target_edge")
+                if anchor is not None:
+                    anchor_src = _transform_point(anchor, edge_crs, source_crs)
+                    segment["points"] = [
+                        [float(anchor_src.x()), float(anchor_src.y())],
+                        [float(target.x()), float(target.y())],
+                    ]
+                    segment["distance"] = _polyline_distance(segment["points"], source_crs)
+                    segment["zero_length"] = False
+                    touched = True
         if outgoing is not None:
             pts = list(design["segments"][outgoing].get("points", []) or [])
             if pts:
+                if len(pts) == 1:
+                    pts.insert(0, list(pts[0]))
                 pts[0] = [float(target.x()), float(target.y())]
                 design["segments"][outgoing]["points"] = pts
+                design["segments"][outgoing]["distance"] = _polyline_distance(pts, source_crs)
+                design["segments"][outgoing]["zero_length"] = False
                 touched = True
         changed += int(touched)
     return changed
+
+
+def _polyline_distance(points, crs):
+    if len(points) < 2:
+        return 0.0
+    try:
+        if crs.isGeographic():
+            return 0.0
+        total = 0.0
+        for i in range(1, len(points)):
+            total += hypot(
+                float(points[i][0]) - float(points[i - 1][0]),
+                float(points[i][1]) - float(points[i - 1][1]),
+            )
+        return round(total, 3)
+    except Exception:
+        total = 0.0
+        for i in range(1, len(points)):
+            total += hypot(
+                float(points[i][0]) - float(points[i - 1][0]),
+                float(points[i][1]) - float(points[i - 1][1]),
+            )
+        return round(total, 3)
 
 
 def _apply_fat_moves(fat_layer, moves):
