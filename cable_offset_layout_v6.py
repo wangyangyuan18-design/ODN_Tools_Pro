@@ -7,6 +7,7 @@ from qgis.PyQt.QtCore import QSettings
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsDistanceArea,
     QgsGeometry,
     QgsMessageLog,
     QgsPointXY,
@@ -144,8 +145,6 @@ def _classify_corner(in_nodes, out_nodes, threshold_deg):
     vin = _unit(in_nodes[-2], in_nodes[-1])
     vout = _unit(out_nodes[0], out_nodes[1])
     angle = _turn_angle_deg(vin, vout)
-    # 180 degrees means the route is continuing straight through the graph
-    # with reversed edge orientation, not making a physical corner.
     return angle >= threshold_deg and angle < 175.0, angle
 
 
@@ -287,8 +286,40 @@ def _find_segment_for_sequence_pos(pos, count):
     return (pos - 1 if pos > 0 and pos - 1 < count else None, pos if pos < count else None)
 
 
+def _polyline_distance(points, crs, project=None):
+    if len(points) < 2:
+        return 0.0
+    try:
+        geom = QgsGeometry.fromPolylineXY(_geometry_points(points))
+        if geom.isEmpty():
+            return 0.0
+        distance_area = QgsDistanceArea()
+        if project is None:
+            project = QgsProject.instance()
+        distance_area.setSourceCrs(crs, project.transformContext())
+        if crs.isGeographic():
+            return round(float(distance_area.measureLength(geom)), 3)
+        total = 0.0
+        polyline = geom.asPolyline()
+        for i in range(1, len(polyline)):
+            total += hypot(
+                float(polyline[i].x()) - float(polyline[i - 1].x()),
+                float(polyline[i].y()) - float(polyline[i - 1].y()),
+            )
+        return round(total, 3)
+    except Exception:
+        total = 0.0
+        for i in range(1, len(points)):
+            total += hypot(
+                float(points[i][0]) - float(points[i - 1][0]),
+                float(points[i][1]) - float(points[i - 1][1]),
+            )
+        return round(total, 3)
+
+
 def _replace_fat_endpoints(designs, moves, edge_crs):
     changed = 0
+    touched_designs = set()
     for move in moves.values():
         di, pos = move["design_index"], move["sequence_pos"]
         if di < 0 or di >= len(designs):
@@ -303,11 +334,9 @@ def _replace_fat_endpoints(designs, moves, edge_crs):
             pts = list(segment.get("points", []) or [])
             if pts:
                 if len(pts) == 1:
-                    # FDT and FAT originally occupy the same coordinate.  The
-                    # FAT landing point is the authoritative new endpoint, so
-                    # turn the logical one-point segment into a real FDT -> FAT
-                    # line instead of allowing it to reach the DC writer as an
-                    # invalid/empty geometry.
+                    # FDT and FAT initially share one coordinate. FAT landing
+                    # supplies the authoritative new endpoint, turning this
+                    # logical zero-length segment into a real FDT -> FAT line.
                     pts.append(list(pts[0]))
                     _log(
                         f"[fat-landing-zero-segment] design={di}; sequence_pos={pos}; "
@@ -340,31 +369,18 @@ def _replace_fat_endpoints(designs, moves, edge_crs):
                 design["segments"][outgoing]["distance"] = _polyline_distance(pts, source_crs)
                 design["segments"][outgoing]["zero_length"] = False
                 touched = True
+        if touched:
+            touched_designs.add(di)
         changed += int(touched)
+
+    # Recalculate the Link total after one or more FAT endpoints moved.
+    for di in touched_designs:
+        design = designs[di]
+        design["length"] = round(
+            sum(float(segment.get("distance", 0.0) or 0.0) for segment in design.get("segments", []) or []),
+            3,
+        )
     return changed
-
-
-def _polyline_distance(points, crs):
-    if len(points) < 2:
-        return 0.0
-    try:
-        if crs.isGeographic():
-            return 0.0
-        total = 0.0
-        for i in range(1, len(points)):
-            total += hypot(
-                float(points[i][0]) - float(points[i - 1][0]),
-                float(points[i][1]) - float(points[i - 1][1]),
-            )
-        return round(total, 3)
-    except Exception:
-        total = 0.0
-        for i in range(1, len(points)):
-            total += hypot(
-                float(points[i][0]) - float(points[i - 1][0]),
-                float(points[i][1]) - float(points[i - 1][1]),
-            )
-        return round(total, 3)
 
 
 def _apply_fat_moves(fat_layer, moves):
