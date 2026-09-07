@@ -63,7 +63,7 @@ def _sequence_identity(sequence):
 
 
 def _stable_link_id(design, index=None):
-    """Persistent identity. FDT/FAT display names are never used as keys."""
+    """Persistent ID. FDT/FAT display names are never identity keys."""
     existing = design.get("_link_id")
     if existing:
         return str(existing)
@@ -78,12 +78,8 @@ def _stable_link_id(design, index=None):
 
 
 def _prepare_design_identities(designs):
-    changed = False
     for index, design in enumerate(designs or []):
-        before = design.get("_link_id")
         _stable_link_id(design, index)
-        changed = changed or before != design.get("_link_id")
-    return changed
 
 
 def _crs_from_authid(authid):
@@ -107,9 +103,7 @@ def _segment_geometry_in_target(design, segment, target_crs):
     source_crs = _crs_from_authid(design.get("source_crs"))
     if source_crs is not None and source_crs != target_crs:
         try:
-            transform = QgsCoordinateTransform(
-                source_crs, target_crs, QgsProject.instance().transformContext()
-            )
+            transform = QgsCoordinateTransform(source_crs, target_crs, QgsProject.instance().transformContext())
             points = [transform.transform(p) for p in points]
         except Exception:
             return None
@@ -202,8 +196,7 @@ def _v12_add_fat(self, info):
         answer = QtWidgets.QMessageBox.question(
             self,
             "FAT 重新分配",
-            f"{info['label']} 已属于 {old_design.get('fdt','')}/{old_design.get('link','')}。\n\n"
-            "是否将它从原 Link 删除并重新分配到当前 Link？",
+            f"{info['label']} 已属于 {old_design.get('fdt','')}/{old_design.get('link','')}。\n\n是否将它从原 Link 删除并重新分配到当前 Link？",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.Yes,
         )
@@ -237,9 +230,7 @@ def _v12_save_current_link(self):
             old_design = self._designs[index]
             rebuilt = self._remove_fats_from_design(old_design, fids)
             if rebuilt is None:
-                raise RuntimeError(
-                    f"原 Link {old_design.get('fdt','')}/{old_design.get('link','')} 删除 FAT 后无法形成有效 Link"
-                )
+                raise RuntimeError(f"原 Link {old_design.get('fdt','')}/{old_design.get('link','')} 删除 FAT 后无法形成有效 Link")
             rebuilt["_link_id"] = _stable_link_id(old_design, index)
             rebuilt["written"] = False
             rebuilt["needs_resync"] = True
@@ -266,7 +257,7 @@ def _v12_save_current_link(self):
 
 
 def _sync_dc_changes_into_designs(self, layer):
-    """Pull geometry edits from linked DC into the saved Link records."""
+    """Pull manual DC geometry edits into linked saved Link segments."""
     records = _dc_records(layer)
     changed_links = []
     for index, design in enumerate(self._designs or []):
@@ -299,7 +290,7 @@ def _sync_dc_changes_into_designs(self, layer):
 
 
 def _write_design_to_dc(self, layer, design_index, design):
-    """Write one Link by stable Link/Segment identity; replace changed DC geometry."""
+    """Write one Link using stable identity; replace changed DC geometry."""
     link_id = _stable_link_id(design, design_index)
     existing = _dc_records(layer)
     segments = design.get("segments", []) or []
@@ -307,9 +298,7 @@ def _write_design_to_dc(self, layer, design_index, design):
     for seg_index, segment in enumerate(segments):
         geom = _segment_geometry_in_target(design, segment, layer.crs())
         if geom is None or geom.isEmpty():
-            raise RuntimeError(
-                f"{design.get('fdt','')}/{design.get('link','')} Segment {seg_index + 1} 几何无效。"
-            )
+            raise RuntimeError(f"{design.get('fdt','')}/{design.get('link','')} Segment {seg_index + 1} 几何无效。")
         wanted[(link_id, seg_index + 1)] = (seg_index, geom)
 
     for key, items in list(existing.items()):
@@ -330,9 +319,8 @@ def _write_design_to_dc(self, layer, design_index, design):
             else:
                 layer.deleteFeature(fid)
 
-    current = _dc_records(layer)
     for key, (seg_index, geom) in wanted.items():
-        rows = current.get(key, [])
+        rows = _dc_records(layer).get(key, [])
         if rows:
             for fid, feature in rows:
                 if _same_geometry(feature.geometry(), geom):
@@ -347,15 +335,12 @@ def _write_design_to_dc(self, layer, design_index, design):
             feature.setGeometry(geom)
             _add_sync_attrs(feature, link_id, seg_index + 1, design)
             if not layer.addFeature(feature):
-                raise RuntimeError(
-                    f"无法写入 Distribution Cable：{design.get('fdt','')}/{design.get('link','')} Segment {seg_index + 1}"
-                )
-
+                raise RuntimeError(f"无法写入 Distribution Cable：{design.get('fdt','')}/{design.get('link','')} Segment {seg_index + 1}")
     return link_id
 
 
 def _v12_write_planned_links(self):
-    """Explicit write: saved Link design is authoritative for DC geometry."""
+    """Explicit write: saved Link design is authoritative for DC."""
     layer = _v9.context.project_layer(_v9._fresh_payload(self), "Distribution Cable")
     if layer is None:
         QtWidgets.QMessageBox.warning(self, "写入图层", "当前项目没有绑定 Distribution Cable 图层。")
@@ -385,28 +370,22 @@ def _v12_write_planned_links(self):
         QtWidgets.QMessageBox.warning(self, "写入图层", f"同步 Distribution Cable 失败：\n{exc}")
         return False
     self._refresh_ui()
-    QtWidgets.QMessageBox.information(
-        self,
-        "写入图层",
-        f"已同步 {links} 条 Link，共 {segments} 个线路段。\n\n"
-        "已存在的 Link/Segment 按稳定内部 ID 更新；FDT/FAT 名称变化不会改变归属。",
-    )
+    QtWidgets.QMessageBox.information(self, "写入图层", f"已同步 {links} 条 Link，共 {segments} 个线路段。\n\n已存在的 Link/Segment 按稳定内部 ID 更新；FDT/FAT 名称变化不会改变归属。")
     return True
 
 
 def _show_startup_sync_dialog(self, layer):
-    """Enforce saved-design >= DC and import only identifiable DC records."""
+    """Enforce saved-design >= DC. Pull linked DC edits first."""
     designs = getattr(self, "_designs", []) or []
     _prepare_design_identities(designs)
     if not _ensure_sync_fields(layer):
-        QtWidgets.QMessageBox.warning(
-            self,
-            "Link 数据检查",
-            "Distribution Cable 无法建立内部 Link 标识字段，无法安全判断线路归属。",
-        )
+        QtWidgets.QMessageBox.warning(self, "Link 数据检查", "Distribution Cable 无法建立内部 Link 标识字段，无法安全判断线路归属。")
         return False
 
-    _sync_dc_changes_into_designs(self, layer)
+    changed = _sync_dc_changes_into_designs(self, layer)
+    if changed:
+        self._refresh_ui()
+
     records = _dc_records(layer)
     known = {_stable_link_id(d, i) for i, d in enumerate(designs)}
     orphan = [key for key in records if key[0] not in known]
@@ -438,8 +417,7 @@ def _show_startup_sync_dialog(self, layer):
         QtWidgets.QMessageBox.warning(
             self,
             "无法自动归属",
-            "这些 DC 线路没有稳定的 Link ID，插件无法安全判断它们属于哪一个已完成 Link。\n\n"
-            "请先对已有设计执行一次“确定并写入图层”建立关联。",
+            "这些 DC 线路没有稳定的 Link ID，无法安全判断它们属于哪个已完成 Link。\n\n请先对已有设计执行一次“确定并写入图层”建立关联。",
         )
         return False
 
@@ -464,9 +442,7 @@ class LinkDesignDock(_v11.LinkDesignDock):
 
     def _check_dc_consistency_before_design(self):
         try:
-            layer = _v9.context.project_layer(
-                _v9._fresh_payload(self._controller), "Distribution Cable"
-            )
+            layer = _v9.context.project_layer(_v9._fresh_payload(self._controller), "Distribution Cable")
         except Exception:
             layer = None
         if layer is None:
@@ -480,5 +456,3 @@ class LinkDesignDock(_v11.LinkDesignDock):
                 self._check_dc_consistency_before_design()
         except Exception:
             pass
-
-    pass
