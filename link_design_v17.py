@@ -37,6 +37,72 @@ def _log(message, level=Qgis.Info):
         pass
 
 
+def _route_attach_diagnostic(engine, typ, feature_id):
+    """Return one detailed attachment diagnosis without changing routing behavior."""
+    result = {
+        "typ": str(typ),
+        "feature_id": int(feature_id),
+        "status": "unknown",
+        "label": str(feature_id),
+        "distance": None,
+        "limit": float(getattr(engine, "attach_distance", 0.0) or 0.0),
+        "node": None,
+    }
+    try:
+        _, info = engine.point_by_id(typ, feature_id)
+        if info is None:
+            result["status"] = "point-not-found"
+            return result
+        result["label"] = str(info.get("label", feature_id))
+    except Exception as exc:
+        result["status"] = f"point-lookup-error:{type(exc).__name__}"
+        return result
+
+    try:
+        if not getattr(engine, "node_points", None):
+            result["status"] = "pole-edge-graph-empty"
+            return result
+        point = engine._point_in_edge_crs(info)
+        candidates = []
+        if hasattr(engine, "_node_index"):
+            candidates = engine._node_index.nearestNeighbor(point, 16)
+        best = None
+        for fid in candidates:
+            node = engine._node_by_fid.get(int(fid))
+            if node is None:
+                continue
+            node_point = engine.node_points[node]
+            distance = engine._point_distance(point, node_point)
+            if best is None or distance < best[0]:
+                best = (distance, node)
+        if best is None:
+            result["status"] = "nearest-node-not-found"
+            return result
+        result["distance"] = float(best[0])
+        result["node"] = best[1]
+        if best[0] > result["limit"]:
+            result["status"] = "over-attach-limit"
+        else:
+            result["status"] = "attached"
+    except Exception as exc:
+        result["status"] = f"diagnostic-error:{type(exc).__name__}:{exc}"
+    return result
+
+
+def _format_route_attach_diag(diag):
+    distance = "N/A" if diag.get("distance") is None else f"{diag['distance']:.3f}m"
+    node = diag.get("node")
+    if isinstance(node, tuple):
+        node_text = f"({node[0]:.8f},{node[1]:.8f})"
+    else:
+        node_text = "N/A"
+    return (
+        f"{diag.get('typ')}/{diag.get('feature_id')}[{diag.get('label')}]; "
+        f"status={diag.get('status')}; nearest={distance}; "
+        f"limit={diag.get('limit', 0.0):.3f}m; node={node_text}"
+    )
+
+
 def _restore_authoritative_routes(host, persist=True):
     """Rebuild completed Link geometry exactly from FDT/FAT sequence via Pole Edge."""
     controller = host._controller
@@ -57,6 +123,10 @@ def _restore_authoritative_routes(host, persist=True):
     restored_segments = 0
     failed_links = 0
     changed = False
+    diagnostic_emitted = False
+    diagnostic_failure_count = 0
+    diagnostic_details = None
+
     for design_index, design in enumerate(controller._designs or []):
         seq_ids = design.get("sequence_ids", []) or []
         segments = design.get("segments", []) or []
@@ -70,19 +140,41 @@ def _restore_authoritative_routes(host, persist=True):
             try:
                 route = engine.route(str(first[0]), int(first[1]), str(second[0]), int(second[1]))
             except Exception as exc:
-                _log(
-                    f"[route-restore-fail] design={design_index}; segment={segment_index}; "
-                    f"{first[1]}->{second[1]}; reason={type(exc).__name__}:{exc}",
-                    Qgis.Warning,
-                )
+                failed_links += 1
+                diagnostic_failure_count += 1
+                if diagnostic_details is None:
+                    diagnostic_details = {
+                        "design": design_index,
+                        "segment": segment_index,
+                        "first": first,
+                        "second": second,
+                        "kind": "route-exception",
+                        "exception": f"{type(exc).__name__}:{exc}",
+                        "start": _route_attach_diagnostic(engine, str(first[0]), int(first[1])),
+                        "end": _route_attach_diagnostic(engine, str(second[0]), int(second[1])),
+                    }
                 link_failed = True
                 break
             if not route or not route.get("edge_sequence"):
-                _log(
-                    f"[route-restore-fail] design={design_index}; segment={segment_index}; "
-                    f"{first[1]}->{second[1]}; reason=无法沿 Pole Edge 建立完整路径",
-                    Qgis.Warning,
-                )
+                diagnostic_failure_count += 1
+                if diagnostic_details is None:
+                    start_diag = _route_attach_diagnostic(engine, str(first[0]), int(first[1]))
+                    end_diag = _route_attach_diagnostic(engine, str(second[0]), int(second[1]))
+                    if start_diag["status"] != "attached" or end_diag["status"] != "attached":
+                        kind = "attachment"
+                    else:
+                        kind = "graph-disconnected-or-no-path"
+                    diagnostic_details = {
+                        "design": design_index,
+                        "segment": segment_index,
+                        "first": first,
+                        "second": second,
+                        "kind": kind,
+                        "exception": None,
+                        "start": start_diag,
+                        "end": end_diag,
+                    }
+                failed_links += 1
                 link_failed = True
                 break
             rebuilt = dict(old_segment)
@@ -95,7 +187,6 @@ def _restore_authoritative_routes(host, persist=True):
             rebuilt["points"] = [[float(p.x()), float(p.y())] for p in route["points"]]
             rebuilt_segments.append(rebuilt)
         if link_failed:
-            failed_links += 1
             continue
         new_length = round(sum(float(s.get("distance", 0.0) or 0.0) for s in rebuilt_segments), 3)
         old_length = float(design.get("length", 0.0) or 0.0)
@@ -109,6 +200,21 @@ def _restore_authoritative_routes(host, persist=True):
         restored_segments += len(rebuilt_segments)
         design["needs_resync"] = True
         design["written"] = False
+
+    if diagnostic_details is not None and not diagnostic_emitted:
+        diagnostic_emitted = True
+        detail = diagnostic_details
+        _log(
+            "[route-restore-diagnostic] "
+            f"design={detail['design']}; segment={detail['segment']}; "
+            f"{detail['first'][0]}/{detail['first'][1]} -> {detail['second'][0]}/{detail['second'][1]}; "
+            f"kind={detail['kind']}; "
+            f"start=({_format_route_attach_diag(detail['start'])}); "
+            f"end=({_format_route_attach_diag(detail['end'])})"
+            + (f"; exception={detail['exception']}" if detail.get('exception') else "")
+            + f"; same_failures_in_run={diagnostic_failure_count}",
+            Qgis.Warning,
+        )
 
     if changed and persist:
         controller._persist_state()
