@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Fallback for FATs coincident with the Link's FDT.
+"""Special FAT landing rule for a FAT initially coincident with its FDT.
 
-When FDT and the first FAT share one coordinate, the incoming Segment can
-contain only one point, so the normal FAT landing calculation has no incoming
-Pole Edge geometry to measure. In that case the owning Link's first outgoing
-segment is the source of truth: derive its actual lateral offset from the
-first Pole Edge direction and place the FAT at that offset from the common
-FDT/Pole anchor.
+For the FDT=FAT case, the incoming logical Segment has zero length. The FAT
+must not remain at the original Pole Edge point merely because the first
+outgoing edge is still at zero offset. Instead, scan the complete offset
+geometry of the owning Link from the FDT forward and place the FAT at the
+first point where that Link actually leaves the original Pole Edge position.
+The ordinary FAT landing rules are unchanged.
 """
 
 from math import hypot
@@ -41,49 +41,64 @@ def _same_point_segment(points, tolerance=1e-9):
         return False
 
 
-def _fallback_signed_offset(segment, edge_nodes, work_crs, source_crs, spacing):
-    """Estimate the actual lateral offset of the outgoing offset geometry."""
-    if not segment or len(edge_nodes) < 2:
-        return None
-    points = _v6._geometry_points(segment.get("points", []) or [])
-    if len(points) < 2:
-        return None
-    try:
-        work_points = _v6._transform_points(points, source_crs, work_crs)
-    except Exception:
-        return None
-
-    a, b = edge_nodes[0], edge_nodes[1]
-    tx, ty = _v6._unit(a, b)
-    if abs(tx) <= 1e-12 and abs(ty) <= 1e-12:
-        return None
-    edge_len = hypot(b.x() - a.x(), b.y() - a.y())
-    if edge_len <= 1e-9:
-        return None
-
-    # Prefer points whose projection falls on the first Pole Edge. This keeps
-    # the sample on the first offset segment instead of accidentally using a
-    # later corner with a different direction.
-    samples = []
-    for p in work_points:
-        along = (p.x() - a.x()) * tx + (p.y() - a.y()) * ty
-        if -0.25 <= along <= edge_len + 0.25:
-            signed = (p.x() - a.x()) * (-ty) + (p.y() - a.y()) * tx
-            samples.append((abs(float(signed)), float(signed)))
-
-    if not samples:
-        return None
-
-    # Use the strongest non-trivial lateral displacement on the first edge,
-    # then snap it to the configured offset spacing.
-    samples.sort(key=lambda item: item[0], reverse=True)
+def _first_nonzero_offset_point(design, start_segment_index, work_crs, edge_crs, source_crs, spacing):
+    """Find the first real non-zero offset point along the Link after the FDT."""
+    segments = design.get("segments", []) or []
     threshold = max(float(spacing) * 0.25, 0.01)
-    for _, signed in samples:
-        if abs(signed) < threshold:
+
+    for seg_index in range(max(0, int(start_segment_index)), len(segments)):
+        segment = segments[seg_index] or {}
+        points = _v6._geometry_points(segment.get("points", []) or [])
+        if len(points) < 2:
             continue
-        snapped = float(round(signed / float(spacing)) * float(spacing))
-        if abs(snapped) >= threshold:
-            return snapped
+        try:
+            work_points = _v6._transform_points(points, source_crs, work_crs)
+        except Exception:
+            continue
+
+        _, edge_nodes = _v6._route_edges_nodes(segment, work_crs, source_crs, edge_crs)
+        if len(edge_nodes) < 2:
+            continue
+
+        # Inspect the generated offset points in route order. For each point,
+        # estimate its signed lateral displacement from the closest original
+        # Pole Edge segment. The first point with a material displacement is
+        # the first place where the offset Link actually leaves the main route.
+        for point_index, point in enumerate(work_points):
+            best = None
+            for edge_index in range(len(edge_nodes) - 1):
+                a = edge_nodes[edge_index]
+                b = edge_nodes[edge_index + 1]
+                dx = b.x() - a.x()
+                dy = b.y() - a.y()
+                length_sq = dx * dx + dy * dy
+                if length_sq <= 1e-18:
+                    continue
+                t = ((point.x() - a.x()) * dx + (point.y() - a.y()) * dy) / length_sq
+                t = max(0.0, min(1.0, t))
+                projection = QgsPointXY(a.x() + t * dx, a.y() + t * dy)
+                ddx = point.x() - projection.x()
+                ddy = point.y() - projection.y()
+                dist_sq = ddx * ddx + ddy * ddy
+                cross = dx * ddy - dy * ddx
+                signed = cross / (length_sq ** 0.5)
+                candidate = (dist_sq, abs(signed), signed, edge_index)
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+
+            if best is None:
+                continue
+            _, magnitude, signed, edge_index = best
+            if magnitude < threshold:
+                continue
+
+            _log(
+                f"[fat-landing-coincident-search] segment={seg_index}; point={point_index}; "
+                f"edge_index={edge_index}; offset={signed:+.3f}m; "
+                "first_nonzero_offset_point=found"
+            )
+            return point, signed, seg_index, point_index
+
     return None
 
 
@@ -91,39 +106,42 @@ def _coincident_target(ref, design, work_crs, edge_crs, spacing):
     segments = design.get("segments", []) or []
     pos = int(ref.get("sequence_pos", -1))
     incoming_index = pos - 1 if 0 <= pos - 1 < len(segments) else None
-    outgoing_index = pos if 0 <= pos < len(segments) else None
     incoming = segments[incoming_index] if incoming_index is not None else None
-    outgoing = segments[outgoing_index] if outgoing_index is not None else None
     incoming_points = list(incoming.get("points", []) or []) if incoming else []
     if not _same_point_segment(incoming_points):
         return None
-    if outgoing is None:
-        return None
 
-    _, out_nodes = _v6._route_edges_nodes(outgoing, work_crs, edge_crs, edge_crs)
-    if len(out_nodes) < 2:
+    # FAT immediately after FDT; begin searching from its outgoing Segment.
+    outgoing_index = pos if 0 <= pos < len(segments) else None
+    if outgoing_index is None:
         return None
 
     source_crs = _v6._crs_from_authid(design.get("source_crs")) or edge_crs
-    signed = _fallback_signed_offset(
-        outgoing,
-        out_nodes,
+    found = _first_nonzero_offset_point(
+        design,
+        outgoing_index,
         work_crs,
+        edge_crs,
         source_crs,
         float(spacing),
     )
-    if signed is None:
+    if found is None:
         return None
 
-    anchor = QgsPointXY(out_nodes[0])
-    tangent = _v6._unit(out_nodes[0], out_nodes[1])
-    target = _v6._offset_point(anchor, tangent, signed)
-    return target, {
-        "mode": "coincident_fallback",
+    target_work, signed, seg_index, point_index = found
+    target_edge = _v6._transform_point(target_work, work_crs, edge_crs)
+
+    # The target is an actual point on the generated offset geometry, not a
+    # reconstructed point from the first Pole Edge direction. This preserves
+    # the real transition/corner produced by the offset engine.
+    return target_edge, {
+        "mode": "coincident_first_offset",
         "turn_angle": 0.0,
         "offset": signed,
-        "anchor": anchor,
-        "side": "outgoing_fallback",
+        "anchor": target_edge,
+        "side": "first_nonzero_offset_point",
+        "source_segment": seg_index,
+        "source_point": point_index,
     }
 
 
@@ -140,8 +158,8 @@ def _patched_target_for_fat(ref, design, fat_feature, fat_layer, work_crs, edge_
         corner_threshold_deg,
     )
 
-    # Only intervene for the exact failure mode: the FAT is immediately after
-    # FDT and the incoming Segment is geometrically coincident.
+    # Only intervene for the exact special case: FAT is immediately after FDT
+    # and the incoming Segment is geometrically coincident/zero-length.
     fallback = _coincident_target(ref, design, work_crs, edge_crs, spacing)
     if fallback is None:
         return target, info
@@ -158,7 +176,9 @@ def _patched_target_for_fat(ref, design, fat_feature, fat_layer, work_crs, edge_
     _log(
         f"[fat-landing-coincident-fallback] design={ref.get('design_index')}; "
         f"seq_pos={ref.get('sequence_pos')}; offset={float(fallback_info['offset']):+.3f}m; "
-        "FDT/FAT initially coincident; target derived from outgoing Link offset"
+        f"source_segment={fallback_info.get('source_segment')}; "
+        f"source_point={fallback_info.get('source_point')}; "
+        "FDT/FAT initially coincident; FAT moved to first nonzero offset point"
     )
     return fallback_target, fallback_info
 
