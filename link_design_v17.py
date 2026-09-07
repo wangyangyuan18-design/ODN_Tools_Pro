@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Link Design v17: keep planned routes authoritative and isolate output offset.
+"""Link Design v17: authoritative routes plus coordinated cable/FAT offset output.
 
 Design rules:
 - Completed Link Design routes are rebuilt from the same Pole Edge route engine
-  used by the known-good Link Design #39 baseline.
+  used by the known-good Link Design baseline.
 - Offset calculations operate on a deep copy only.
-- The saved controller designs always retain the un-offset Pole Edge route.
+- The saved controller designs retain the un-offset Pole Edge route.
 - Distribution Cable receives the optional offset geometry.
-- Linked Distribution Cable geometry is never imported back into the planned
-  Link geometry during the startup consistency check.
-- Offset corner geometry is controlled by a fixed corner control distance,
-  not by selectable 45/60/75/90 degree parameters.
+- FAT output points are recalculated from the owning Link after offset: a
+  straight-through FAT lands on the Link's parallel offset; a large-corner
+  FAT lands on the generated corner/control-distance bend. Cable endpoints are
+  made coincident with the moved FAT.
 """
 
 import copy
@@ -22,7 +22,7 @@ from . import link_design_v16 as _v16
 from . import link_design_v9 as _v9
 from . import link_design_v12 as _v12
 from . import odn_project_context as context
-from . import cable_offset_layout_v5 as _offset
+from . import cable_offset_layout_v6 as _offset
 from .change_detection_adapter import save_snapshot
 
 
@@ -199,15 +199,16 @@ class LinkDesignDock(_v16.LinkDesignDock):
         control_distance.setValue(control_distance_value)
         control_distance.setSuffix(" m")
         control_distance.setToolTip(
-            "拐角控制距离：Pole Edge 顶点到控制线 A 的垂直距离。\n"
-            "偏移拐点只能落在该控制线上；实际角度由偏移量与该距离自然计算。"
+            "拐角控制距离：Pole Edge 顶点到控制线 A 的距离。\n"
+            "偏移拐点只能落在该控制线附近；实际角度由偏移量与该距离自然计算。"
         )
         form.addRow("拐角控制距离", control_distance)
 
         hint = QtWidgets.QLabel(
             "角度不再作为参数。\n"
             "控制距离 0.30 m 时：偏移 0.50 m ≈ 59.0°，"
-            "偏移 1.00 m ≈ 73.3°，偏移 1.50 m ≈ 78.7°。"
+            "偏移 1.00 m ≈ 73.3°，偏移 1.50 m ≈ 78.7°。\n"
+            "FAT 落点：直行跟随 Link 偏移线；大拐角落在实际偏移拐点。"
         )
         hint.setWordWrap(True)
         form.addRow("规则", hint)
@@ -228,15 +229,21 @@ class LinkDesignDock(_v16.LinkDesignDock):
         payload = controller._v9_payload()
         dc_layer = context.project_layer(payload, "Distribution Cable")
         edge_layer = context.project_layer(payload, "Pole Edge")
-        if dc_layer is None or edge_layer is None:
+        fat_layer = context.project_layer(payload, "FAT")
+        if dc_layer is None or edge_layer is None or fat_layer is None:
             QtWidgets.QMessageBox.warning(
                 self, "偏移并写入图层",
-                "当前项目缺少 Distribution Cable 或 Pole Edge 图层。",
+                "当前项目缺少 Distribution Cable、Pole Edge 或 FAT 图层。",
             )
             return
         if not dc_layer.isEditable() and not dc_layer.startEditing():
             QtWidgets.QMessageBox.warning(
                 self, "偏移并写入图层", "无法进入 Distribution Cable 编辑状态。"
+            )
+            return
+        if not fat_layer.isEditable() and not fat_layer.startEditing():
+            QtWidgets.QMessageBox.warning(
+                self, "偏移并写入图层", "无法进入 FAT 编辑状态，因此没有执行本次偏移写入。"
             )
             return
 
@@ -252,18 +259,29 @@ class LinkDesignDock(_v16.LinkDesignDock):
         planned_designs = copy.deepcopy(controller._designs)
         try:
             _v12._prepare_design_identities(planned_designs)
+            fat_limit = 3.0
+            try:
+                fat_limit = float((payload.get("parameters") or {}).get("fat_pole_max_distance", 3.0))
+            except (TypeError, ValueError):
+                fat_limit = 3.0
             summary = _offset.apply_explicit_layout_to_designs(
                 planned_designs,
                 dc_layer,
                 edge_layer,
                 spacing=spacing_value,
                 control_distance_m=control_distance_value,
+                fat_layer=fat_layer,
+                fat_max_distance_m=fat_limit,
             )
 
+            # FAT geometry is not committed until all copied Cable geometries
+            # have successfully passed validation and been written.
             for index, design in enumerate(planned_designs):
                 if not (design.get("segments") or []):
                     continue
                 _v12._write_design_to_dc(controller, dc_layer, index, design)
+
+            fat_written = _offset.commit_fat_landing_points(fat_layer, summary)
 
             for design in controller._designs:
                 design["written"] = True
@@ -271,6 +289,7 @@ class LinkDesignDock(_v16.LinkDesignDock):
                 design.pop("_resync_source", None)
 
             dc_layer.triggerRepaint()
+            fat_layer.triggerRepaint()
             controller._persist_state()
             save_snapshot(controller)
             self.refresh_from_core()
@@ -278,16 +297,30 @@ class LinkDesignDock(_v16.LinkDesignDock):
                 f"已偏移并写入全部 Link：{len(controller._designs)} 条；"
                 f"拐角控制距离 {control_distance_value:.2f} m，"
                 f"偏移间距 {spacing_value:.2f} m；"
-                f"实际发生偏移 {summary.get('changed_designs', 0)} 条 Link。"
+                f"Cable 实际偏移 {summary.get('changed_designs', 0)} 条 Link；"
+                f"FAT 落点更新 {fat_written} 个。"
             )
-            if not summary.get("changed_designs"):
+            if not summary.get("changed_designs") and not fat_written:
                 QtWidgets.QMessageBox.information(
                     self,
                     "偏移并写入图层",
                     "已完成写入，但本次没有产生需要偏移的重叠 Pole Edge 段。\n\n"
-                    "非重叠线路保持原规划位置。",
+                    "非重叠线路保持原规划位置，FAT 也保持原落点。",
+                )
+            elif summary.get("fat_skipped"):
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "偏移并写入图层",
+                    f"Cable 偏移和 FAT 落点更新已完成。\n\n"
+                    f"FAT 总数：{summary.get('fat_total', 0)}\n"
+                    f"已更新：{fat_written}\n"
+                    f"直行：{summary.get('fat_straight', 0)}\n"
+                    f"大拐角：{summary.get('fat_corner', 0)}\n"
+                    f"跳过：{summary.get('fat_skipped', 0)}\n\n"
+                    "被跳过的 FAT 不会被强制移动，并已在日志中记录原因。",
                 )
         except Exception as exc:
+            _log(f"[offset-write-fail] {type(exc).__name__}: {exc}", Qgis.Critical)
             QtWidgets.QMessageBox.warning(
                 self,
                 "偏移并写入图层",
