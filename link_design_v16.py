@@ -4,6 +4,7 @@
 import copy
 
 from qgis.PyQt import QtWidgets
+from qgis.core import QgsMessageLog, Qgis
 
 from . import link_design_v15 as _v15
 from . import link_design_v9 as _v9
@@ -19,6 +20,13 @@ if not hasattr(_v9, "context"):
     _v9.context = context
 
 _ORIGINAL_START_DESIGN = _v9._CoreController.start_design
+
+
+def _v16_log(message):
+    try:
+        QgsMessageLog.logMessage(str(message), "ODN_Tools_Pro / Cable Offset", Qgis.Info)
+    except Exception:
+        pass
 
 
 def _v16_start_design(self):
@@ -64,6 +72,99 @@ class LinkDesignDock(_v15.LinkDesignDock):
         # invoke it a second time here, otherwise a valid mismatch can produce
         # two dialogs during one plugin opening.
         super().showEvent(event)
+
+    def _ensure_offset_edge_sequences(self, controller, edge_layer):
+        """Backfill missing edge_sequence for legacy saved designs.
+
+        Older designs stored only points + edge_count even though the route
+        engine already knew the Pole Edge sequence. Explicit offsetting needs
+        those edge references to identify overlapping physical Pole Edge
+        segments. Rebuild them from the saved FDT/FAT sequence without changing
+        the user's FAT order.
+        """
+        migrated_designs = 0
+        migrated_segments = 0
+        failed_segments = 0
+        engine = controller._engine or controller._prepare_engine()
+        if engine is None:
+            raise RuntimeError("无法建立当前 Pole Edge 路由引擎，不能恢复 Link 的 Edge 序列。")
+        controller._engine = engine
+
+        for design_index, design in enumerate(controller._designs or []):
+            seq_ids = design.get("sequence_ids", []) or []
+            segments = design.get("segments", []) or []
+            if len(seq_ids) < 2 or len(segments) != len(seq_ids) - 1:
+                _v16_log(
+                    f"[migration] design {design_index} 跳过：sequence_ids={len(seq_ids)}, segments={len(segments)}"
+                )
+                continue
+
+            changed = False
+            new_segments = []
+            for segment_index, (segment, first, second) in enumerate(
+                zip(segments, seq_ids[:-1], seq_ids[1:])
+            ):
+                edge_sequence = segment.get("edge_sequence", []) or []
+                edge_count = int(segment.get("edge_count", 0) or 0)
+                if edge_sequence and (edge_count <= 0 or len(edge_sequence) == edge_count):
+                    new_segments.append(segment)
+                    continue
+
+                try:
+                    route = engine.route(
+                        str(first[0]), int(first[1]),
+                        str(second[0]), int(second[1]),
+                    )
+                except Exception as exc:
+                    failed_segments += 1
+                    _v16_log(
+                        f"[migration] design {design_index} segment {segment_index} "
+                        f"{first} -> {second}: route异常: {exc}"
+                    )
+                    new_segments.append(segment)
+                    continue
+
+                if not route or not route.get("edge_sequence"):
+                    failed_segments += 1
+                    _v16_log(
+                        f"[migration] design {design_index} segment {segment_index} "
+                        f"{first} -> {second}: 无法恢复 edge_sequence"
+                    )
+                    new_segments.append(segment)
+                    continue
+
+                rebuilt = dict(segment)
+                rebuilt["edge_sequence"] = list(route["edge_sequence"])
+                rebuilt["edge_count"] = len(route["edge_sequence"])
+                rebuilt["points"] = [
+                    [float(p.x()), float(p.y())] for p in route["points"]
+                ]
+                rebuilt["distance"] = round(float(route["distance"]), 3)
+                rebuilt["pole_edge_distance"] = round(
+                    float(route.get("pole_edge_distance", route["distance"])), 3
+                )
+                rebuilt["from"] = route.get("from_label", rebuilt.get("from", first[1]))
+                rebuilt["to"] = route.get("to_label", rebuilt.get("to", second[1]))
+                new_segments.append(rebuilt)
+                changed = True
+                migrated_segments += 1
+                _v16_log(
+                    f"[migration] design {design_index} segment {segment_index} "
+                    f"{first[1]} -> {second[1]}: 恢复 edge_sequence={len(route['edge_sequence'])}"
+                )
+
+            if changed:
+                design["segments"] = new_segments
+                design["length"] = round(
+                    sum(float(s.get("distance", 0.0) or 0.0) for s in new_segments), 3
+                )
+                migrated_designs += 1
+
+        _v16_log(
+            f"[migration] 完成：迁移Link={migrated_designs}; "
+            f"迁移Segment={migrated_segments}; 失败Segment={failed_segments}"
+        )
+        return migrated_designs, migrated_segments, failed_segments
 
     def _offset_and_write(self):
         controller = self._controller
@@ -144,6 +245,17 @@ class LinkDesignDock(_v15.LinkDesignDock):
         backup = copy.deepcopy(controller._designs)
         try:
             _v12._prepare_design_identities(controller._designs)
+            migrated_designs, migrated_segments, failed_segments = self._ensure_offset_edge_sequences(
+                controller,
+                edge_layer,
+            )
+            _v16_log(
+                f"[input] designs={len(controller._designs)}; DC={dc_layer.featureCount()}; "
+                f"Pole Edge={edge_layer.featureCount()}; spacing={spacing_value:.3f}; "
+                f"angles={sorted(chosen)}; migrated_designs={migrated_designs}; "
+                f"migrated_segments={migrated_segments}; failed_segments={failed_segments}"
+            )
+
             summary = _offset.apply_explicit_layout_to_designs(
                 controller._designs,
                 dc_layer,
