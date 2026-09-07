@@ -3,7 +3,7 @@
 
 This wrapper adds concise diagnostic logging around the existing geometry engine.
 """
-from qgis.core import QgsVectorLayer, QgsMessageLog, Qgis
+from qgis.core import QgsFeature, QgsVectorLayer, QgsMessageLog, Qgis
 from . import cable_offset_layout_v2 as _v2
 
 ALLOWED = (45.0, 60.0, 75.0, 90.0)
@@ -38,7 +38,7 @@ def _manual_only_layer(distribution_layer, designs):
         if idx >= 0 and feature.attribute(idx) and str(feature.attribute(idx)) in known:
             excluded_count += 1
             continue
-        clone = type(feature)()
+        clone = QgsFeature()
         clone.setGeometry(feature.geometry())
         fs.append(clone)
     if fs:
@@ -110,17 +110,26 @@ def _make_logged_build_points(original_build):
             int(slots_by_edge.get(i, 0))
             for i in range(len(segment.get("edge_sequence", []) or []))
         ]
-        result = original_build(
-            segment,
-            slots_by_edge,
-            spacing,
-            work_crs,
-            source_crs,
-            edge_crs,
-        )
+        try:
+            result = original_build(
+                segment,
+                slots_by_edge,
+                spacing,
+                work_crs,
+                source_crs,
+                edge_crs,
+            )
+        except Exception as exc:
+            _log(
+                f"[geometry-error] from={segment.get('from', '?')}; "
+                f"to={segment.get('to', '?')}; edge_count={len(slots)}; "
+                f"type={type(exc).__name__}: {exc}"
+            )
+            raise
         if any(slot != 0 for slot in slots):
             _log(
-                f"[geometry] offset_slots={slots}; output_points={len(result)}"
+                f"[geometry] from={segment.get('from', '?')}; to={segment.get('to', '?')}; "
+                f"offset_slots={slots}; output_points={len(result)}"
             )
         return result
     return build
