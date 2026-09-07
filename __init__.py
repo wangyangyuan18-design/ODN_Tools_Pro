@@ -5,7 +5,6 @@ import os
 
 
 def classFactory(iface):
-    """Load the project-driven ODN Tools Pro plugin."""
     from qgis.PyQt.QtGui import QIcon
     from qgis.PyQt.QtCore import Qt
     from qgis.PyQt.QtWidgets import QAction, QMenu
@@ -16,7 +15,7 @@ def classFactory(iface):
     from .odn_project_validation import install_validation_page
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
-    from .link_design_v13 import LinkDesignDock
+    from .link_design_v16 import LinkDesignDock
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
