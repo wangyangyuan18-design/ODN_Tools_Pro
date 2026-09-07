@@ -10,6 +10,13 @@ only a consequence of the two distances:
     angle = atan(offset_change / control_distance_m)
 
 Therefore 45/60/75/90 degrees are not input parameters anymore.
+
+Important geometry rule:
+- Same-lane corners are built by ``cable_offset_layout_v8`` as one continuous
+  offset polyline using a miter/bevel join.
+- The 0.30 m control distance is used only for genuine lane changes.
+- A same-lane corner never returns to the original Pole Edge node just to
+  leave that node again.
 """
 
 from math import atan, degrees
@@ -19,6 +26,7 @@ from qgis.core import QgsMessageLog, Qgis
 
 from . import cable_offset_layout_v3 as _v3
 from . import cable_offset_layout_v7 as _v7
+from . import cable_offset_layout_v8 as _v8
 
 DEFAULT_SPACING_M = 0.5
 DEFAULT_CONTROL_DISTANCE_M = 0.30
@@ -72,20 +80,13 @@ def _natural_transition_factory(control_distance_m, spacing):
 
 
 def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m):
-    """Run the existing validated layout engine with the new transition rule."""
+    """Run the validated layout engine with global lanes and clean corners."""
     base = _v3._v2._base
-    original_factory = _v3._transition_factory
     original_base_assign = base._assign_slots
     original_base_build = base._build_segment_points
-    global_assigner = None
-    lane_debug = None
 
-    _v7_work_crs = _v3._choose_metric_work_crs(edge_layer, distribution_layer)
     counters = {"edges": 0, "overlap_edges": 0, "slots": {}}
     try:
-        # Build one global lane map for the complete set of Links before the
-        # legacy edge-by-edge writer starts.  The writer still handles CRS,
-        # validation and persistence exactly as before.
         global_assigner, lane_debug = _v7.make_global_slot_assigner(
             designs,
             distribution_layer,
@@ -110,15 +111,17 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
         )
 
         base._assign_slots = global_assigner
-        base._build_segment_points = _v7.make_build_wrapper(original_base_build)
+        # v8 is the only active geometry builder. Same-lane corners are
+        # continuous miter/bevel joins; no forced return to the Pole Edge node.
+        base._build_segment_points = _v8.make_build_wrapper(original_base_build)
 
+        # The transition angle is still derived from the control distance, but
+        # this is used only when a Link changes lane, never at same-lane corners.
         original_factory_local = _v3._transition_factory
         _v3._transition_factory = lambda _ignored_angles: _natural_transition_factory(
             control_distance_m, spacing
         )
         try:
-            # Use the global lane map while retaining the existing v3/v2
-            # engine's validation and write pipeline.
             summary = _v3.apply_explicit_layout_to_designs(
                 designs,
                 distribution_layer,
@@ -129,9 +132,6 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
         finally:
             _v3._transition_factory = original_factory_local
 
-        # v3 wraps the active base assign/build functions, so its counters are
-        # already incorporated by the legacy wrapper. Keep a dedicated summary
-        # of the global allocation for diagnostics.
         if lane_debug:
             summary["global_lane_priority"] = list(ordered)
             summary["global_lane_slot_map"] = dict(lane_debug.get("slot_map", {}))
@@ -164,7 +164,8 @@ def apply_explicit_layout_to_designs(
     _log("========== Offset START ==========")
     _log(
         f"[rule] spacing={spacing:.3f}m; control_distance={control_distance_m:.3f}m; "
-        "angles=derived_only; lane_policy=global_priority"
+        "angles=derived_only; lane_policy=global_priority; "
+        "corner_builder=v8_continuous_no_backtrack"
     )
     for magnitude in range(1, 9):
         offset = magnitude * spacing
@@ -184,22 +185,24 @@ def apply_explicit_layout_to_designs(
 
     for design in designs or []:
         layout = dict(design.get("layout") or {})
-        layout["version"] = 10
+        layout["version"] = 11
         layout["spacing_m"] = round(spacing, 3)
         layout["corner_control_distance_m"] = round(control_distance_m, 3)
         layout["rule"] = "global_link_priority_continuous_lanes"
         layout["transition_angle"] = "derived_from_offset_and_control_distance"
-        layout["corner_geometry"] = "continuous_offset_join_no_backtrack"
+        layout["corner_geometry"] = "v8_miter_or_bevel_no_backtrack"
         layout.pop("angles_deg", None)
         design["layout"] = layout
 
     summary.pop("angles_deg", None)
     summary["corner_control_distance_m"] = control_distance_m
     summary["transition_rule"] = "derived_angle_atan(offset_change/control_distance)"
+    summary["corner_geometry"] = "v8_miter_or_bevel_no_backtrack"
     _log(
         f"[result] changed={summary.get('changed_designs', 0)}; "
         f"extra={summary.get('extra_length_m', 0):.3f}m; "
-        f"control_distance={control_distance_m:.3f}m; lane_policy=global_priority"
+        f"control_distance={control_distance_m:.3f}m; "
+        "corner_builder=v8_continuous_no_backtrack"
     )
     _log("========== Offset END ==========")
     return summary
