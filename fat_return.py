@@ -15,6 +15,7 @@ from qgis.PyQt import QtWidgets
 from qgis.core import (
     QgsCoordinateTransform,
     QgsDistanceArea,
+    QgsGeometry,
     QgsMessageLog,
     QgsPointXY,
     QgsProject,
@@ -216,7 +217,6 @@ def fat_return_to_poles(dock):
 
     moved = 0
     skipped = 0
-    details = []
     record_layer(fat_layer, "FAT归杆")
     try:
         fat_layer.beginEditCommand("FAT归杆")
@@ -225,15 +225,18 @@ def fat_return_to_poles(dock):
             if pole is None:
                 skipped += 1
                 if distance is not None:
-                    details.append(f"FAT {feature.id()}: 最近 POLE {distance:.2f} m，超过 {max_distance:.2f} m")
+                    _log(
+                        f"[skip] FAT={feature.id()}; nearest_pole_distance={distance:.3f}m; "
+                        f"limit={max_distance:.3f}m",
+                        Qgis.Warning,
+                    )
                 else:
-                    details.append(f"FAT {feature.id()}: 无法确定最近 POLE")
+                    _log(f"[skip] FAT={feature.id()}; reason=no_valid_pole", Qgis.Warning)
                 continue
 
-            old_geom = feature.geometry()
             target = QgsPointXY(pole["point"])
-            feature.setGeometry(__import__("qgis.core", fromlist=["QgsGeometry"]).QgsGeometry.fromPointXY(target))
-            if not fat_layer.changeGeometry(feature.id(), feature.geometry()):
+            new_geometry = QgsGeometry.fromPointXY(target)
+            if not fat_layer.changeGeometry(feature.id(), new_geometry):
                 raise RuntimeError(f"FAT {feature.id()} 几何写入失败")
             moved += 1
             _log(
@@ -258,8 +261,7 @@ def fat_return_to_poles(dock):
     dock.info.setText(
         f"FAT归杆完成：移动 {moved} 个，超出 {max_distance:.2f} m 或无法匹配 {skipped} 个。"
     )
-    if skipped:
-        _log(f"[summary] moved={moved}; skipped={skipped}; max_distance={max_distance:.3f}m", Qgis.Warning)
-    else:
-        _log(f"[summary] moved={moved}; skipped=0; max_distance={max_distance:.3f}m")
+    _log(
+        f"[summary] moved={moved}; skipped={skipped}; max_distance={max_distance:.3f}m"
+    )
     return True
