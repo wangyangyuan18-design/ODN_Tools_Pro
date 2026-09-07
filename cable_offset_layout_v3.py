@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Explicit cable offset layout with user-selected transition angles.
 
-This wrapper adds diagnostic logging around the existing geometry engine.
+This wrapper adds concise diagnostic logging around the existing geometry engine.
 """
-from qgis.core import QgsFeature, QgsVectorLayer, QgsMessageLog, Qgis
+from qgis.core import QgsVectorLayer, QgsMessageLog, Qgis
 from . import cable_offset_layout_v2 as _v2
 
 ALLOWED = (45.0, 60.0, 75.0, 90.0)
@@ -38,15 +38,15 @@ def _manual_only_layer(distribution_layer, designs):
         if idx >= 0 and feature.attribute(idx) and str(feature.attribute(idx)) in known:
             excluded_count += 1
             continue
-        clone = QgsFeature()
+        clone = type(feature)()
         clone.setGeometry(feature.geometry())
         fs.append(clone)
     if fs:
         layer.dataProvider().addFeatures(fs)
     layer.updateExtents()
     _log(
-        f"[occupancy] DC总要素={all_count}, 排除本次设计Link={excluded_count}, "
-        f"作为既有占用参与计算={len(fs)}, Link IDs={len(known)}"
+        f"[occupancy] total={all_count}; excluded_current={excluded_count}; "
+        f"existing_used={len(fs)}; current_links={len(known)}"
     )
     return layer
 
@@ -82,11 +82,11 @@ def _make_geometry_only_canonical_edge(original_canonical):
 def _make_logged_assign_slots(original_assign):
     def assign(edge_users, edge_reserved, previous_slots):
         result = original_assign(edge_users, edge_reserved, previous_slots)
-        if len(edge_users) > 1 or edge_reserved:
-            sample = edge_users[0].edge_key if edge_users else None
+        nonzero = [int(v) for v in result.values() if int(v) != 0]
+        if edge_reserved or nonzero:
             _log(
-                f"[slot] edge={sample}; users={len(edge_users)}; reserved={sorted(edge_reserved or set())}; "
-                f"assigned={result}; previous={dict(previous_slots)}"
+                f"[slot] users={len(edge_users)}; reserved={sorted(edge_reserved or set())}; "
+                f"nonzero={nonzero}"
             )
         return result
     return assign
@@ -97,21 +97,31 @@ def _make_logged_occupancy(original_occupancy):
         reserved = original_occupancy(edge_geom, spacing, index, geometries)
         if reserved:
             _log(
-                f"[existing-occupancy] edge_len={edge_geom.length():.3f}m; "
-                f"spacing={spacing:.3f}m; reserved_slots={sorted(reserved)}"
+                f"[occupancy-hit] edge_len={edge_geom.length():.2f}m; "
+                f"reserved={sorted(reserved)}"
             )
         return reserved
     return occupancy
 
 
 def _make_logged_build_points(original_build):
-    def build(segment, slots_by_edge, spacing, work_crs, source_crs):
-        slots = [int(slots_by_edge.get(i, 0)) for i in range(len(segment.get("edge_sequence", []) or []))]
-        result = original_build(segment, slots_by_edge, spacing, work_crs, source_crs)
+    def build(segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs):
+        slots = [
+            int(slots_by_edge.get(i, 0))
+            for i in range(len(segment.get("edge_sequence", []) or []))
+        ]
+        result = original_build(
+            segment,
+            slots_by_edge,
+            spacing,
+            work_crs,
+            source_crs,
+            edge_crs,
+        )
         if any(slot != 0 for slot in slots):
-            _log(f"[geometry] nonzero slots={slots}; output_points={len(result)}")
-        else:
-            _log(f"[geometry] all slots=0; preserve original points; edge_count={len(slots)}")
+            _log(
+                f"[geometry] offset_slots={slots}; output_points={len(result)}"
+            )
         return result
     return build
 
@@ -152,20 +162,27 @@ def apply_explicit_layout_to_designs(
     old_build = base._build_segment_points
 
     try:
-        _log("========== Offset run START ==========")
+        _log("========== Offset START ==========")
         _log(
-            f"[input] designs={len(designs or [])}; distribution_features={distribution_layer.featureCount()}; "
-            f"pole_edge_features={edge_layer.featureCount()}; spacing={spacing:.3f}m; "
-            f"angles={sorted(allowed)}; edge_crs={edge_layer.crs().authid()}; dc_crs={distribution_layer.crs().authid()}"
+            f"[input] designs={len(designs or [])}; DC={distribution_layer.featureCount()}; "
+            f"PoleEdge={edge_layer.featureCount()}; spacing={spacing:.3f}m; "
+            f"angles={sorted(allowed)}; edge_crs={edge_layer.crs().authid()}; "
+            f"dc_crs={distribution_layer.crs().authid()}"
         )
-        for i, design in enumerate(designs or []):
+
+        invalid_designs = 0
+        total_segments = 0
+        total_edges = 0
+        for design in designs or []:
             segs = design.get("segments", []) or []
-            total_edges = sum(len(s.get("edge_sequence", []) or []) for s in segs)
-            _log(
-                f"[design {i}] link_id={design.get('_link_id')}; fdt={design.get('fdt')}; "
-                f"link={design.get('link')}; written={design.get('written')}; needs_resync={design.get('needs_resync')}; "
-                f"segments={len(segs)}; edge_refs={total_edges}"
-            )
+            total_segments += len(segs)
+            total_edges += sum(len(s.get("edge_sequence", []) or []) for s in segs)
+            if not segs or any(not (s.get("edge_sequence", []) or []) for s in segs):
+                invalid_designs += 1
+        _log(
+            f"[routes] segments={total_segments}; edge_refs={total_edges}; "
+            f"designs_missing_edge_refs={invalid_designs}"
+        )
 
         for d in designs or []:
             d["written"] = False
@@ -195,8 +212,12 @@ def apply_explicit_layout_to_designs(
             base._existing_slot_occupancy = old_occupancy
             base._build_segment_points = old_build
 
-        _log(f"[summary] {summary}")
-        _log("========== Offset run END ==========")
+        _log(
+            f"[result] changed_designs={summary.get('changed_designs', 0)}; "
+            f"changed_indices={summary.get('changed_indices', [])}; "
+            f"extra_length_m={summary.get('extra_length_m', 0)}"
+        )
+        _log("========== Offset END ==========")
 
         for d in designs or []:
             d["layout"] = {
