@@ -18,10 +18,12 @@ def classFactory(iface):
     from .link_design_v17 import LinkDesignDock
     from .fat_return import install_fat_return_button
     from .plugin_undo import undo_last
+    from .offset_write_patch import install_offset_write_patch
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
     initialize_project_manager_context()
+    install_offset_write_patch()
 
     class ODNToolsPro:
         def __init__(self, iface):
