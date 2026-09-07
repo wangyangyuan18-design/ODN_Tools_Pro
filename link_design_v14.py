@@ -1,18 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Link Design v14: automatic multi-cable Pole Edge offset layout.
-
-This active layer also integrates project-source change detection. Change
-repair preserves the saved FAT order and only rebuilds affected Link segments.
-"""
+"""Link Design v14: Link/Distribution Cable synchronization and change detection."""
 
 from qgis.PyQt.QtCore import QSettings
 from qgis.PyQt import QtWidgets
 
 from . import link_design_v12 as _v12
 from . import link_design_v9 as _v9
-from .cable_offset_layout_v2 import apply_layout_to_designs
 from .change_detection_adapter import ChangeDetectionDialog, detect_changes, save_snapshot
-
 
 _ORIGINAL_WRITE = _v9._CoreController.write_planned_links
 _ORIGINAL_SAVE = _v9._CoreController.save_current_link
@@ -40,42 +34,11 @@ def _v14_save_current_link(self):
 
 
 def _v14_write_planned_links(self):
-    """Lay out pending cables first, then use v12's safe cable sync writer."""
-    try:
-        payload = _v9._fresh_payload(self)
-        distribution_layer = _v9.context.project_layer(payload, "Distribution Cable")
-        edge_layer = _v9.context.project_layer(payload, "Pole Edge")
-        if distribution_layer is None:
-            return _ORIGINAL_WRITE(self)
-        if edge_layer is None:
-            return _ORIGINAL_WRITE(self)
+    """Normal write: synchronize the saved Link topology into Distribution Cable.
 
-        pending = [
-            design for design in self._designs
-            if not design.get("written") or design.get("needs_resync")
-        ]
-        if pending:
-            summary = apply_layout_to_designs(
-                self._designs,
-                distribution_layer,
-                edge_layer,
-                spacing=_spacing_m(),
-            )
-            if summary.get("changed_designs"):
-                self.status.setText(
-                    "状态：已自动分配重叠线路偏移槽位；"
-                    f"处理 {summary['changed_designs']} 条 Link，"
-                    f"间距 {summary['spacing_m']:.2f} m。"
-                )
-            self._persist_state()
-    except Exception as exc:
-        QtWidgets.QMessageBox.warning(
-            self,
-            "线路偏移",
-            "自动线路偏移布局失败，已保留原始 Pole Edge 路径并继续写入。\n\n"
-            f"原因：{exc}",
-        )
-
+    Offset geometry is intentionally NOT applied here. The dedicated
+    "偏移并写入图层" action in v15 performs that operation explicitly.
+    """
     result = _ORIGINAL_WRITE(self)
     if result:
         try:
@@ -90,17 +53,14 @@ _v9._CoreController.write_planned_links = _v14_write_planned_links
 
 
 class LinkDesignDock(_v12.LinkDesignDock):
-    """v14 dock: v12 cable synchronization plus automatic overlap layout and change detection."""
+    """v14 dock: v12 synchronization plus change detection."""
 
     def __init__(self, iface, parent=None):
-        # Parent constructors call refresh_from_core(). The button attribute
-        # must exist before that happens, otherwise initialization crashes.
         self._change_button = None
         super().__init__(iface, parent)
         self._install_change_detection_button()
 
     def _install_change_detection_button(self):
-        """Add the compact change-detection action to the top of the dock."""
         container = None
         try:
             container = self.widget()
