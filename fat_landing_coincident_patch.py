@@ -39,7 +39,7 @@ def _same_point_segment(points, tolerance=1e-9):
 
 
 def _local_mainline(ref, design, work_crs, edge_crs, source_crs):
-    """Return the FDT anchor and the local Pole Edge direction."""
+    """Return the FDT anchor and local Pole Edge direction."""
     segments = design.get("segments", []) or []
     pos = int(ref.get("sequence_pos", -1))
     outgoing_index = pos if 0 <= pos < len(segments) else None
@@ -73,8 +73,8 @@ def _intersection_points(geometry):
             else:
                 result.append(QgsPointXY(geometry.asPoint()))
         elif geometry.type() == 1:
-            line = geometry.asMultiPolyline() if geometry.isMultipart() else [geometry.asPolyline()]
-            for part in line:
+            parts = geometry.asMultiPolyline() if geometry.isMultipart() else [geometry.asPolyline()]
+            for part in parts:
                 result.extend(QgsPointXY(p) for p in part)
         elif geometry.isMultipart():
             for part in geometry.asGeometryCollection():
@@ -87,9 +87,10 @@ def _intersection_points(geometry):
 def _outgoing_offset_intersection(ref, design, work_crs, edge_crs, source_crs, control_distance):
     """Find FAT on the already-generated outgoing offset Link.
 
-    The perpendicular is positioned 0.30 m along the local main-line
-    direction from the coincident FDT. FAT is the intersection with the
-    actual outgoing offset geometry, never a separately fabricated route.
+    A perpendicular is positioned exactly ``control_distance`` metres along
+    the local main-line direction from the coincident FDT. The FAT is the
+    intersection with the actual outgoing offset geometry, so no artificial
+    direction or artificial side branch is created.
     """
     segments = design.get("segments", []) or []
     pos = int(ref.get("sequence_pos", -1))
@@ -166,7 +167,6 @@ def _coincident_target(ref, design, fat_feature, fat_layer, work_crs, edge_crs, 
     incoming_points = list(incoming.get("points", []) or []) if incoming else []
     if not _same_point_segment(incoming_points):
         return None
-
     source_crs = _v6._crs_from_authid(design.get("source_crs")) or edge_crs
     return _outgoing_offset_intersection(
         ref, design, work_crs, edge_crs, source_crs, float(control_distance)
@@ -207,13 +207,12 @@ def _patched_target_for_fat(
     )
     if fallback is None:
         return target, info
-
     fallback_target, fallback_info = fallback
     _log(
         f"[fat-landing-coincident-fallback] design={ref.get('design_index')}; "
         f"seq_pos={ref.get('sequence_pos')}; "
-        "FDT/FAT initially coincident; FAT target taken from actual outgoing "
-        "offset Link geometry"
+        "FDT/FAT initially coincident; FAT target taken directly from actual "
+        "outgoing offset Link geometry"
     )
     return fallback_target, fallback_info
 
@@ -230,11 +229,7 @@ def _project_point_on_segment(point, a, b):
 
 
 def _trim_outgoing_to_coincident_target(designs, moves, edge_crs):
-    """Make the outgoing segment continue from FAT on its existing geometry.
-
-    For the special FDT=FAT case, discard only the prefix before the exact FAT
-    position. The retained suffix starts at the computed on-line FAT point.
-    """
+    """Trim the old FDT prefix so the next Link segment starts at FAT."""
     for move in moves.values():
         if not move.get("coincident_on_link"):
             continue
@@ -245,7 +240,6 @@ def _trim_outgoing_to_coincident_target(designs, moves, edge_crs):
         segments = designs[di].get("segments", []) or []
         if pos < 0 or pos >= len(segments):
             continue
-
         segment = segments[pos]
         raw = list(segment.get("points", []) or [])
         if len(raw) < 2:
@@ -253,28 +247,33 @@ def _trim_outgoing_to_coincident_target(designs, moves, edge_crs):
 
         source_crs = _v6._crs_from_authid(designs[di].get("source_crs")) or edge_crs
         raw_xy = _v6._geometry_points(raw)
-        work_points = _v6._transform_points(raw_xy, source_crs, source_crs)
-        target = QgsPointXY(move["target_work"])
+        # Work in the Pole Edge CRS here because move["target_edge"] is in
+        # that CRS. This also avoids assuming that the Link source CRS uses
+        # metres.
+        edge_points = _v6._transform_points(raw_xy, source_crs, edge_crs)
+        target_edge = QgsPointXY(move["target_edge"])
 
         best_index = 0
-        best_projection = work_points[0]
         best_distance = float("inf")
-        for i in range(len(work_points) - 1):
-            projected, _ = _project_point_on_segment(target, work_points[i], work_points[i + 1])
-            d = hypot(projected.x() - target.x(), projected.y() - target.y())
+        for i in range(len(edge_points) - 1):
+            projected, _ = _project_point_on_segment(target_edge, edge_points[i], edge_points[i + 1])
+            d = hypot(projected.x() - target_edge.x(), projected.y() - target_edge.y())
             if d < best_distance:
                 best_distance = d
                 best_index = i
-                best_projection = projected
 
-        target_src = _v6._transform_point(move["target_edge"], edge_crs, source_crs)
+        target_src = _v6._transform_point(target_edge, edge_crs, source_crs)
         suffix = [[float(target_src.x()), float(target_src.y())]]
-        for p in raw[best_index + 1:]:
-            suffix.append([float(p[0]), float(p[1])])
+        suffix.extend(
+            [float(p[0]), float(p[1])] for p in raw[best_index + 1:]
+        )
 
         cleaned = []
         for p in suffix:
-            if not cleaned or hypot(float(p[0]) - float(cleaned[-1][0]), float(p[1]) - float(cleaned[-1][1])) > 1e-9:
+            if not cleaned or hypot(
+                float(p[0]) - float(cleaned[-1][0]),
+                float(p[1]) - float(cleaned[-1][1]),
+            ) > 1e-9:
                 cleaned.append(p)
         if len(cleaned) < 2:
             continue
