@@ -21,7 +21,6 @@ from . import link_design_v9 as _v9
 from . import link_design_v11 as _v11
 
 _original_save_current_link = _v9._CoreController.save_current_link
-
 LINK_ID_FIELD = "_ODN_LINK_ID"
 SEGMENT_ID_FIELD = "_ODN_SEGMENT"
 LINK_FDT_FIELD = "_ODN_FDT"
@@ -63,6 +62,7 @@ def _sequence_identity(sequence):
 
 
 def _stable_link_id(design, index=None):
+    """Persistent Link identity; FDT/FAT display names are never identity keys."""
     existing = design.get("_link_id")
     if existing:
         return str(existing)
@@ -256,6 +256,7 @@ def _v12_save_current_link(self):
 
 
 def _sync_dc_changes_into_designs(self, layer):
+    """Pull manually edited linked DC geometry into saved Link segments."""
     records = _dc_records(layer)
     changed_links = []
     for index, design in enumerate(self._designs or []):
@@ -288,6 +289,7 @@ def _sync_dc_changes_into_designs(self, layer):
 
 
 def _write_design_to_dc(self, layer, design_index, design):
+    """Write one Link using stable identity; changed DC geometry is replaced."""
     link_id = _stable_link_id(design, design_index)
     existing = _dc_records(layer)
     wanted = {}
