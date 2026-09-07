@@ -18,6 +18,7 @@ from qgis.PyQt.QtCore import QSettings
 from qgis.core import QgsMessageLog, Qgis
 
 from . import cable_offset_layout_v3 as _v3
+from . import cable_offset_layout_v7 as _v7
 
 DEFAULT_SPACING_M = 0.5
 DEFAULT_CONTROL_DISTANCE_M = 0.30
@@ -72,21 +73,76 @@ def _natural_transition_factory(control_distance_m, spacing):
 
 def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m):
     """Run the existing validated layout engine with the new transition rule."""
+    base = _v3._v2._base
     original_factory = _v3._transition_factory
-    _v3._transition_factory = lambda _ignored_angles: _natural_transition_factory(
-        control_distance_m, spacing
-    )
+    original_base_assign = base._assign_slots
+    original_base_build = base._build_segment_points
+    global_assigner = None
+    lane_debug = None
+
+    _v7_work_crs = _v3._choose_metric_work_crs(edge_layer, distribution_layer)
+    counters = {"edges": 0, "overlap_edges": 0, "slots": {}}
     try:
-        summary = _v3.apply_explicit_layout_to_designs(
+        # Build one global lane map for the complete set of Links before the
+        # legacy edge-by-edge writer starts.  The writer still handles CRS,
+        # validation and persistence exactly as before.
+        global_assigner, lane_debug = _v7.make_global_slot_assigner(
             designs,
             distribution_layer,
             edge_layer,
-            spacing=spacing,
-            angles=(90.0,),
+            spacing,
+            counters,
         )
+
+        ordered = lane_debug.get("ordered_designs", []) if lane_debug else []
+        if ordered:
+            route_text = []
+            routes = lane_debug.get("routes", {}) or {}
+            for rank, di in enumerate(ordered[:12], start=1):
+                route = routes.get(di, {})
+                route_text.append(
+                    f"#{rank}=design{di}:{float(route.get('route_length', 0.0)):.1f}m"
+                )
+            _log("[global-lane-priority] " + ", ".join(route_text))
+        _log(
+            f"[global-lane] links={len(ordered)}; "
+            f"mapped_edges={len((lane_debug or {}).get('slot_map', {}))}"
+        )
+
+        base._assign_slots = global_assigner
+        base._build_segment_points = _v7.make_build_wrapper(original_base_build)
+
+        original_factory_local = _v3._transition_factory
+        _v3._transition_factory = lambda _ignored_angles: _natural_transition_factory(
+            control_distance_m, spacing
+        )
+        try:
+            # Use the global lane map while retaining the existing v3/v2
+            # engine's validation and write pipeline.
+            summary = _v3.apply_explicit_layout_to_designs(
+                designs,
+                distribution_layer,
+                edge_layer,
+                spacing=spacing,
+                angles=(90.0,),
+            )
+        finally:
+            _v3._transition_factory = original_factory_local
+
+        # v3 wraps the active base assign/build functions, so its counters are
+        # already incorporated by the legacy wrapper. Keep a dedicated summary
+        # of the global allocation for diagnostics.
+        if lane_debug:
+            summary["global_lane_priority"] = list(ordered)
+            summary["global_lane_slot_map"] = dict(lane_debug.get("slot_map", {}))
+            summary["global_lane_route_lengths"] = {
+                str(di): round(float(data.get("route_length", 0.0)), 3)
+                for di, data in (lane_debug.get("routes", {}) or {}).items()
+            }
+        return summary
     finally:
-        _v3._transition_factory = original_factory
-    return summary
+        base._assign_slots = original_base_assign
+        base._build_segment_points = original_base_build
 
 
 def apply_explicit_layout_to_designs(
@@ -108,7 +164,7 @@ def apply_explicit_layout_to_designs(
     _log("========== Offset START ==========")
     _log(
         f"[rule] spacing={spacing:.3f}m; control_distance={control_distance_m:.3f}m; "
-        "angles=derived_only"
+        "angles=derived_only; lane_policy=global_priority"
     )
     for magnitude in range(1, 9):
         offset = magnitude * spacing
@@ -128,11 +184,12 @@ def apply_explicit_layout_to_designs(
 
     for design in designs or []:
         layout = dict(design.get("layout") or {})
-        layout["version"] = 9
+        layout["version"] = 10
         layout["spacing_m"] = round(spacing, 3)
         layout["corner_control_distance_m"] = round(control_distance_m, 3)
-        layout["rule"] = "fixed_corner_control_distance"
+        layout["rule"] = "global_link_priority_continuous_lanes"
         layout["transition_angle"] = "derived_from_offset_and_control_distance"
+        layout["corner_geometry"] = "continuous_offset_join_no_backtrack"
         layout.pop("angles_deg", None)
         design["layout"] = layout
 
@@ -142,7 +199,7 @@ def apply_explicit_layout_to_designs(
     _log(
         f"[result] changed={summary.get('changed_designs', 0)}; "
         f"extra={summary.get('extra_length_m', 0):.3f}m; "
-        f"control_distance={control_distance_m:.3f}m"
+        f"control_distance={control_distance_m:.3f}m; lane_policy=global_priority"
     )
     _log("========== Offset END ==========")
     return summary
