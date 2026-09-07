@@ -63,7 +63,6 @@ def _sequence_identity(sequence):
 
 
 def _stable_link_id(design, index=None):
-    """Persistent ID; FDT/FAT display names are never identity keys."""
     existing = design.get("_link_id")
     if existing:
         return str(existing)
@@ -290,12 +289,11 @@ def _sync_dc_changes_into_designs(self, layer):
 
 
 def _write_design_to_dc(self, layer, design_index, design):
-    """Write one Link using stable identity; replace changed DC geometry."""
+    """Write one Link using stable identity; changed DC geometry is replaced."""
     link_id = _stable_link_id(design, design_index)
     existing = _dc_records(layer)
-    segments = design.get("segments", []) or []
     wanted = {}
-    for seg_index, segment in enumerate(segments):
+    for seg_index, segment in enumerate(design.get("segments", []) or []):
         geom = _segment_geometry_in_target(design, segment, layer.crs())
         if geom is None or geom.isEmpty():
             raise RuntimeError(f"{design.get('fdt','')}/{design.get('link','')} Segment {seg_index + 1} 几何无效。")
@@ -304,11 +302,12 @@ def _write_design_to_dc(self, layer, design_index, design):
     for key, items in list(existing.items()):
         if key[0] != link_id:
             continue
-        if key not in wanted:
+        target = wanted.get(key)
+        if target is None:
             for fid, _feature in items:
                 layer.deleteFeature(fid)
             continue
-        target_geom = wanted[key][1]
+        target_geom = target[1]
         kept = False
         for fid, feature in items:
             if not kept and _same_geometry(feature.geometry(), target_geom):
@@ -340,7 +339,7 @@ def _write_design_to_dc(self, layer, design_index, design):
 
 
 def _v12_write_planned_links(self):
-    """Explicit write: saved Link design is authoritative for DC geometry."""
+    """Explicit write: saved Link design is authoritative for current DC geometry."""
     layer = _v9.context.project_layer(_v9._fresh_payload(self), "Distribution Cable")
     if layer is None:
         QtWidgets.QMessageBox.warning(self, "写入图层", "当前项目没有绑定 Distribution Cable 图层。")
@@ -370,12 +369,16 @@ def _v12_write_planned_links(self):
         QtWidgets.QMessageBox.warning(self, "写入图层", f"同步 Distribution Cable 失败：\n{exc}")
         return False
     self._refresh_ui()
-    QtWidgets.QMessageBox.information(self, "写入图层", f"已同步 {links} 条 Link，共 {segments} 个线路段。\n\n已存在的 Link/Segment 按稳定内部 ID 更新；FDT/FAT 名称变化不会改变归属。")
+    QtWidgets.QMessageBox.information(
+        self,
+        "写入图层",
+        f"已同步 {links} 条 Link，共 {segments} 个线路段。\n\n已存在的 Link/Segment 按稳定内部 ID 更新；FDT/FAT 名称变化不会改变归属。",
+    )
     return True
 
 
 def _show_startup_sync_dialog(self, layer):
-    """Enforce saved-design >= DC and pull linked DC edits before design."""
+    """Enforce saved-design >= DC and pull linked DC geometry before design."""
     designs = getattr(self, "_designs", []) or []
     _prepare_design_identities(designs)
     if not _ensure_sync_fields(layer):
@@ -397,7 +400,7 @@ def _show_startup_sync_dialog(self, layer):
         + "、".join(details[:30])
         + ("……" if len(details) > 30 else "")
         + "\n\n"
-        "是：同步到已完成设计\n"
+        "是：保留并同步到已完成设计\n"
         "否：从 Distribution Cable 删除\n"
         "取消：暂不进入链路设计"
     )
@@ -411,13 +414,10 @@ def _show_startup_sync_dialog(self, layer):
     if answer == QtWidgets.QMessageBox.Cancel:
         return False
     if answer == QtWidgets.QMessageBox.Yes:
-        # Existing DC without a stable Link ID cannot be safely assigned to a
-        # saved Link. Do not guess from FDT/FAT display names.
         QtWidgets.QMessageBox.warning(
             self,
             "无法自动归属",
-            "这些 DC 线路没有稳定的 Link ID，无法安全判断它们属于哪个已完成 Link。\n\n"
-            "请先对已有设计执行一次“确定并写入图层”建立关联。",
+            "这些 DC 线路没有稳定的 Link ID，无法安全判断它们属于哪个已完成 Link。\n\n请先对已有设计执行一次“确定并写入图层”建立关联。",
         )
         return False
     if not layer.isEditable() and not layer.startEditing():
@@ -441,7 +441,9 @@ class LinkDesignDock(_v11.LinkDesignDock):
 
     def _check_dc_consistency_before_design(self):
         try:
-            layer = _v9.context.project_layer(_v9._fresh_payload(self._controller), "Distribution Cable")
+            layer = _v9.context.project_layer(
+                _v9._fresh_payload(self._controller), "Distribution Cable"
+            )
         except Exception:
             layer = None
         if layer is None:
