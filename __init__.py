@@ -6,8 +6,8 @@ import os
 
 def classFactory(iface):
     from qgis.PyQt.QtGui import QIcon
-    from qgis.PyQt.QtCore import Qt
     from qgis.PyQt.QtWidgets import QAction, QMenu
+    from qgis.PyQt.QtCore import Qt
     from .pole_trace_connect import PoleTraceDialog
     from .overlength_pole import OverlengthPoleDialog
     from .odn_project_manager import OdnProjectManager, initialize_project_manager_context
@@ -16,6 +16,8 @@ def classFactory(iface):
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
     from .link_design_v17 import LinkDesignDock
+    from .fat_return import install_fat_return_button
+    from .plugin_undo import undo_last
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
@@ -41,6 +43,7 @@ def classFactory(iface):
             self._add("杆路轨迹自动连线", self.pole_trace_connect, "icons/pole_trace.svg")
             self._add("超距增点", self.overlength_pole, "icons/overlength_pole.svg")
             self._add("链路设计", self.link_design, "icons/link_design.svg")
+            self._add_undo()
 
         def _add(self, text, callback, icon_relpath):
             action = QAction(QIcon(os.path.join(self.plugin_dir, icon_relpath)), text, self.iface.mainWindow())
@@ -48,6 +51,23 @@ def classFactory(iface):
             self.menu.addAction(action)
             self.toolbar.addAction(action)
             self.actions.append(action)
+
+        def _add_undo(self):
+            action = QAction("回退", self.iface.mainWindow())
+            action.setToolTip("回退 ODN Tools Pro 最近一次已记录的操作")
+            action.setShortcut("Ctrl+Shift+Z")
+            action.triggered.connect(lambda: self._undo_last())
+            self.menu.addAction(action)
+            self.toolbar.addAction(action)
+            self.actions.append(action)
+            self._undo_action = action
+
+        def _undo_last(self):
+            if not undo_last(self.iface.mainWindow()):
+                try:
+                    self.iface.messageBar().pushWarning("ODN Tools Pro", "没有可回退的插件操作。")
+                except Exception:
+                    pass
 
         def project_manager(self):
             OdnProjectManager(self.iface, self.iface.mainWindow()).exec_()
@@ -64,6 +84,7 @@ def classFactory(iface):
         def link_design(self):
             if self._link_design_dock is None:
                 self._link_design_dock = LinkDesignDock(self.iface, self.iface.mainWindow())
+                install_fat_return_button(self._link_design_dock)
                 self.iface.addDockWidget(Qt.LeftDockWidgetArea, self._link_design_dock)
             self._link_design_dock.show()
             self._link_design_dock.raise_()
