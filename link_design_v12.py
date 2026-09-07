@@ -154,6 +154,13 @@ def _sync_dc_changes_into_designs(self, layer):
 def _write_design_to_dc(self, layer, design_index, design):
     link_id = _stable_link_id(design, design_index); existing = _dc_records(layer); wanted = {}
     for seg_index, segment in enumerate(design.get("segments", []) or []):
+        raw_points = segment.get("points", []) or []
+        if len(raw_points) < 2:
+            # Co-located FDT/FAT is a valid zero-length logical Segment.
+            # Do not fabricate a tiny cable. No Distribution Cable feature is
+            # written for this Segment; stale data with this key is removed by
+            # the normal reconciliation pass below.
+            continue
         geom = _segment_geometry_in_target(design, segment, layer.crs())
         if geom is None or geom.isEmpty(): raise RuntimeError(f"{design.get('fdt','')}/{design.get('link','')} Segment {seg_index + 1} 几何无效。")
         wanted[(link_id, seg_index + 1)] = (seg_index, geom)
