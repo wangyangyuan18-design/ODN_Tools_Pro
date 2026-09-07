@@ -63,7 +63,7 @@ def _sequence_identity(sequence):
 
 
 def _stable_link_id(design, index=None):
-    """Persistent ID. FDT/FAT display names are never identity keys."""
+    """Persistent ID; FDT/FAT display names are never identity keys."""
     existing = design.get("_link_id")
     if existing:
         return str(existing)
@@ -340,7 +340,7 @@ def _write_design_to_dc(self, layer, design_index, design):
 
 
 def _v12_write_planned_links(self):
-    """Explicit write: saved Link design is authoritative for DC."""
+    """Explicit write: saved Link design is authoritative for DC geometry."""
     layer = _v9.context.project_layer(_v9._fresh_payload(self), "Distribution Cable")
     if layer is None:
         QtWidgets.QMessageBox.warning(self, "写入图层", "当前项目没有绑定 Distribution Cable 图层。")
@@ -375,17 +375,14 @@ def _v12_write_planned_links(self):
 
 
 def _show_startup_sync_dialog(self, layer):
-    """Enforce saved-design >= DC. Pull linked DC edits first."""
+    """Enforce saved-design >= DC and pull linked DC edits before design."""
     designs = getattr(self, "_designs", []) or []
     _prepare_design_identities(designs)
     if not _ensure_sync_fields(layer):
         QtWidgets.QMessageBox.warning(self, "Link 数据检查", "Distribution Cable 无法建立内部 Link 标识字段，无法安全判断线路归属。")
         return False
 
-    changed = _sync_dc_changes_into_designs(self, layer)
-    if changed:
-        self._refresh_ui()
-
+    _sync_dc_changes_into_designs(self, layer)
     records = _dc_records(layer)
     known = {_stable_link_id(d, i) for i, d in enumerate(designs)}
     orphan = [key for key in records if key[0] not in known]
@@ -400,7 +397,7 @@ def _show_startup_sync_dialog(self, layer):
         + "、".join(details[:30])
         + ("……" if len(details) > 30 else "")
         + "\n\n"
-        "是：保留并同步到已完成设计\n"
+        "是：同步到已完成设计\n"
         "否：从 Distribution Cable 删除\n"
         "取消：暂不进入链路设计"
     )
@@ -414,13 +411,15 @@ def _show_startup_sync_dialog(self, layer):
     if answer == QtWidgets.QMessageBox.Cancel:
         return False
     if answer == QtWidgets.QMessageBox.Yes:
+        # Existing DC without a stable Link ID cannot be safely assigned to a
+        # saved Link. Do not guess from FDT/FAT display names.
         QtWidgets.QMessageBox.warning(
             self,
             "无法自动归属",
-            "这些 DC 线路没有稳定的 Link ID，无法安全判断它们属于哪个已完成 Link。\n\n请先对已有设计执行一次“确定并写入图层”建立关联。",
+            "这些 DC 线路没有稳定的 Link ID，无法安全判断它们属于哪个已完成 Link。\n\n"
+            "请先对已有设计执行一次“确定并写入图层”建立关联。",
         )
         return False
-
     if not layer.isEditable() and not layer.startEditing():
         QtWidgets.QMessageBox.warning(self, "Link 数据检查", "无法进入 Distribution Cable 编辑状态。")
         return False
