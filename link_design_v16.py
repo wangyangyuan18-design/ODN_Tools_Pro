@@ -12,14 +12,11 @@ from . import odn_project_context as context
 from . import cable_offset_layout_v4 as _offset
 from .change_detection_adapter import save_snapshot
 
-
-# Compatibility aliases used by legacy adapters that imported these helpers
-# from link_design_v9. The real implementation lives in link_design_v2/v3.
+# Compatibility aliases used by legacy adapters.
 if not hasattr(_v9, "_fresh_payload"):
     _v9._fresh_payload = _v9._v2._fresh_payload
 if not hasattr(_v9, "context"):
     _v9.context = context
-
 
 _ORIGINAL_START_DESIGN = _v9._CoreController.start_design
 
@@ -30,7 +27,9 @@ def _v16_start_design(self):
     if host is not None:
         try:
             if not host._check_dc_consistency_before_design():
-                self.status.setText("状态：Distribution Cable 与已完成设计不一致，已阻止继续链路设计。")
+                self.status.setText(
+                    "状态：Distribution Cable 与已完成设计不一致，已阻止继续链路设计。"
+                )
                 return False
         except Exception as exc:
             self.status.setText(f"状态：链路数据自检失败，已阻止继续设计：{exc}")
@@ -48,7 +47,7 @@ _v9._CoreController.start_design = _v16_start_design
 
 class LinkDesignDock(_v15.LinkDesignDock):
     def _check_dc_consistency_before_design(self):
-        """Run the DC/saved-Link consistency gate without swallowing errors."""
+        """Run the DC/saved-Link consistency check using the real modules."""
         try:
             layer = context.project_layer(
                 self._controller._v9_payload(),
@@ -61,21 +60,10 @@ class LinkDesignDock(_v15.LinkDesignDock):
         return _v12._show_startup_sync_dialog(self._controller, layer)
 
     def showEvent(self, event):
+        # v12 already invokes _check_dc_consistency_before_design(). Do not
+        # invoke it a second time here, otherwise a valid mismatch can produce
+        # two dialogs during one plugin opening.
         super().showEvent(event)
-        try:
-            # The v12 compatibility layer also performs this check. Run it
-            # explicitly here so a failed check cannot be silently swallowed.
-            if getattr(self, "_controller", None) is not None:
-                ok = self._check_dc_consistency_before_design()
-                if not ok:
-                    self.info.setText("Distribution Cable 与已完成设计不一致，请先完成数据同步。")
-        except Exception as exc:
-            self.info.setText(f"链路数据自检失败：{exc}")
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Link 数据检查",
-                f"链路数据自检失败，暂不能开始链路设计：\n{exc}",
-            )
 
     def _offset_and_write(self):
         controller = self._controller
@@ -126,7 +114,11 @@ class LinkDesignDock(_v15.LinkDesignDock):
 
         chosen = [value for value, check in angle_checks.items() if check.isChecked()]
         if not chosen:
-            QtWidgets.QMessageBox.warning(self, "偏移并写入图层", "至少选择一个角度。")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "偏移并写入图层",
+                "至少选择一个角度。",
+            )
             return
         spacing_value = float(spacing.value())
         _offset.save_settings(chosen, spacing_value)
