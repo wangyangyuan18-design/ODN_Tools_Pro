@@ -16,8 +16,11 @@ from qgis.gui import QgsRubberBand
 from . import link_design_v14 as _v14
 from . import link_design_v11 as _v11
 from . import odn_project_context as context
+from . import cable_offset_layout_v3 as _offset_v3
 
 SHOW_COMPLETED_FAT_KEY = "ODNToolsPro/LinkDesign/show_completed_fat_marks"
+OFFSET_ANGLE_KEY = "ODNToolsPro/CableOffsetLayout/angle_deg"
+OFFSET_SPACING_KEY = "ODNToolsPro/CableOffsetLayout/spacing_m"
 
 _original_refresh_planning_state = _v11.LinkDesignMapToolV11.refresh_planning_state
 
@@ -43,10 +46,8 @@ class LinkDesignDock(_v14.LinkDesignDock):
             QSettings().value(SHOW_COMPLETED_FAT_KEY, True, type=bool)
         )
         self._selected_fat_bands = []
+        self._offset_button = None
         super().__init__(iface, parent)
-        # The map-tool refresh reads the shared controller state. Keep the
-        # checkbox preference mirrored there so toggling the UI immediately
-        # affects the gray completed-FAT markers.
         self._controller._show_completed_fat_marks = self._show_completed_fat_marks
         self._install_ui_refinements()
 
@@ -109,6 +110,7 @@ class LinkDesignDock(_v14.LinkDesignDock):
 
     def _install_ui_refinements(self):
         self._replace_summary_row()
+        self._replace_action_rows()
         self.tree.viewport().installEventFilter(self)
         try:
             self._overlay.exit.clicked.disconnect(self._controller.exit_design)
@@ -148,6 +150,53 @@ class LinkDesignDock(_v14.LinkDesignDock):
         layout.insertLayout(index, row)
         self.show_fat_marks.toggled.connect(self._toggle_completed_fat_marks)
 
+    def _replace_action_rows(self):
+        root = self.widget()
+        layout = root.layout() if root is not None else None
+        if layout is None:
+            return
+
+        buttons = {self.modify_btn, self.delete_btn, self.write_btn}
+        target_index = -1
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            sublayout = item.layout()
+            if sublayout is None:
+                continue
+            found = False
+            for subindex in range(sublayout.count()):
+                widget = sublayout.itemAt(subindex).widget()
+                if widget in buttons:
+                    found = True
+                    break
+            if found:
+                target_index = index
+                layout.takeAt(index)
+                break
+        if target_index < 0:
+            target_index = layout.count()
+
+        self.modify_btn.setMinimumHeight(28)
+        self.delete_btn.setMinimumHeight(28)
+        self.write_btn.setMinimumHeight(28)
+        self.offset_btn = QtWidgets.QPushButton("偏移并写入图层")
+        self.offset_btn.setMinimumHeight(28)
+        self.offset_btn.setToolTip("设置偏移角度与偏移量后，将全部已完成 Link 按最终偏移结果写入 Distribution Cable")
+
+        grid = QtWidgets.QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(4)
+        grid.addWidget(self.modify_btn, 0, 0)
+        grid.addWidget(self.delete_btn, 0, 1)
+        grid.addWidget(self.write_btn, 1, 0)
+        grid.addWidget(self.offset_btn, 1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        layout.insertLayout(target_index, grid)
+        self._offset_button = self.offset_btn
+        self.offset_btn.clicked.connect(self._offset_and_write)
+
     def _toggle_completed_fat_marks(self, checked):
         self._show_completed_fat_marks = bool(checked)
         self._controller._show_completed_fat_marks = self._show_completed_fat_marks
@@ -161,10 +210,102 @@ class LinkDesignDock(_v14.LinkDesignDock):
                 pass
         self.iface.mapCanvas().refresh()
 
+    def _offset_and_write(self):
+        controller = self._controller
+        if controller._draw_active:
+            self.info.setText("请先保存或退出当前规划，再执行偏移并写入图层。")
+            return
+        if not controller._designs:
+            self.info.setText("当前没有已完成的 Link 可偏移写入。")
+            return
+
+        angle_value = float(QSettings().value(OFFSET_ANGLE_KEY, 60.0))
+        spacing_value = float(QSettings().value(OFFSET_SPACING_KEY, 0.5))
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("偏移并写入图层")
+        dialog.setModal(True)
+        form = QtWidgets.QFormLayout(dialog)
+        form.setContentsMargins(12, 12, 12, 12)
+        form.setSpacing(8)
+
+        angle = QtWidgets.QComboBox()
+        angle.addItems(["60°", "75°", "90°"])
+        nearest = min((60.0, 75.0, 90.0), key=lambda x: abs(x - angle_value))
+        angle.setCurrentIndex((60.0, 75.0, 90.0).index(nearest))
+
+        spacing = QtWidgets.QDoubleSpinBox()
+        spacing.setRange(0.01, 20.0)
+        spacing.setDecimals(2)
+        spacing.setSingleStep(0.10)
+        spacing.setValue(max(0.01, spacing_value))
+        spacing.setSuffix(" m")
+
+        form.addRow("角度", angle)
+        form.addRow("偏移量", spacing)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        form.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        angle_value = (60.0, 75.0, 90.0)[angle.currentIndex()]
+        spacing_value = float(spacing.value())
+        QSettings().setValue(OFFSET_ANGLE_KEY, angle_value)
+        QSettings().setValue(OFFSET_SPACING_KEY, spacing_value)
+        QSettings().sync()
+
+        payload = controller._v9_payload()
+        dc_layer = context.project_layer(payload, "Distribution Cable")
+        edge_layer = context.project_layer(payload, "Pole Edge")
+        if dc_layer is None or edge_layer is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "偏移并写入图层",
+                "当前项目缺少 Distribution Cable 或 Pole Edge 图层。",
+            )
+            return
+
+        backup = __import__("copy").deepcopy(controller._designs)
+        try:
+            summary = _offset_v3.apply_explicit_layout_to_designs(
+                controller._designs,
+                dc_layer,
+                edge_layer,
+                spacing=spacing_value,
+                angle_deg=angle_value,
+            )
+            # The normal writer now treats the Link design as the authoritative
+            # source and replaces linked DC geometry for the same Link/Segment.
+            result = controller.write_planned_links()
+            if not result:
+                controller._designs = backup
+                controller._persist_state()
+                self.refresh_from_core()
+                return
+            self.info.setText(
+                f"已偏移并写入全部 Link：{summary.get('changed_designs', 0)} 条发生几何变化，"
+                f"角度 {angle_value:.0f}°，偏移量 {spacing_value:.2f} m。"
+            )
+            self.refresh_from_core()
+        except Exception as exc:
+            controller._designs = backup
+            try:
+                controller._persist_state()
+            except Exception:
+                pass
+            QtWidgets.QMessageBox.warning(
+                self,
+                "偏移并写入图层",
+                f"偏移写入失败，已恢复本次设计数据：\n{exc}",
+            )
+
     def eventFilter(self, obj, event):
         viewport = getattr(self.tree, "viewport", lambda: None)()
         if obj is viewport and event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-            # QGIS 3.40 uses the Qt5-style QMouseEvent API here.
             try:
                 pos = event.pos()
             except AttributeError:
