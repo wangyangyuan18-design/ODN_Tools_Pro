@@ -11,6 +11,16 @@ Rules implemented here:
   style angles where geometry permits.
 - Slot side is computed from the Pole Edge travel direction, so positive
   offset is always the left normal and negative offset is the right normal.
+
+Important coordinate-system rule:
+- Stored ``edge_sequence`` endpoints always originate from the Pole Edge
+  layer CRS, because they are created by the routing engine from Pole Edge
+  graph nodes.
+- Stored segment ``points`` originate from ``design.source_crs`` (normally
+  the CRS used when the Link was saved).
+- These two CRS must never be confused when transforming into the metric
+  working CRS.  Mixing them can turn geographic coordinates into projected
+  coordinates and send the generated cable far away from the design area.
 """
 
 from math import hypot, tan, radians
@@ -217,8 +227,15 @@ def _transform_point(point, source_crs, target_crs):
     return transform.transform(point)
 
 
-def _extract_route_graph_nodes(segment, work_crs, source_crs):
-    """Reconstruct ordered graph nodes from the stored edge sequence."""
+def _extract_route_graph_nodes(segment, work_crs, source_crs, edge_crs):
+    """Reconstruct ordered graph nodes from the stored edge sequence.
+
+    ``segment.points`` and ``segment.edge_sequence`` deliberately have
+    different coordinate origins.  Segment points use ``source_crs`` while
+    every edge endpoint comes from the Pole Edge layer and therefore uses
+    ``edge_crs``.  Convert each into ``work_crs`` before any comparison or
+    distance calculation.
+    """
     raw_edges = segment.get("edge_sequence", []) or []
     edges = []
     for raw in raw_edges:
@@ -242,7 +259,14 @@ def _extract_route_graph_nodes(segment, work_crs, source_crs):
         except Exception:
             continue
 
-    first_a, first_b = _edge_points(edges[0])
+    def edge_endpoints(raw_edge):
+        a, b = _edge_points(raw_edge)
+        return (
+            _transform_point(a, edge_crs, work_crs),
+            _transform_point(b, edge_crs, work_crs),
+        )
+
+    first_a, first_b = edge_endpoints(edges[0])
 
     if len(edges) == 1:
         if len(stored_work) >= 2:
@@ -257,7 +281,7 @@ def _extract_route_graph_nodes(segment, work_crs, source_crs):
             first, second = first_a, first_b
         return [first, second]
 
-    next_a, next_b = _edge_points(edges[1])
+    next_a, next_b = edge_endpoints(edges[1])
     shared = _shared_endpoint(first_a, first_b, next_a, next_b)
     if shared is not None:
         first = first_b if _same_point(first_a, shared) else first_a
@@ -274,10 +298,10 @@ def _extract_route_graph_nodes(segment, work_crs, source_crs):
     nodes = [first]
     current = first
     for idx, edge in enumerate(edges):
-        a, b = _edge_points(edge)
+        a, b = edge_endpoints(edge)
         if not _same_point(current, a) and not _same_point(current, b):
             if idx + 1 < len(edges):
-                na, nb = _edge_points(edges[idx + 1])
+                na, nb = edge_endpoints(edges[idx + 1])
                 shared_now = _shared_endpoint(a, b, na, nb)
                 if shared_now is not None:
                     current = b if _same_point(a, shared_now) else a
@@ -446,7 +470,7 @@ def _assign_slots(edge_users, edge_reserved, previous_slots):
     return assigned
 
 
-def _build_segment_points(segment, slots_by_edge, spacing, work_crs, source_crs):
+def _build_segment_points(segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs):
     raw_edges = segment.get("edge_sequence", []) or []
     edges = []
     for raw in raw_edges:
@@ -477,7 +501,7 @@ def _build_segment_points(segment, slots_by_edge, spacing, work_crs, source_crs)
     if len(work_stored) < 2:
         return work_stored
 
-    nodes = _extract_route_graph_nodes(segment, work_crs, source_crs)
+    nodes = _extract_route_graph_nodes(segment, work_crs, source_crs, edge_crs)
     if len(nodes) != len(edges) + 1:
         return work_stored
 
@@ -604,6 +628,7 @@ def apply_layout_to_designs(
     if spacing <= 0:
         spacing = DEFAULT_SPACING_M
 
+    edge_crs = edge_layer.crs()
     work_crs = _choose_work_crs(edge_layer)
     existing_index, existing_geometries = _build_existing_index(
         distribution_layer,
@@ -616,7 +641,7 @@ def apply_layout_to_designs(
             continue
         segments = design.get("segments", []) or []
         for segment_index, segment in enumerate(segments):
-            source_crs = edge_layer.crs()
+            source_crs = edge_crs
             authid = str(design.get("source_crs", "") or "")
             if authid:
                 candidate = QgsCoordinateReferenceSystem(authid)
@@ -642,19 +667,28 @@ def apply_layout_to_designs(
                 source_crs,
                 work_crs,
             )
-            nodes = _extract_route_graph_nodes(segment, work_crs, source_crs)
+            nodes = _extract_route_graph_nodes(
+                segment,
+                work_crs,
+                source_crs,
+                edge_crs,
+            )
             if len(nodes) != len(parsed_edges) + 1:
                 continue
 
             for edge_index, edge in enumerate(parsed_edges):
+                # edge_sequence endpoints are Pole Edge CRS, NOT the design
+                # source CRS.  The old implementation used source_crs here;
+                # for 4326 Pole Edge + 3857 DC that interpreted longitude and
+                # latitude as meter coordinates before projecting them.
                 a = _transform_point(
                     QgsPointXY(edge[1][0], edge[1][1]),
-                    source_crs,
+                    edge_crs,
                     work_crs,
                 )
                 b = _transform_point(
                     QgsPointXY(edge[2][0], edge[2][1]),
-                    source_crs,
+                    edge_crs,
                     work_crs,
                 )
                 hint = _route_side_hint(start_point, end_point, a, b)
@@ -688,8 +722,8 @@ def apply_layout_to_designs(
     for edge_key in sorted(users_by_edge, key=lambda key: edge_priority[key]):
         users = users_by_edge[edge_key]
         a, b = _edge_points(edge_key)
-        a = _transform_point(a, edge_layer.crs(), work_crs)
-        b = _transform_point(b, edge_layer.crs(), work_crs)
+        a = _transform_point(a, edge_crs, work_crs)
+        b = _transform_point(b, edge_crs, work_crs)
         edge_geom = QgsGeometry.fromPolylineXY([a, b])
         reserved = _existing_slot_occupancy(
             edge_geom,
@@ -712,7 +746,7 @@ def apply_layout_to_designs(
         if design.get("written") and not design.get("needs_resync"):
             continue
         segments = design.get("segments", []) or []
-        source_crs = edge_layer.crs()
+        source_crs = edge_crs
         authid = str(design.get("source_crs", "") or "")
         if authid:
             candidate = QgsCoordinateReferenceSystem(authid)
@@ -738,6 +772,7 @@ def apply_layout_to_designs(
                 spacing,
                 work_crs,
                 source_crs,
+                edge_crs,
             )
             old_work_points = [
                 _transform_point(
