@@ -110,6 +110,17 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
         finally:
             _v3._transition_factory = original_factory_local
 
+        # v6 owns FAT endpoint synchronization. Patch its target resolver only
+        # for this run so the FAT always follows the final generated Cable
+        # geometry rather than the legacy 0.30 m control-point fallback.
+        try:
+            from . import cable_offset_layout_v6 as _v6_runtime
+            from . import cable_offset_fat_v2 as _fat_v2
+            _v6_runtime._target_for_fat = _fat_v2.target_for_fat
+            _log("[fat-landing-v2] active: FAT follows final offset Cable geometry")
+        except Exception as exc:
+            _log(f"[fat-landing-v2] activation failed: {type(exc).__name__}: {exc}", Qgis.Warning)
+
         if lane_debug:
             summary["global_lane_priority"] = list(ordered)
             summary["global_lane_slot_map"] = dict(lane_debug.get("slot_map", {}))
@@ -152,7 +163,7 @@ def apply_explicit_layout_to_designs(
     _log(
         f"[rule] spacing={spacing:.3f}m; control_distance={control_distance_m:.3f}m; "
         "main_lane=directional_continuity; corner=same_lane_continuous; "
-        "lane_change=directional_control_distance"
+        "lane_change=directional_control_distance; fat=actual_offset_geometry"
     )
     for magnitude in range(1, 9):
         offset = magnitude * spacing
@@ -168,13 +179,14 @@ def apply_explicit_layout_to_designs(
 
     for design in designs or []:
         layout = dict(design.get("layout") or {})
-        layout["version"] = 12
+        layout["version"] = 13
         layout["spacing_m"] = round(spacing, 3)
         layout["corner_control_distance_m"] = round(control_distance_m, 3)
         layout["rule"] = "global_directional_priority_continuous_lanes"
         layout["transition_angle"] = "derived_from_offset_and_control_distance"
         layout["corner_geometry"] = "v9_directional_lane_transition"
         layout["main_lane_rule"] = "longest_directional_run_then_route_length"
+        layout["fat_landing"] = "actual_final_offset_cable_geometry"
         layout.pop("angles_deg", None)
         design["layout"] = layout
 
@@ -182,11 +194,12 @@ def apply_explicit_layout_to_designs(
     summary["corner_control_distance_m"] = control_distance_m
     summary["transition_rule"] = "directional: before_node_when_moving_inward_after_node_when_moving_outward"
     summary["corner_geometry"] = "v9_directional_lane_transition"
+    summary["fat_landing"] = "actual_final_offset_cable_geometry"
     _log(
         f"[result] changed={summary.get('changed_designs', 0)}; "
         f"extra={summary.get('extra_length_m', 0):.3f}m; "
         f"control_distance={control_distance_m:.3f}m; "
-        "main_lane=directional_continuity"
+        "main_lane=directional_continuity; fat=actual_offset_geometry"
     )
     _log("========== Offset END ==========")
     return summary
