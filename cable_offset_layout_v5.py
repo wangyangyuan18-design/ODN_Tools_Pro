@@ -4,7 +4,7 @@
 The active geometry/allocator is v9:
 - main-lane priority follows directional continuity first;
 - same-lane corners stay continuous and parallel;
-- lane changes use 0.30 m control distance;
+- lane changes use the configured control distance;
 - 0.50 m remains the lane spacing.
 """
 
@@ -93,7 +93,9 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
         )
 
         base._assign_slots = global_assigner
-        base._build_segment_points = _v9.make_build_wrapper(original_base_build)
+        base._build_segment_points = _v9.make_build_wrapper(
+            original_base_build, control_distance_m
+        )
 
         original_factory_local = _v3._transition_factory
         _v3._transition_factory = lambda _ignored_angles: _natural_transition_factory(
@@ -110,9 +112,6 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
         finally:
             _v3._transition_factory = original_factory_local
 
-        # v6 owns FAT endpoint synchronization. Patch its target resolver only
-        # for this run so the FAT always follows the final generated Cable
-        # geometry rather than the legacy 0.30 m control-point fallback.
         try:
             from . import cable_offset_layout_v6 as _v6_runtime
             from . import cable_offset_fat_v2 as _fat_v2
@@ -179,7 +178,7 @@ def apply_explicit_layout_to_designs(
 
     for design in designs or []:
         layout = dict(design.get("layout") or {})
-        layout["version"] = 13
+        layout["version"] = 14
         layout["spacing_m"] = round(spacing, 3)
         layout["corner_control_distance_m"] = round(control_distance_m, 3)
         layout["rule"] = "global_directional_priority_continuous_lanes"
