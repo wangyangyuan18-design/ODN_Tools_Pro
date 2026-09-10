@@ -1,17 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Global lane priority v9 and route-aware corner transitions.
-
-Rules implemented from the ODN layout discussion:
-- Main lane is chosen by directional continuity, not by Link length alone.
-- The longest straight run is the strongest priority signal; route length is
-  secondary. Turns and reversals reduce priority.
-- Shared Pole Edge lanes remain globally consistent for the complete Link set.
-- Same-lane corners use a continuous parallel offset join.
-- Lane changes are directional: when moving toward the main lane, transition
-  can start before the Pole Edge node; when moving outward, transition starts
-  after the node. This prevents unnecessary saw-tooth geometry.
-- 0.50 m is lane spacing; 0.30 m is only the transition/control distance.
-"""
+"""Global lane priority v9 and route-aware corner transitions."""
 
 from math import acos, degrees, hypot
 
@@ -66,16 +54,13 @@ def _route_metrics(design_index, design, edge_crs, work_crs):
                 turn_sum += angle
                 if angle >= 135.0:
                     reversal_count += 1
-                # A turn breaks the directional main-run. A very small bend is
-                # treated as continuation so road-following routes stay strong.
                 if angle >= 25.0:
                     longest_run = max(longest_run, current_run)
                     current_run = 0.0
     longest_run = max(longest_run, current_run)
 
-    # Directional continuity is deliberately stronger than total length.
-    # This is what lets a shorter, cleaner L2 outrank a longer L1 that turns
-    # away and comes back. The route length remains a secondary tie-breaker.
+    # Directional continuity dominates total length. This makes a cleaner
+    # straight L2 outrank a longer L1 that turns away and returns.
     score = (
         longest_run * 1000.0
         + total * 10.0
@@ -205,11 +190,7 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
             counters["slots"][slot] = counters["slots"].get(slot, 0) + 1
         return assigned
 
-    return assign, {
-        "routes": routes,
-        "ordered_designs": ordered_designs,
-        "slot_map": slot_map,
-    }
+    return assign, {"routes": routes, "ordered_designs": ordered_designs, "slot_map": slot_map}
 
 
 def _append(result, point, eps=1e-7):
@@ -226,18 +207,6 @@ def _replace_last(result, point):
         result.append(p)
 
 
-def _transition_point(a, b, slot, spacing, control_distance, from_node=True):
-    length = hypot(b.x() - a.x(), b.y() - a.y())
-    if slot == 0 or length <= 1e-12:
-        return QgsPointXY(a if from_node else b)
-    run = min(abs(slot) * float(spacing) / max(1e-12, abs(slot) * float(spacing) / max(float(control_distance), 1e-12)), length * 0.45)
-    # The expression above simplifies to control_distance; keeping the
-    # explicit form documents that control distance is independent of spacing.
-    run = min(float(control_distance), length * 0.45)
-    center = _base._point_along(a, b, run / length if from_node else 1.0 - run / length)
-    return _base._offset_point(center, _base._unit(a, b), slot * spacing)
-
-
 def _build_continuous_segment_points(segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs):
     raw_edges = segment.get("edge_sequence", []) or []
     edges = [e for raw in raw_edges if (e := _base._canonical_edge(raw))]
@@ -252,12 +221,11 @@ def _build_continuous_segment_points(segment, slots_by_edge, spacing, work_crs, 
     if not any(slots):
         return stored_work
 
-    # v8 supplies the robust same-lane miter/bevel join. v9 replaces only the
-    # lane-change timing so D/E/F-type corners are directional instead of
-    # symmetric saw-tooth transitions.
+    # The actual value is supplied by v5 for the current run. Keeping the
+    # fallback at 0.30 m preserves the established project default.
+    control_distance = float(segment.get("_corner_control_distance_m", 0.30) or 0.30)
     result = []
     start_point, end_point = stored_work[0], stored_work[-1]
-    control_distance = 0.30
     first_slot = slots[0]
     first_a, first_b = nodes[0], nodes[1]
     first_len = hypot(first_b.x() - first_a.x(), first_b.y() - first_a.y())
@@ -287,38 +255,35 @@ def _build_continuous_segment_points(segment, slots_by_edge, spacing, work_crs, 
                     else:
                         _replace_last(result, join)
             else:
-                # If the new lane is closer to the main lane, start the
-                # transition before the node (D-type). If it moves outward,
-                # cross the node first and transition on the outgoing edge
-                # (E/F-type). This keeps the main route visually dominant.
                 prev_mag = abs(prev_slot)
                 new_mag = abs(slot)
                 if new_mag < prev_mag and prev_slot != 0:
-                    run = min(control_distance, hypot(a.x() - prev_a.x(), a.y() - prev_a.y()) * 0.45)
-                    center = _base._point_along(prev_a, prev_b, max(0.0, 1.0 - run / max(hypot(prev_b.x()-prev_a.x(), prev_b.y()-prev_a.y()), 1e-12)))
-                    p_old = _base._offset_point(center, prev_t, prev_slot * spacing)
-                    _replace_last(result, p_old)
+                    prev_len = hypot(prev_b.x() - prev_a.x(), prev_b.y() - prev_a.y())
+                    run = min(control_distance, prev_len * 0.45)
+                    center = _base._point_along(prev_a, prev_b, max(0.0, 1.0 - run / max(prev_len, 1e-12)))
+                    _replace_last(result, _base._offset_point(center, prev_t, prev_slot * spacing))
                     _append(result, a)
-                    run2 = min(control_distance, hypot(b.x()-a.x(), b.y()-a.y()) * 0.45)
-                    center2 = _base._point_along(a, b, run2 / max(hypot(b.x()-a.x(), b.y()-a.y()), 1e-12))
+                    next_len = hypot(b.x() - a.x(), b.y() - a.y())
+                    run2 = min(control_distance, next_len * 0.45)
+                    center2 = _base._point_along(a, b, run2 / max(next_len, 1e-12))
                     _append(result, _base._offset_point(center2, t, slot * spacing))
                 else:
-                    # Outward or cross-side transition: reach the corner on
-                    # the old lane, then change lane after the node.
                     _append(result, _base._offset_point(a, prev_t, prev_slot * spacing) if prev_slot else a)
                     if slot:
-                        run = min(control_distance, hypot(b.x()-a.x(), b.y()-a.y()) * 0.45)
-                        center = _base._point_along(a, b, run / max(hypot(b.x()-a.x(), b.y()-a.y()), 1e-12))
+                        next_len = hypot(b.x() - a.x(), b.y() - a.y())
+                        run = min(control_distance, next_len * 0.45)
+                        center = _base._point_along(a, b, run / max(next_len, 1e-12))
                         _append(result, _base._offset_point(center, t, slot * spacing))
                     else:
                         _append(result, a)
 
+        edge_len = hypot(b.x() - a.x(), b.y() - a.y())
         if i == len(edges) - 1:
             if slot == 0:
                 _append(result, b)
             else:
-                run = min(control_distance, hypot(b.x()-a.x(), b.y()-a.y()) * 0.45)
-                center = _base._point_along(a, b, max(0.0, 1.0-run/max(hypot(b.x()-a.x(), b.y()-a.y()),1e-12)))
+                run = min(control_distance, edge_len * 0.45)
+                center = _base._point_along(a, b, max(0.0, 1.0 - run / max(edge_len, 1e-12)))
                 _append(result, _base._offset_point(center, t, slot * spacing))
             _append(result, end_point)
         elif slot == 0:
@@ -329,7 +294,15 @@ def _build_continuous_segment_points(segment, slots_by_edge, spacing, work_crs, 
     return result
 
 
-def make_build_wrapper(original):
+def make_build_wrapper(original, control_distance_m=0.30):
+    """Return the active builder with the configured transition distance."""
+    control_distance_m = max(0.01, float(control_distance_m))
+
     def build(segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs):
-        return _build_continuous_segment_points(segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs)
+        segment = dict(segment or {})
+        segment["_corner_control_distance_m"] = control_distance_m
+        return _build_continuous_segment_points(
+            segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs
+        )
+
     return build
