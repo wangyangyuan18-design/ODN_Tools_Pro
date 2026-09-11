@@ -1,5 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Global lane priority v9 and route-aware corner transitions."""
+"""Global lane priority v9 and route-aware continuous corner geometry.
+
+Geometry rules:
+- 0.50 m is the physical separation between parallel cable lanes.
+- Ordinary Pole Edge corners are built from the offset lanes themselves.
+- The 0.30 m control distance is NOT used for ordinary corners or lane
+  transitions. It belongs to same-point multi-cable fan-out cases such as
+  FDT/BB/CL and FAT return-cable takeoff, which are handled by the endpoint
+  writer/landing logic rather than the Pole Edge corner builder.
+- A same-lane corner stays continuous and never backtracks through the
+  original Pole Edge node.
+- Lane placement is based on geometric lane index, not Link number.
+"""
 
 from math import acos, degrees, hypot
 
@@ -59,8 +71,6 @@ def _route_metrics(design_index, design, edge_crs, work_crs):
                     current_run = 0.0
     longest_run = max(longest_run, current_run)
 
-    # Directional continuity dominates total length. This makes a cleaner
-    # straight L2 outrank a longer L1 that turns away and returns.
     score = (
         longest_run * 1000.0
         + total * 10.0
@@ -107,8 +117,12 @@ def _collect_uses(designs, edge_crs, work_crs):
             nodes = _base._extract_route_graph_nodes(segment, work_crs, edge_crs, edge_crs)
             if len(nodes) != len(edges) + 1:
                 continue
-            start_point = _base._transform_point(QgsPointXY(float(points[0][0]), float(points[0][1])), edge_crs, work_crs)
-            end_point = _base._transform_point(QgsPointXY(float(points[-1][0]), float(points[-1][1])), edge_crs, work_crs)
+            start_point = _base._transform_point(
+                QgsPointXY(float(points[0][0]), float(points[0][1])), edge_crs, work_crs
+            )
+            end_point = _base._transform_point(
+                QgsPointXY(float(points[-1][0]), float(points[-1][1])), edge_crs, work_crs
+            )
             for edge_index, edge in enumerate(edges):
                 a, b = _base._edge_points(edge)
                 a = _base._transform_point(a, edge_crs, work_crs)
@@ -160,9 +174,17 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
     slot_map = {}
 
     for edge_key, users in users_by_edge.items():
-        reserved = _reserved_for_edge(edge_key, edge_crs, work_crs, spacing, existing_index, existing_geometries, reserved_cache)
+        reserved = _reserved_for_edge(
+            edge_key, edge_crs, work_crs, spacing,
+            existing_index, existing_geometries, reserved_cache
+        )
         used = set(reserved)
-        for use in sorted(users, key=lambda item: priority_by_design.get(item.design_index, (float("inf"), item.design_index))):
+        for use in sorted(
+            users,
+            key=lambda item: priority_by_design.get(
+                item.design_index, (float("inf"), item.design_index)
+            ),
+        ):
             chosen = None
             for candidate in _packed_lane_candidates(use.side_hint):
                 if candidate not in used:
@@ -182,7 +204,12 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
         counters["edges"] += 1
         counters["overlap_edges"] += int(len(edge_users) > 1 or bool(edge_reserved))
         assigned = {}
-        for use in sorted(edge_users, key=lambda item: priority_by_design.get(item.design_index, (float("inf"), item.design_index))):
+        for use in sorted(
+            edge_users,
+            key=lambda item: priority_by_design.get(
+                item.design_index, (float("inf"), item.design_index)
+            ),
+        ):
             key = (use.design_index, use.segment_index, use.edge_index)
             slot = int(slot_map.get(key, 0))
             use.slot = slot
@@ -190,119 +217,29 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
             counters["slots"][slot] = counters["slots"].get(slot, 0) + 1
         return assigned
 
-    return assign, {"routes": routes, "ordered_designs": ordered_designs, "slot_map": slot_map}
-
-
-def _append(result, point, eps=1e-7):
-    p = QgsPointXY(point)
-    if not result or hypot(result[-1].x() - p.x(), result[-1].y() - p.y()) > eps:
-        result.append(p)
-
-
-def _replace_last(result, point):
-    p = QgsPointXY(point)
-    if result:
-        result[-1] = p
-    else:
-        result.append(p)
-
-
-def _build_continuous_segment_points(segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs):
-    raw_edges = segment.get("edge_sequence", []) or []
-    edges = [e for raw in raw_edges if (e := _base._canonical_edge(raw))]
-    stored = segment.get("points", []) or []
-    if not edges or len(stored) < 2:
-        return [_base._transform_point(QgsPointXY(float(p[0]), float(p[1])), source_crs, work_crs) for p in stored if len(p) >= 2]
-    nodes = _base._extract_route_graph_nodes(segment, work_crs, source_crs, edge_crs)
-    if len(nodes) != len(edges) + 1:
-        raise RuntimeError("v9: route nodes 与 edge_sequence 不一致")
-    stored_work = [_base._transform_point(QgsPointXY(float(p[0]), float(p[1])), source_crs, work_crs) for p in stored if len(p) >= 2]
-    slots = [int(slots_by_edge.get(i, 0)) for i in range(len(edges))]
-    if not any(slots):
-        return stored_work
-
-    # The actual value is supplied by v5 for the current run. Keeping the
-    # fallback at 0.30 m preserves the established project default.
-    control_distance = float(segment.get("_corner_control_distance_m", 0.30) or 0.30)
-    result = []
-    start_point, end_point = stored_work[0], stored_work[-1]
-    first_slot = slots[0]
-    first_a, first_b = nodes[0], nodes[1]
-    first_len = hypot(first_b.x() - first_a.x(), first_b.y() - first_a.y())
-    _append(result, start_point)
-    if first_slot == 0:
-        _append(result, first_a)
-    else:
-        run = min(control_distance, first_len * 0.45)
-        center = _base._point_along(first_a, first_b, run / first_len if first_len > 1e-12 else 0.0)
-        _append(result, _base._offset_point(center, _base._unit(first_a, first_b), first_slot * spacing))
-
-    for i, (a, b) in enumerate(zip(nodes[:-1], nodes[1:])):
-        slot = slots[i]
-        t = _base._unit(a, b)
-        if i > 0:
-            prev_slot = slots[i - 1]
-            prev_a, prev_b = nodes[i - 1], nodes[i]
-            prev_t = _base._unit(prev_a, prev_b)
-            if prev_slot == slot:
-                if slot == 0:
-                    _replace_last(result, a)
-                else:
-                    join = _v8._same_lane_join(a, prev_a, prev_b, a, b, slot, spacing)
-                    if isinstance(join, tuple):
-                        _replace_last(result, join[0])
-                        _append(result, join[1])
-                    else:
-                        _replace_last(result, join)
-            else:
-                prev_mag = abs(prev_slot)
-                new_mag = abs(slot)
-                if new_mag < prev_mag and prev_slot != 0:
-                    prev_len = hypot(prev_b.x() - prev_a.x(), prev_b.y() - prev_a.y())
-                    run = min(control_distance, prev_len * 0.45)
-                    center = _base._point_along(prev_a, prev_b, max(0.0, 1.0 - run / max(prev_len, 1e-12)))
-                    _replace_last(result, _base._offset_point(center, prev_t, prev_slot * spacing))
-                    _append(result, a)
-                    next_len = hypot(b.x() - a.x(), b.y() - a.y())
-                    run2 = min(control_distance, next_len * 0.45)
-                    center2 = _base._point_along(a, b, run2 / max(next_len, 1e-12))
-                    _append(result, _base._offset_point(center2, t, slot * spacing))
-                else:
-                    _append(result, _base._offset_point(a, prev_t, prev_slot * spacing) if prev_slot else a)
-                    if slot:
-                        next_len = hypot(b.x() - a.x(), b.y() - a.y())
-                        run = min(control_distance, next_len * 0.45)
-                        center = _base._point_along(a, b, run / max(next_len, 1e-12))
-                        _append(result, _base._offset_point(center, t, slot * spacing))
-                    else:
-                        _append(result, a)
-
-        edge_len = hypot(b.x() - a.x(), b.y() - a.y())
-        if i == len(edges) - 1:
-            if slot == 0:
-                _append(result, b)
-            else:
-                run = min(control_distance, edge_len * 0.45)
-                center = _base._point_along(a, b, max(0.0, 1.0 - run / max(edge_len, 1e-12)))
-                _append(result, _base._offset_point(center, t, slot * spacing))
-            _append(result, end_point)
-        elif slot == 0:
-            _append(result, b)
-        else:
-            _append(result, _base._offset_point(b, t, slot * spacing))
-
-    return result
+    return assign, {
+        "routes": routes,
+        "ordered_designs": ordered_designs,
+        "slot_map": slot_map,
+    }
 
 
 def make_build_wrapper(original, control_distance_m=0.30):
-    """Return the active builder with the configured transition distance."""
-    control_distance_m = max(0.01, float(control_distance_m))
+    """Return the continuous lane builder.
 
+    `control_distance_m` is intentionally accepted for compatibility with the
+    existing v5 caller, but it is not used here. Ordinary corners are not
+    control-distance transitions; they are pure 0.50 m lane-offset geometry.
+    """
     def build(segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs):
-        segment = dict(segment or {})
-        segment["_corner_control_distance_m"] = control_distance_m
-        return _build_continuous_segment_points(
-            segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs
+        result = _v8.build_continuous_segment_points(
+            segment,
+            slots_by_edge,
+            spacing,
+            work_crs,
+            source_crs,
+            edge_crs,
         )
+        return result
 
     return build
