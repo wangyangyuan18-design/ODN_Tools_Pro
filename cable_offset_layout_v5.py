@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Pole Edge cable offset layout using fixed spacing and control distance.
+"""Pole Edge cable offset layout using 0.50 m lane spacing.
 
 The active geometry/allocator is v9:
 - main-lane priority follows directional continuity first;
 - same-lane corners stay continuous and parallel;
-- lane changes use the configured control distance;
-- 0.50 m remains the lane spacing.
+- ordinary corners do NOT use the 0.30 m control distance;
+- 0.30 m is reserved for same-point multi-cable fan-out/takeoff logic
+  (FDT/BB/CL/FAT return), not for normal Pole Edge lane transitions;
+- FAT landing follows the actual final offset Cable geometry.
 """
-
-from math import atan, degrees
 
 from qgis.PyQt.QtCore import QSettings
 from qgis.core import QgsMessageLog, Qgis
@@ -51,19 +51,6 @@ def save_settings(spacing, control_distance):
     settings.sync()
 
 
-def _natural_transition_factory(control_distance_m, spacing):
-    control_distance_m = max(0.01, float(control_distance_m))
-    spacing = max(0.01, float(spacing))
-
-    def transition(change):
-        offset_change = abs(float(change)) * spacing
-        if offset_change <= 1e-12:
-            return 0.0
-        return degrees(atan(offset_change / control_distance_m))
-
-    return transition
-
-
 def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m):
     base = _v3._v2._base
     original_base_assign = base._assign_slots
@@ -93,14 +80,17 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
         )
 
         base._assign_slots = global_assigner
+        # v9 now owns ordinary corner geometry and deliberately does not use
+        # control_distance_m for Pole Edge turns.
         base._build_segment_points = _v9.make_build_wrapper(
             original_base_build, control_distance_m
         )
 
+        # Do not inject the 0.30 m value into the generic transition factory.
+        # This prevents ordinary Pole Edge corners from being treated as
+        # control-distance lane changes. The 0.30 m value remains available to
+        # dedicated same-point fan-out/takeoff logic (FDT/BB/CL/FAT return).
         original_factory_local = _v3._transition_factory
-        _v3._transition_factory = lambda _ignored_angles: _natural_transition_factory(
-            control_distance_m, spacing
-        )
         try:
             summary = _v3.apply_explicit_layout_to_designs(
                 designs,
@@ -118,7 +108,10 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
             _v6_runtime._target_for_fat = _fat_v2.target_for_fat
             _log("[fat-landing-v2] active: FAT follows final offset Cable geometry")
         except Exception as exc:
-            _log(f"[fat-landing-v2] activation failed: {type(exc).__name__}: {exc}", Qgis.Warning)
+            _log(
+                f"[fat-landing-v2] activation failed: {type(exc).__name__}: {exc}",
+                Qgis.Warning,
+            )
 
         if lane_debug:
             summary["global_lane_priority"] = list(ordered)
@@ -160,17 +153,11 @@ def apply_explicit_layout_to_designs(
 
     _log("========== Offset START ==========")
     _log(
-        f"[rule] spacing={spacing:.3f}m; control_distance={control_distance_m:.3f}m; "
+        f"[rule] spacing={spacing:.3f}m; ordinary_corner_control=NOT_USED; "
+        f"same_point_fanout_control={control_distance_m:.3f}m; "
         "main_lane=directional_continuity; corner=same_lane_continuous; "
-        "lane_change=directional_control_distance; fat=actual_offset_geometry"
+        "lane_change=offset_lane_geometry; fat=actual_offset_geometry"
     )
-    for magnitude in range(1, 9):
-        offset = magnitude * spacing
-        angle = degrees(atan(offset / control_distance_m))
-        _log(
-            f"[derived-angle] offset={offset:.3f}m; "
-            f"control_distance={control_distance_m:.3f}m; angle={angle:.3f}deg"
-        )
 
     summary = _apply(
         designs, distribution_layer, edge_layer, spacing, control_distance_m
@@ -178,26 +165,30 @@ def apply_explicit_layout_to_designs(
 
     for design in designs or []:
         layout = dict(design.get("layout") or {})
-        layout["version"] = 14
+        layout["version"] = 15
         layout["spacing_m"] = round(spacing, 3)
         layout["corner_control_distance_m"] = round(control_distance_m, 3)
         layout["rule"] = "global_directional_priority_continuous_lanes"
-        layout["transition_angle"] = "derived_from_offset_and_control_distance"
-        layout["corner_geometry"] = "v9_directional_lane_transition"
+        layout["transition_angle"] = "geometry_from_offset_lane_spacing"
+        layout["corner_geometry"] = "v9_continuous_offset_lanes"
         layout["main_lane_rule"] = "longest_directional_run_then_route_length"
+        layout["fanout_control_rule"] = "same_point_only"
         layout["fat_landing"] = "actual_final_offset_cable_geometry"
         layout.pop("angles_deg", None)
         design["layout"] = layout
 
     summary.pop("angles_deg", None)
     summary["corner_control_distance_m"] = control_distance_m
-    summary["transition_rule"] = "directional: before_node_when_moving_inward_after_node_when_moving_outward"
-    summary["corner_geometry"] = "v9_directional_lane_transition"
+    summary["ordinary_corner_control_distance"] = None
+    summary["fanout_control_distance_m"] = control_distance_m
+    summary["transition_rule"] = "offset-lane geometry; no 0.30m ordinary-corner control"
+    summary["corner_geometry"] = "v9_continuous_offset_lanes"
     summary["fat_landing"] = "actual_final_offset_cable_geometry"
     _log(
         f"[result] changed={summary.get('changed_designs', 0)}; "
         f"extra={summary.get('extra_length_m', 0):.3f}m; "
-        f"control_distance={control_distance_m:.3f}m; "
+        "ordinary_corner_control=NOT_USED; "
+        f"same_point_fanout_control={control_distance_m:.3f}m; "
         "main_lane=directional_continuity; fat=actual_offset_geometry"
     )
     _log("========== Offset END ==========")
