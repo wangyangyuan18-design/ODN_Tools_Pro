@@ -66,10 +66,8 @@ def _endpoint_is_special(item):
 
 
 def _mark_endpoint_modes(designs):
-    ids_by_design = {}
     for design in designs or []:
         ids = design.get("sequence_ids", []) or []
-        ids_by_design[id(design)] = ids
         for index, segment in enumerate(design.get("segments", []) or []):
             start_item = ids[index] if index < len(ids) else None
             end_item = ids[index + 1] if index + 1 < len(ids) else None
@@ -82,14 +80,21 @@ def _fat_nodes_are_link_exclusive(designs, pending, slot_map, reserved_by_edge, 
 
     v9's generic exception list contains FAT because FAT Return may legitimately
     have two cables on one Link. For problem 5, however, that exception must
-    not allow two independent Link designs to use the same FAT. This helper
-    temporarily changes only the node-classification function used by the
-    exclusivity pass.
+    not allow two independent Link designs to use the same FAT.
+
+    Important: keep the original v9 classifier in the closure. The previous
+    implementation called _endpoint_is_special() after replacing
+    _v9._shared_node_exception, which made _endpoint_is_special call the
+    replacement again for non-FAT special nodes (FDT/BB/CL/etc.), causing
+    unbounded recursion and a RecursionError immediately after Offset START.
     """
     original = _v9._shared_node_exception
 
     def strict_shared(item):
-        return _endpoint_is_special(item) and _node_type(item) != "FAT"
+        kind = _node_type(item)
+        if kind == "FAT":
+            return False
+        return bool(original(item))
 
     _v9._shared_node_exception = strict_shared
     try:
