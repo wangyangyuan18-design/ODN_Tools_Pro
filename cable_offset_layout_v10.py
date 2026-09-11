@@ -17,14 +17,7 @@ from . import cable_offset_layout_v8 as _v8
 
 
 def _lane_candidates(use, previous_slot, used, reserved, limit=100):
-    """Stable lane continuity with main-lane preference for new routes.
-
-    Existing route: retain the previous lane first, then move outward on the
-    same side. A side change is the last resort.
-
-    New route: slot 0 is preferred if available; otherwise join from the
-    entering side and occupy the outside of the existing group.
-    """
+    """Stable lane continuity with main-lane preference for new routes."""
     if previous_slot is not None:
         previous_slot = int(previous_slot)
         yield previous_slot
@@ -42,7 +35,7 @@ def _lane_candidates(use, previous_slot, used, reserved, limit=100):
                 yield -sign * magnitude
         return
 
-    # A route entering the network gets the true main lane whenever possible.
+    # New route: true main lane first, then the entering side outward.
     if 0 not in used and 0 not in reserved:
         yield 0
     sign = 1 if use.side_hint >= 0 else -1
@@ -52,20 +45,29 @@ def _lane_candidates(use, previous_slot, used, reserved, limit=100):
         yield -sign * magnitude
 
 
-def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, counters):
-    """Allocate lanes in complete-route order instead of independent edges.
+def _mark_endpoint_modes(designs):
+    """Attach explicit endpoint semantics to each segment.
 
-    The previous v9 implementation iterated ``users_by_edge`` first. That can
-    leave slot 0 unused on an edge even though it is the natural main lane,
-    and it can lose the previous lane because a preceding edge has not yet
-    been allocated. v10 processes each Link in route-priority order and walks
-    its edges sequentially, so lane continuity is an actual invariant.
+    sequence_ids belongs to the Design, not normally to an individual segment.
+    Copying only the two endpoint flags into the segment avoids guessing from
+    ``slot != 0`` inside the geometry builder.
     """
+    for design in designs or []:
+        ids = design.get("sequence_ids", []) or []
+        for index, segment in enumerate(design.get("segments", []) or []):
+            start_item = ids[index] if index < len(ids) else None
+            end_item = ids[index + 1] if index + 1 < len(ids) else None
+            segment["_odn_special_start"] = bool(_v9._shared_node_exception(start_item))
+            segment["_odn_special_end"] = bool(_v9._shared_node_exception(end_item))
+
+
+def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, counters):
+    """Allocate lanes in complete-route order instead of independent edges."""
     base = _v9._base
     edge_crs = edge_layer.crs()
     work_crs = base._choose_work_crs(edge_layer)
+    _mark_endpoint_modes(designs)
     pending, routes = _v9._collect_uses(designs, edge_crs, work_crs)
-    use_lookup = {(u.design_index, u.segment_index, u.edge_index): u for u in pending}
 
     ordered_designs = sorted(
         routes,
@@ -93,25 +95,26 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
             )
         return reserved_by_edge[edge_key]
 
-    # Complete route order is essential: main route gets first choice on every
-    # edge, and its previous slot is known before the next edge is allocated.
+    # Route-sequential allocation fixes the old edge-first problem: the main
+    # route receives slot 0 when available and its previous lane is known when
+    # the next Pole Edge is processed.
     for design_index in ordered_designs:
         route_uses = sorted(
             [u for u in pending if u.design_index == design_index],
             key=lambda u: (u.segment_index, u.edge_index),
         )
         previous_slot = None
-        previous_edge = None
+        previous_segment = None
         for use in route_uses:
             edge_key = use.edge_key
             reserved = reserved_for(edge_key)
             used = used_by_edge.setdefault(edge_key, set(reserved))
 
-            # If the route has a real discontinuity, do not blindly inherit a
-            # lane from the preceding segment. Within a continuous segment,
-            # previous_slot is always the previous edge's assigned lane.
-            if previous_edge is not None and use.edge_index == 0:
+            # A new segment is a real route discontinuity; otherwise inherit
+            # the preceding edge's relative lane.
+            if previous_segment is not None and use.segment_index != previous_segment:
                 previous_slot = None
+
             chosen = None
             for candidate in _lane_candidates(use, previous_slot, used, reserved):
                 if candidate not in used:
@@ -130,9 +133,8 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
             use.slot = chosen
             used.add(chosen)
             previous_slot = chosen
-            previous_edge = edge_key
+            previous_segment = use.segment_index
 
-    # Keep the existing ordinary-Pole protection as a final topology guard.
     node_changes = _v9._enforce_ordinary_node_exclusivity(
         designs, pending, slot_map, reserved_by_edge, priority_by_design,
         edge_crs, work_crs, spacing,
@@ -160,7 +162,7 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
     _v9._log(
         f"[global-lane-v10] links={len(ordered_designs)}; "
         f"mapped_edges={len(slot_map)}; main_lane=preferred; "
-        "route_sequential_allocation=ON"
+        "route_sequential_allocation=ON; endpoint_modes=explicit"
     )
     return assign, {
         "routes": routes,
@@ -171,27 +173,11 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
 
 
 def _is_special_endpoint(segment, at_start):
-    """Return whether an endpoint is an explicit multi-cable node.
-
-    sequence_ids normally carries node type/name information. Keep the test
-    deliberately narrow so an ordinary Pole can never accidentally receive a
-    0.30 m takeoff merely because its lane is non-zero.
-    """
-    ids = segment.get("sequence_ids", []) or []
-    if at_start:
-        item = ids[0] if ids else None
-    else:
-        item = ids[-1] if ids else None
-    return _v9._shared_node_exception(item)
+    return bool(segment.get("_odn_special_start" if at_start else "_odn_special_end", False))
 
 
 def _patch_endpoint_entry(segment):
-    """Patch v8's endpoint decision for this build only.
-
-    NORMAL endpoint -> direct Pole connection.
-    SPECIAL endpoint -> v8 takeoff (0.30 m control).
-    Internal corners remain untouched and continue using pure 0.50 m offset.
-    """
+    """Make ordinary endpoint entry straight and reserve takeoff for specials."""
     original = _v8._entry_point
     special_start = _is_special_endpoint(segment, True)
 
@@ -203,21 +189,38 @@ def _patch_endpoint_entry(segment):
                 return _v8.QgsPointXY(a)
             if special_start:
                 return _v8._takeoff_entry(a, b, slot, spacing)
+            # NORMAL_ENDPOINT: cable goes directly to the Pole. Do not invent
+            # a 0.30 m diagonal merely because the lane is non-zero.
             return _v8.QgsPointXY(a)
         return original(nodes, slots, i, spacing)
 
     return entry
 
 
+def _patch_endpoint_exit(segment):
+    """Make the final endpoint land directly on the destination Pole/node."""
+    original = _v8._exit_point
+
+    def exit_point(nodes, slots, i, spacing):
+        if i == len(slots) - 1:
+            return _v8.QgsPointXY(nodes[i + 1])
+        return original(nodes, slots, i, spacing)
+
+    return exit_point
+
+
 def make_build_wrapper(original, control_distance_m=0.30):
-    """Use v8 geometry with explicit endpoint semantics from v10."""
+    """Use v8 continuous geometry with explicit endpoint semantics."""
     def build(segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs):
         original_entry = _v8._entry_point
+        original_exit = _v8._exit_point
         _v8._entry_point = _patch_endpoint_entry(segment)
+        _v8._exit_point = _patch_endpoint_exit(segment)
         try:
             return _v8.build_continuous_segment_points(
                 segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs
             )
         finally:
             _v8._entry_point = original_entry
+            _v8._exit_point = original_exit
     return build
