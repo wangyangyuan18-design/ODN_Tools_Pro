@@ -7,8 +7,9 @@ Problem 1-8 consolidation:
 - a new route joins an existing cable group from the outside;
 - ordinary Pole nodes are exclusive;
 - ordinary turns do not use the 0.30 m takeoff distance;
-- only explicit special endpoints (FDT/FAT-return/BB/SFC-CL/Closure) use
-  the 0.30 m takeoff geometry;
+- only explicit special endpoints use the 0.30 m takeoff geometry;
+- FAT is exclusive between independent Links, while FAT Return on the same
+  Link may use the same engineering point;
 - FAT geometry is handled by the final cable geometry of its owning Link.
 """
 
@@ -35,7 +36,6 @@ def _lane_candidates(use, previous_slot, used, reserved, limit=100):
                 yield -sign * magnitude
         return
 
-    # New route: true main lane first, then the entering side outward.
     if 0 not in used and 0 not in reserved:
         yield 0
     sign = 1 if use.side_hint >= 0 else -1
@@ -45,20 +45,60 @@ def _lane_candidates(use, previous_slot, used, reserved, limit=100):
         yield -sign * magnitude
 
 
-def _mark_endpoint_modes(designs):
-    """Attach explicit endpoint semantics to each segment.
+def _node_type(item):
+    if not item or len(item) < 1:
+        return ""
+    text = str(item[0]).strip().upper()
+    return "".join(ch for ch in text if ch.isalnum())
 
-    sequence_ids belongs to the Design, not normally to an individual segment.
-    Copying only the two endpoint flags into the segment avoids guessing from
-    ``slot != 0`` inside the geometry builder.
+
+def _endpoint_is_special(item):
+    """Special takeoff whitelist, including FAT for same-Link Return.
+
+    FAT is intentionally special for endpoint geometry but is NOT treated as
+    globally shareable by ordinary-node exclusivity. Two independent Links
+    cannot use the same FAT.
     """
+    kind = _node_type(item)
+    if kind == "FAT":
+        return True
+    return _v9._shared_node_exception(item)
+
+
+def _mark_endpoint_modes(designs):
+    ids_by_design = {}
     for design in designs or []:
         ids = design.get("sequence_ids", []) or []
+        ids_by_design[id(design)] = ids
         for index, segment in enumerate(design.get("segments", []) or []):
             start_item = ids[index] if index < len(ids) else None
             end_item = ids[index + 1] if index + 1 < len(ids) else None
-            segment["_odn_special_start"] = bool(_v9._shared_node_exception(start_item))
-            segment["_odn_special_end"] = bool(_v9._shared_node_exception(end_item))
+            segment["_odn_special_start"] = _endpoint_is_special(start_item)
+            segment["_odn_special_end"] = _endpoint_is_special(end_item)
+
+
+def _fat_nodes_are_link_exclusive(designs, pending, slot_map, reserved_by_edge, priority_by_design, edge_crs, work_crs, spacing):
+    """Run v9 node protection with FAT treated as non-shareable across Links.
+
+    v9's generic exception list contains FAT because FAT Return may legitimately
+    have two cables on one Link. For problem 5, however, that exception must
+    not allow two independent Link designs to use the same FAT. This helper
+    temporarily changes only the node-classification function used by the
+    exclusivity pass.
+    """
+    original = _v9._shared_node_exception
+
+    def strict_shared(item):
+        return _endpoint_is_special(item) and _node_type(item) != "FAT"
+
+    _v9._shared_node_exception = strict_shared
+    try:
+        return _v9._enforce_ordinary_node_exclusivity(
+            designs, pending, slot_map, reserved_by_edge, priority_by_design,
+            edge_crs, work_crs, spacing,
+        )
+    finally:
+        _v9._shared_node_exception = original
 
 
 def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, counters):
@@ -95,9 +135,6 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
             )
         return reserved_by_edge[edge_key]
 
-    # Route-sequential allocation fixes the old edge-first problem: the main
-    # route receives slot 0 when available and its previous lane is known when
-    # the next Pole Edge is processed.
     for design_index in ordered_designs:
         route_uses = sorted(
             [u for u in pending if u.design_index == design_index],
@@ -109,9 +146,6 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
             edge_key = use.edge_key
             reserved = reserved_for(edge_key)
             used = used_by_edge.setdefault(edge_key, set(reserved))
-
-            # A new segment is a real route discontinuity; otherwise inherit
-            # the preceding edge's relative lane.
             if previous_segment is not None and use.segment_index != previous_segment:
                 previous_slot = None
 
@@ -135,12 +169,12 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
             previous_slot = chosen
             previous_segment = use.segment_index
 
-    node_changes = _v9._enforce_ordinary_node_exclusivity(
+    node_changes = _fat_nodes_are_link_exclusive(
         designs, pending, slot_map, reserved_by_edge, priority_by_design,
         edge_crs, work_crs, spacing,
     )
     if node_changes:
-        _v9._log(f"[node-exclusive-v10] corrected ordinary Pole-node cases={node_changes}")
+        _v9._log(f"[node-exclusive-v10] corrected ordinary/FAT cross-Link cases={node_changes}")
 
     def assign(edge_users, edge_reserved, previous_slots):
         counters["edges"] += 1
@@ -162,7 +196,8 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
     _v9._log(
         f"[global-lane-v10] links={len(ordered_designs)}; "
         f"mapped_edges={len(slot_map)}; main_lane=preferred; "
-        "route_sequential_allocation=ON; endpoint_modes=explicit"
+        "route_sequential_allocation=ON; endpoint_modes=explicit; "
+        "fat_cross_link_exclusive=ON"
     )
     return assign, {
         "routes": routes,
@@ -177,7 +212,7 @@ def _is_special_endpoint(segment, at_start):
 
 
 def _patch_endpoint_entry(segment):
-    """Make ordinary endpoint entry straight and reserve takeoff for specials."""
+    """Ordinary endpoint -> direct; special endpoint -> 0.30 m takeoff."""
     original = _v8._entry_point
     special_start = _is_special_endpoint(segment, True)
 
@@ -189,8 +224,6 @@ def _patch_endpoint_entry(segment):
                 return _v8.QgsPointXY(a)
             if special_start:
                 return _v8._takeoff_entry(a, b, slot, spacing)
-            # NORMAL_ENDPOINT: cable goes directly to the Pole. Do not invent
-            # a 0.30 m diagonal merely because the lane is non-zero.
             return _v8.QgsPointXY(a)
         return original(nodes, slots, i, spacing)
 
@@ -198,7 +231,7 @@ def _patch_endpoint_entry(segment):
 
 
 def _patch_endpoint_exit(segment):
-    """Make the final endpoint land directly on the destination Pole/node."""
+    """All final endpoint arrivals land directly on the destination node."""
     original = _v8._exit_point
 
     def exit_point(nodes, slots, i, spacing):
