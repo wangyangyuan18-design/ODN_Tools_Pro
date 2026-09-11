@@ -16,7 +16,6 @@ def classFactory(iface):
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
     from .link_design_v17 import LinkDesignDock
-    from .odn21_constraints import install_link_design_odn21
     from .fat_return import install_fat_return_button
     from .plugin_undo import undo_last
     from .offset_write_patch import install_offset_write_patch
@@ -29,7 +28,6 @@ def classFactory(iface):
     install_offset_write_patch()
     install_coincident_fat_fallback()
     install_coincident_fdt_fat_route_patch()
-    install_link_design_odn21(LinkDesignDock)
 
     class ODNToolsPro:
         def __init__(self, iface):
