@@ -8,7 +8,11 @@ Rules:
   continuous offset join (miter, with bevel fallback).
 - A same-lane corner does NOT insert the original Pole Edge node as an
   intermediate waypoint and does NOT use the 0.30 m lane-change control run.
-- The control distance is used only when the lane number actually changes.
+- A lane change inside a route uses the geometric transition rule.
+- A shared engineering output/takeoff at the beginning of an offset route
+  uses a 0.30 m control run when the route must leave the common outlet and
+  establish its 0.50 m parallel lane. The resulting angle is generated from
+  the actual offset distance and 0.30 m control run (0.50 m -> about 59 deg).
 - Geometry errors are raised instead of silently falling back to the legacy
   edge-by-edge builder, because that fallback could recreate the old
   A -> control point -> B -> control point -> C geometry.
@@ -21,6 +25,7 @@ from qgis.core import QgsMessageLog, QgsPointXY, Qgis
 from . import cable_offset_layout as _base
 
 LOG_TAG = "ODN_Tools_Pro / Cable Offset"
+DEFAULT_TAKEOFF_CONTROL_DISTANCE_M = 0.30
 
 
 def _log(message, level=Qgis.Info):
@@ -89,8 +94,6 @@ def _same_lane_join(node, prev_a, prev_b, next_a, next_b, slot, spacing):
     hit = _intersection(p1, p2, q1, q2)
     if hit is not None:
         distance = hypot(hit.x() - node.x(), hit.y() - node.y())
-        # Reject pathological miters on extremely acute turns. The bevel
-        # remains on the two correct offset lines and never goes through node.
         if distance <= max(3.0 * abs(d), 5.0 * max(float(spacing), 0.01)):
             return hit
 
@@ -101,6 +104,7 @@ def _same_lane_join(node, prev_a, prev_b, next_a, next_b, slot, spacing):
 
 
 def _transition_entry(a, b, slot, spacing, fraction_cap=0.45):
+    """Enter a new non-zero lane along an ordinary edge transition."""
     d = abs(int(slot)) * float(spacing)
     if slot == 0 or d <= 1e-12:
         return QgsPointXY(a)
@@ -111,6 +115,26 @@ def _transition_entry(a, b, slot, spacing, fraction_cap=0.45):
     run = min(_base._transition_run(d, angle), length * fraction_cap)
     center = _base._point_along(a, b, run / length)
     return _base._offset_point(center, _base._unit(a, b), int(slot) * float(spacing))
+
+
+def _takeoff_entry(a, b, slot, spacing, control_distance=DEFAULT_TAKEOFF_CONTROL_DISTANCE_M):
+    """Leave a shared output/takeoff point and establish a parallel lane.
+
+    The control distance is measured from the common node along the original
+    route. The offset distance is the actual lane spacing. Therefore the
+    resulting transition angle is not hard-coded: it follows from geometry.
+    For one lane (0.5 m) with 0.30 m control, the angle is about 59 degrees.
+    """
+    d_signed = int(slot) * float(spacing)
+    d = abs(d_signed)
+    if slot == 0 or d <= 1e-12:
+        return QgsPointXY(a)
+    length = hypot(b.x() - a.x(), b.y() - a.y())
+    if length <= 1e-12:
+        return QgsPointXY(a)
+    run = min(max(0.01, float(control_distance)), length * 0.45)
+    center = _base._point_along(a, b, run / length)
+    return _base._offset_point(center, _base._unit(a, b), d_signed)
 
 
 def _transition_exit(a, b, slot, spacing, fraction_cap=0.45):
@@ -130,7 +154,7 @@ def _entry_point(nodes, slots, i, spacing):
     a, b = nodes[i], nodes[i + 1]
     slot = slots[i]
     if i == 0:
-        return QgsPointXY(a) if slot == 0 else _transition_entry(a, b, slot, spacing)
+        return QgsPointXY(a) if slot == 0 else _takeoff_entry(a, b, slot, spacing)
 
     prev_slot = slots[i - 1]
     node = a
@@ -140,7 +164,6 @@ def _entry_point(nodes, slots, i, spacing):
         prev_a, prev_b = nodes[i - 1], nodes[i]
         return _same_lane_join(node, prev_a, prev_b, a, b, slot, spacing)
 
-    # Genuine lane change: no forced stop/backtrack through the node.
     if slot == 0:
         return QgsPointXY(node)
     return _transition_entry(a, b, slot, spacing)
@@ -160,7 +183,6 @@ def _exit_point(nodes, slots, i, spacing):
         next_a, next_b = nodes[i + 1], nodes[i + 2]
         return _same_lane_join(node, a, b, next_a, next_b, slot, spacing)
 
-    # Genuine lane change: finish the old lane before the node.
     if slot == 0:
         return QgsPointXY(node)
     return _transition_exit(a, b, slot, spacing)
@@ -200,8 +222,6 @@ def build_continuous_segment_points(
 
     slots = [int(slots_by_edge.get(i, 0)) for i in range(len(edges))]
 
-    # Lane 0 is the authoritative original route. Do not rebuild it and do not
-    # add any corner control points.
     if not any(slot != 0 for slot in slots):
         return stored_work
 
@@ -212,8 +232,6 @@ def build_continuous_segment_points(
         entry = _entry_point(nodes, slots, i, spacing)
         exit_ = _exit_point(nodes, slots, i, spacing)
 
-        # For a same-lane corner, entry == exit (the miter point) or they are
-        # the two bevel endpoints. In neither case is the original node added.
         _append(result, entry)
         _append(result, exit_)
 
@@ -228,6 +246,14 @@ def build_continuous_segment_points(
                 f"slot_change={slots[i - 1]}->{slots[i]}; "
                 "mode=genuine_lane_change"
             )
+        elif i == 0 and slots[i] != 0:
+            control = DEFAULT_TAKEOFF_CONTROL_DISTANCE_M
+            offset = abs(slots[i]) * float(spacing)
+            _log(
+                f"[takeoff-v8] first_edge=0; slot={slots[i]}; "
+                f"offset={offset:.3f}m; control_distance={control:.3f}m; "
+                "mode=shared-output-takeoff"
+            )
 
     _append(result, stored_work[-1])
     return result
@@ -236,9 +262,6 @@ def build_continuous_segment_points(
 def make_build_wrapper(original):
     """Return the active builder without a silent legacy-geometry fallback."""
     def build(segment, slots_by_edge, spacing, work_crs, source_crs, edge_crs):
-        # Preserve the original builder only for genuinely non-routable or
-        # non-offset data; valid offset geometry errors must propagate so v3
-        # can abort rather than silently recreating the old corner path.
         return build_continuous_segment_points(
             segment,
             slots_by_edge,
