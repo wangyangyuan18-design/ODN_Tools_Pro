@@ -38,9 +38,6 @@ jobs:
           set -euo pipefail
           rm -rf package
           mkdir -p package/ODN_Tools_Pro
-
-          # The QGIS-installable ZIP must contain exactly one top-level
-          # plugin directory named ODN_Tools_Pro.
           rsync -a \
             --exclude='.git/' \
             --exclude='.github/' \
@@ -49,8 +46,6 @@ jobs:
             --exclude='ODN_Tools_Pro.zip' \
             --exclude='ODN_Tools_Pro-QGIS-Plugin.ZIP' \
             ./ package/ODN_Tools_Pro/
-
-          # Remove development/cache files that must not be shipped.
           find package/ODN_Tools_Pro -type d \( -name '__pycache__' -o -name '.pytest_cache' \) -prune -exec rm -rf {} +
           find package/ODN_Tools_Pro -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
@@ -61,7 +56,6 @@ jobs:
           test -f package/ODN_Tools_Pro/metadata.txt
           test -f package/ODN_Tools_Pro/__init__.py
           grep -q 'def classFactory' package/ODN_Tools_Pro/__init__.py
-
           python - <<'PY'
           from pathlib import Path
           root = Path('package/ODN_Tools_Pro')
@@ -71,10 +65,6 @@ jobs:
               if '=' in line and not line.startswith('#'):
                   k, v = line.split('=', 1)
                   values[k.strip()] = v.strip()
-
-          # QGIS plugin directory and metadata display name are different
-          # concepts. The directory is fixed at ODN_Tools_Pro; the metadata
-          # name is the human-facing plugin name and may contain spaces.
           assert values.get('name'), values
           assert values.get('version'), values
           assert values.get('qgisMinimumVersion'), values
@@ -91,17 +81,16 @@ jobs:
           python -m compileall -q package/ODN_Tools_Pro
           find package/ODN_Tools_Pro -type d -name '__pycache__' -prune -exec rm -rf {} +
 
-      - name: Build inner QGIS plugin ZIP
+      - name: Build directly installable QGIS plugin ZIP
         shell: bash
         run: |
           set -euo pipefail
           cd package
           zip -r ../ODN_Tools_Pro.zip ODN_Tools_Pro -x '*/__pycache__/*' '*.pyc' '*.pyo'
           cd ..
-          unzip -l ODN_Tools_Pro.zip
           unzip -t ODN_Tools_Pro.zip
 
-      - name: Verify inner ZIP layout
+      - name: Verify ZIP layout and critical entry point
         shell: bash
         run: |
           set -euo pipefail
@@ -111,42 +100,21 @@ jobs:
 
           with ZipFile('ODN_Tools_Pro.zip') as zf:
               names = [n for n in zf.namelist() if n and not n.endswith('/')]
-              assert names, 'Inner ZIP is empty'
+              assert names, 'ZIP is empty'
               top = {PurePosixPath(n).parts[0] for n in names}
               assert top == {'ODN_Tools_Pro'}, top
               assert 'ODN_Tools_Pro/metadata.txt' in names
               assert 'ODN_Tools_Pro/__init__.py' in names
-              print('Inner ZIP is directly installable as a QGIS plugin.')
+              init_text = zf.read('ODN_Tools_Pro/__init__.py').decode('utf-8')
+              assert 'install_link_design_odn21' not in init_text, 'Stale ODN21 installer import remains in package'
+              print('ZIP is directly installable as a QGIS plugin.')
+              print('No stale install_link_design_odn21 reference in __init__.py.')
           PY
 
-      - name: Build outer delivery ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -f ODN_Tools_Pro-QGIS-Plugin.ZIP
-          zip ODN_Tools_Pro-QGIS-Plugin.ZIP ODN_Tools_Pro.zip
-          unzip -l ODN_Tools_Pro-QGIS-Plugin.ZIP
-          unzip -t ODN_Tools_Pro-QGIS-Plugin.ZIP
-
-      - name: Verify outer ZIP layout
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          from zipfile import ZipFile
-
-          with ZipFile('ODN_Tools_Pro-QGIS-Plugin.ZIP') as zf:
-              files = [n for n in zf.namelist() if n and not n.endswith('/')]
-              assert files == ['ODN_Tools_Pro.zip'], files
-              print('Outer delivery ZIP contains ODN_Tools_Pro.zip only.')
-          PY
-
-      - name: Upload plugin packages
+      - name: Upload directly installable plugin
         uses: actions/upload-artifact@v4
         with:
           name: ODN_Tools_Pro-QGIS-Plugin
-          path: |
-            ODN_Tools_Pro-QGIS-Plugin.ZIP
-            ODN_Tools_Pro.zip
+          path: ODN_Tools_Pro.zip
           if-no-files-found: error
           retention-days: 30
