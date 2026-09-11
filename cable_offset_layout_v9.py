@@ -11,14 +11,26 @@ Geometry rules:
 - A same-lane corner stays continuous and never backtracks through the
   original Pole Edge node.
 - Lane placement is based on geometric lane index, not Link number.
+- An ordinary Pole node may not be used by two independent Cable routes.
+  Multiple cables may share a node only for explicit engineering nodes such as
+  FDT, FAT return, BB, and SFC/CL.
 """
 
 from math import acos, degrees, hypot
 
-from qgis.core import QgsGeometry, QgsPointXY
+from qgis.core import QgsGeometry, QgsPointXY, QgsMessageLog, Qgis
 
 from . import cable_offset_layout as _base
 from . import cable_offset_layout_v8 as _v8
+
+LOG_TAG = "ODN_Tools_Pro / Cable Offset"
+
+
+def _log(message, level=Qgis.Info):
+    try:
+        QgsMessageLog.logMessage(str(message), LOG_TAG, level)
+    except Exception:
+        pass
 
 
 def _unit(a, b):
@@ -150,6 +162,244 @@ def _packed_lane_candidates(side_hint, limit=20):
             yield -magnitude
 
 
+def _compact_node_type(item):
+    if not item or len(item) < 1:
+        return ""
+    text = str(item[0]).strip().upper()
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def _shared_node_exception(item):
+    """Return True for engineering nodes where multiple cable legs may meet."""
+    kind = _compact_node_type(item)
+    if kind in {"FDT", "FAT", "BB", "CL", "CLOSURE", "SFCCL", "SFCCLOSURE"}:
+        return True
+    if kind.startswith("SFC") and ("CL" in kind or "CLOSURE" in kind):
+        return True
+    return False
+
+
+def _node_key(point):
+    return (round(float(point.x()), 7), round(float(point.y()), 7))
+
+
+def _collect_node_users(designs, edge_crs, work_crs):
+    """Collect which independent Link designs pass each physical Pole node."""
+    users = {}
+    for design_index, design in enumerate(designs or []):
+        if design.get("written") and not design.get("needs_resync"):
+            continue
+        sequence_ids = design.get("sequence_ids", []) or []
+        for segment_index, segment in enumerate(design.get("segments", []) or []):
+            raw_edges = segment.get("edge_sequence", []) or []
+            edges = [e for raw in raw_edges if (e := _base._canonical_edge(raw))]
+            if not edges:
+                continue
+            nodes = _base._extract_route_graph_nodes(segment, work_crs, edge_crs, edge_crs)
+            if len(nodes) != len(edges) + 1:
+                continue
+            for node_index, node in enumerate(nodes):
+                seq_item = None
+                if node_index == 0 and segment_index < len(sequence_ids):
+                    seq_item = sequence_ids[segment_index]
+                elif node_index == len(nodes) - 1 and segment_index + 1 < len(sequence_ids):
+                    seq_item = sequence_ids[segment_index + 1]
+                users.setdefault(_node_key(node), []).append(
+                    {
+                        "design_index": design_index,
+                        "segment_index": segment_index,
+                        "node_index": node_index,
+                        "node_count": len(nodes),
+                        "special": _shared_node_exception(seq_item),
+                    }
+                )
+    return users
+
+
+def _group_node_users_by_design(raw_users):
+    grouped = {}
+    for key, occurrences in raw_users.items():
+        by_design = {}
+        for occurrence in occurrences:
+            di = occurrence["design_index"]
+            entry = by_design.setdefault(di, {"special": False, "occurrences": []})
+            entry["special"] = bool(entry["special"] or occurrence["special"])
+            entry["occurrences"].append(occurrence)
+        grouped[key] = by_design
+    return grouped
+
+
+def _use_map(pending):
+    return {
+        (use.design_index, use.segment_index, use.edge_index): use
+        for use in pending
+    }
+
+
+def _slot_free_for_edge(edge_key, candidate, slot_map, use_lookup, excluded_keys, reserved_by_edge):
+    if candidate in set(reserved_by_edge.get(edge_key, set())):
+        return False
+    for use_key, use in use_lookup.items():
+        if use_key in excluded_keys:
+            continue
+        if use.edge_key == edge_key and int(slot_map.get(use_key, 0)) == int(candidate):
+            return False
+    return True
+
+
+def _enforce_ordinary_node_exclusivity(
+    designs,
+    pending,
+    slot_map,
+    reserved_by_edge,
+    priority_by_design,
+    edge_crs,
+    work_crs,
+    spacing,
+):
+    """Keep ordinary cable routes off a Pole node already used by another Link.
+
+    The preferred Link (global route priority) keeps the node. Lower-priority
+    Links continue on a non-zero lane through that node, then may transition
+    later on the adjacent edge. Explicit FDT/FAT/BB/SFC-CL nodes are exempt.
+    """
+    node_groups = _group_node_users_by_design(
+        _collect_node_users(designs, edge_crs, work_crs)
+    )
+    use_lookup = _use_map(pending)
+    changed = 0
+
+    ordered_nodes = sorted(
+        node_groups.items(),
+        key=lambda item: min(
+            priority_by_design.get(di, (float("inf"), di))[0]
+            for di in item[1]
+        ),
+    )
+
+    for node_key, by_design in ordered_nodes:
+        if len(by_design) <= 1:
+            continue
+
+        keepers = sorted(
+            by_design,
+            key=lambda di: priority_by_design.get(di, (float("inf"), di)),
+        )
+        keeper = keepers[0]
+        for design_index in keepers:
+            info = by_design[design_index]
+            if info.get("special"):
+                continue
+            if design_index == keeper:
+                # The highest-priority ordinary Link is the only one allowed
+                # to occupy the physical Pole node in this group.
+                continue
+
+            internal_occurrences = [
+                occ for occ in info.get("occurrences", [])
+                if 0 < int(occ["node_index"]) < int(occ["node_count"]) - 1
+            ]
+            for occ in internal_occurrences:
+                si = int(occ["segment_index"])
+                ni = int(occ["node_index"])
+                prev_key = (design_index, si, ni - 1)
+                next_key = (design_index, si, ni)
+                prev_use = use_lookup.get(prev_key)
+                next_use = use_lookup.get(next_key)
+                if prev_use is None or next_use is None:
+                    continue
+
+                prev_slot = int(slot_map.get(prev_key, 0))
+                next_slot = int(slot_map.get(next_key, 0))
+                if prev_slot != 0 and next_slot != 0:
+                    continue
+
+                excluded = {prev_key, next_key}
+                candidate_order = []
+                for candidate in (
+                    prev_slot if prev_slot != 0 else None,
+                    next_slot if next_slot != 0 else None,
+                    int(prev_use.slot or 0) if int(prev_use.slot or 0) != 0 else None,
+                    int(next_use.slot or 0) if int(next_use.slot or 0) != 0 else None,
+                ):
+                    if candidate is not None and candidate not in candidate_order:
+                        candidate_order.append(candidate)
+                hint = _base._route_side_hint(
+                    prev_use.start_point,
+                    prev_use.end_point,
+                    *_base._edge_points(prev_use.edge_key),
+                )
+                for candidate in _packed_lane_candidates(hint, limit=12):
+                    if candidate != 0 and candidate not in candidate_order:
+                        candidate_order.append(candidate)
+
+                chosen = None
+                for candidate in candidate_order:
+                    if candidate == 0:
+                        continue
+                    if _slot_free_for_edge(
+                        prev_use.edge_key,
+                        candidate,
+                        slot_map,
+                        use_lookup,
+                        excluded,
+                        reserved_by_edge,
+                    ) and _slot_free_for_edge(
+                        next_use.edge_key,
+                        candidate,
+                        slot_map,
+                        use_lookup,
+                        excluded,
+                        reserved_by_edge,
+                    ):
+                        chosen = int(candidate)
+                        break
+
+                if chosen is None:
+                    # Pick the first lane that is free on both adjacent edges,
+                    # even when the lane index is beyond the usual packed set.
+                    magnitude = 1
+                    sign = 1 if hint >= 0 else -1
+                    while magnitude <= 100:
+                        candidate = sign * magnitude
+                        if (
+                            _slot_free_for_edge(
+                                prev_use.edge_key,
+                                candidate,
+                                slot_map,
+                                use_lookup,
+                                excluded,
+                                reserved_by_edge,
+                            )
+                            and _slot_free_for_edge(
+                                next_use.edge_key,
+                                candidate,
+                                slot_map,
+                                use_lookup,
+                                excluded,
+                                reserved_by_edge,
+                            )
+                        ):
+                            chosen = int(candidate)
+                            break
+                        magnitude += 1
+                    if chosen is None:
+                        continue
+
+                slot_map[prev_key] = chosen
+                slot_map[next_key] = chosen
+                prev_use.slot = chosen
+                next_use.slot = chosen
+                changed += 1
+                _log(
+                    f"[node-exclusive] node={node_key}; design={design_index}; "
+                    f"keeper={keeper}; slot={prev_slot}->{chosen}/{next_slot}->{chosen}; "
+                    "reason=ordinary-node-already-used"
+                )
+
+    return changed
+
+
 def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, counters):
     edge_crs = edge_layer.crs()
     work_crs = _base._choose_work_crs(edge_layer)
@@ -171,6 +421,7 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
 
     existing_index, existing_geometries = _base._build_existing_index(distribution_layer, work_crs)
     reserved_cache = {}
+    reserved_by_edge = {}
     slot_map = {}
 
     for edge_key, users in users_by_edge.items():
@@ -178,6 +429,7 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
             edge_key, edge_crs, work_crs, spacing,
             existing_index, existing_geometries, reserved_cache
         )
+        reserved_by_edge[edge_key] = set(reserved)
         used = set(reserved)
         for use in sorted(
             users,
@@ -199,6 +451,19 @@ def make_global_slot_assigner(designs, distribution_layer, edge_layer, spacing, 
             slot_map[(use.design_index, use.segment_index, use.edge_index)] = int(chosen)
             use.slot = int(chosen)
             used.add(int(chosen))
+
+    node_changes = _enforce_ordinary_node_exclusivity(
+        designs,
+        pending,
+        slot_map,
+        reserved_by_edge,
+        priority_by_design,
+        edge_crs,
+        work_crs,
+        spacing,
+    )
+    if node_changes:
+        _log(f"[node-exclusive] corrected ordinary Pole-node fan-in cases={node_changes}")
 
     def assign(edge_users, edge_reserved, previous_slots):
         counters["edges"] += 1
