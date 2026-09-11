@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
 """Pole Edge cable offset layout using 0.50 m lane spacing.
 
-The active geometry/allocator is v9:
-- main-lane priority follows directional continuity first;
-- same-lane corners stay continuous and parallel;
+The active geometry/allocator is v10:
+- complete-route sequential lane allocation;
+- main lane is preferred whenever it is available;
+- relative lane continuity is preserved across consecutive edges;
+- new cables join existing groups from the outside;
+- ordinary Pole nodes remain exclusive;
 - ordinary corners do NOT use the 0.30 m control distance;
-- 0.30 m is reserved for same-point multi-cable fan-out/takeoff logic
-  (FDT/BB/CL/FAT return), not for normal Pole Edge lane transitions;
-- FAT landing follows the actual final offset Cable geometry.
+- 0.30 m is reserved for explicit same-point multi-cable fan-out/takeoff;
+- FAT landing follows the final geometry of its owning Link.
 """
 
 from qgis.PyQt.QtCore import QSettings
 from qgis.core import QgsMessageLog, Qgis
 
 from . import cable_offset_layout_v3 as _v3
-from . import cable_offset_layout_v9 as _v9
+from . import cable_offset_layout_v10 as _v10
 
 DEFAULT_SPACING_M = 0.5
 DEFAULT_CONTROL_DISTANCE_M = 0.30
@@ -57,7 +59,7 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
     original_base_build = base._build_segment_points
     counters = {"edges": 0, "overlap_edges": 0, "slots": {}}
     try:
-        global_assigner, lane_debug = _v9.make_global_slot_assigner(
+        global_assigner, lane_debug = _v10.make_global_slot_assigner(
             designs, distribution_layer, edge_layer, spacing, counters
         )
         ordered = lane_debug.get("ordered_designs", []) if lane_debug else []
@@ -72,24 +74,18 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
                     f"len={float(route.get('route_length', 0.0)):.1f}m;"
                     f"turns={int(route.get('turn_count', 0))}"
                 )
-            _log("[global-lane-priority-v9] " + ", ".join(route_text))
+            _log("[global-lane-priority-v10] " + ", ".join(route_text))
         _log(
-            f"[global-lane-v9] links={len(ordered)}; "
+            f"[global-lane-v10] links={len(ordered)}; "
             f"mapped_edges={len((lane_debug or {}).get('slot_map', {}))}; "
-            "main_rule=directional_continuity_then_length"
+            "main_rule=available-main-first; route_sequential=ON"
         )
 
         base._assign_slots = global_assigner
-        # v9 now owns ordinary corner geometry and deliberately does not use
-        # control_distance_m for Pole Edge turns.
-        base._build_segment_points = _v9.make_build_wrapper(
+        base._build_segment_points = _v10.make_build_wrapper(
             original_base_build, control_distance_m
         )
 
-        # Do not inject the 0.30 m value into the generic transition factory.
-        # This prevents ordinary Pole Edge corners from being treated as
-        # control-distance lane changes. The 0.30 m value remains available to
-        # dedicated same-point fan-out/takeoff logic (FDT/BB/CL/FAT return).
         original_factory_local = _v3._transition_factory
         try:
             summary = _v3.apply_explicit_layout_to_designs(
@@ -116,6 +112,7 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
         if lane_debug:
             summary["global_lane_priority"] = list(ordered)
             summary["global_lane_slot_map"] = dict(lane_debug.get("slot_map", {}))
+            summary["global_lane_allocator"] = lane_debug.get("allocator_version", "v10")
             summary["global_lane_route_lengths"] = {
                 str(di): round(float(data.get("route_length", 0.0)), 3)
                 for di, data in (lane_debug.get("routes", {}) or {}).items()
@@ -155,8 +152,9 @@ def apply_explicit_layout_to_designs(
     _log(
         f"[rule] spacing={spacing:.3f}m; ordinary_corner_control=NOT_USED; "
         f"same_point_fanout_control={control_distance_m:.3f}m; "
-        "main_lane=directional_continuity; corner=same_lane_continuous; "
-        "lane_change=offset_lane_geometry; fat=actual_offset_geometry"
+        "main_lane=available-main-first; route=sequential-continuity; "
+        "corner=same_lane_continuous; lane_change=conflict_only; "
+        "fat=owning_link_final_geometry"
     )
 
     summary = _apply(
@@ -165,15 +163,18 @@ def apply_explicit_layout_to_designs(
 
     for design in designs or []:
         layout = dict(design.get("layout") or {})
-        layout["version"] = 15
+        layout["version"] = 16
         layout["spacing_m"] = round(spacing, 3)
         layout["corner_control_distance_m"] = round(control_distance_m, 3)
-        layout["rule"] = "global_directional_priority_continuous_lanes"
+        layout["rule"] = "global_route_sequential_relative_lanes"
         layout["transition_angle"] = "geometry_from_offset_lane_spacing"
         layout["corner_geometry"] = "v9_continuous_offset_lanes"
-        layout["main_lane_rule"] = "longest_directional_run_then_route_length"
-        layout["fanout_control_rule"] = "same_point_only"
-        layout["fat_landing"] = "actual_final_offset_cable_geometry"
+        layout["main_lane_rule"] = "available_main_lane_first"
+        layout["lane_continuity_rule"] = "preserve_previous_relative_lane"
+        layout["group_join_rule"] = "new_cable_outside_existing_group"
+        layout["pole_node_rule"] = "one_independent_cable_per_ordinary_pole"
+        layout["fanout_control_rule"] = "same_point_special_nodes_only"
+        layout["fat_landing"] = "owning_link_final_offset_geometry"
         layout.pop("angles_deg", None)
         design["layout"] = layout
 
@@ -181,15 +182,16 @@ def apply_explicit_layout_to_designs(
     summary["corner_control_distance_m"] = control_distance_m
     summary["ordinary_corner_control_distance"] = None
     summary["fanout_control_distance_m"] = control_distance_m
-    summary["transition_rule"] = "offset-lane geometry; no 0.30m ordinary-corner control"
+    summary["transition_rule"] = "continuous relative-lane geometry; no ordinary 0.30m control"
     summary["corner_geometry"] = "v9_continuous_offset_lanes"
-    summary["fat_landing"] = "actual_final_offset_cable_geometry"
+    summary["lane_allocator"] = "v10_route_sequential_main_first"
+    summary["fat_landing"] = "owning_link_final_offset_geometry"
     _log(
         f"[result] changed={summary.get('changed_designs', 0)}; "
         f"extra={summary.get('extra_length_m', 0):.3f}m; "
         "ordinary_corner_control=NOT_USED; "
         f"same_point_fanout_control={control_distance_m:.3f}m; "
-        "main_lane=directional_continuity; fat=actual_offset_geometry"
+        "main_lane=available-main-first; fat=owning-link-final-geometry"
     )
     _log("========== Offset END ==========")
     return summary
