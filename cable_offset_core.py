@@ -25,6 +25,27 @@ from qgis.core import (
 from . import cable_offset_layout as _base
 
 LOG_TAG = "ODN_Tools_Pro / Cable Offset"
+
+
+FAT_TRACE_DESIGN = "DAR436_H1A1"
+FAT_TRACE_LINKS = {"L3", "L4"}
+FAT_TRACE_NODE = "N0020"
+FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"
+
+def _fat_trace_focus(design, feature_name=""):
+    if not isinstance(design, dict):
+        return False
+    link = str(design.get("link", "")).upper().strip()
+    text = " ".join(str(design.get(k, "")) for k in ("name", "fdt", "link")).upper()
+    seq = " ".join(str(x) for x in (design.get("sequence", []) or [])).upper()
+    return (FAT_TRACE_DESIGN in text and link in FAT_TRACE_LINKS and
+            (FAT_TRACE_NODE in seq or FAT_TRACE_FAT in str(feature_name).upper()))
+
+def _fat_trace_point(point):
+    try:
+        return f"({float(point.x()):.6f},{float(point.y()):.6f})"
+    except Exception:
+        return str(point)
 DEFAULT_SPACING_M = 0.50
 DEFAULT_CONTROL_M = 0.30
 DEFAULT_FAT_MAX_DISTANCE_M = 3.0
@@ -776,8 +797,13 @@ def _geometry(segment, slot_by_edge, spacing, work, edge_crs, control):
             # position.  A special endpoint is allowed to finish at the node.
             if special_end:
                 add(b)
+                if segment.get("_fat_trace_design"):
+                    _log(f"[FAT-TRACE][GEOMETRY-END] segment={segment.get('_fat_trace_segment_index')}; slot={slot}; special_end=TRUE; endpoint=PHYSICAL_NODE; node={_fat_trace_point(b)}")
             else:
-                add(_offset_lane_point(b, direction, slot, spacing))
+                endpoint = _offset_lane_point(b, direction, slot, spacing)
+                add(endpoint)
+                if segment.get("_fat_trace_design"):
+                    _log(f"[FAT-TRACE][GEOMETRY-END] segment={segment.get('_fat_trace_segment_index')}; slot={slot}; special_end=FALSE; endpoint=OFFSET_LANE; node={_fat_trace_point(b)}; endpoint={_fat_trace_point(endpoint)}")
 
     add(old[-1])
     segment["_corner_decisions"] = list(corner_decisions)
@@ -883,6 +909,8 @@ def _fat_target(ref, design, feature, fat_layer, edge_crs, work):
     nearest = _nearest_on_route(design, anchor, edge_crs, work)
     if nearest is None:
         return None, anchor, {"reason": "无法从最终 Offset Cable 几何确定 FAT 落点"}
+    if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):
+        _log(f"[FAT-TRACE][TARGET] link={design.get('link','')}; feature_id={feature.id()}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; seq_pos={position}; anchor={_fat_trace_point(anchor)}; segment={nearest[1]}; distance={nearest[0]:.6f}; target={_fat_trace_point(nearest[2])}")
     return nearest[2], anchor, {
         "segment_index": nearest[1],
         "distance": nearest[0],
@@ -924,6 +952,9 @@ def _prepare_fat_moves(designs, fat_layer, edge_layer, work, fat_limit):
             edge_crs,
             work,
         )
+        trace_design = designs[reference["design_index"]]
+        if _fat_trace_focus(trace_design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):
+            _log(f"[FAT-TRACE][DECISION] feature_id={feature_id}; link={trace_design.get('link','')}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; target={_fat_trace_point(target) if target else 'None'}; info={info}")
         if target is None or anchor is None:
             stats["skipped"] += 1
             continue
@@ -939,6 +970,8 @@ def _prepare_fat_moves(designs, fat_layer, edge_layer, work, fat_limit):
 
         target_edge = _tp(target, work, edge_crs)
         target_layer = _tp(target_edge, edge_crs, fat_layer.crs())
+        if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):
+            _log(f"[FAT-TRACE][MOVE-PREP] feature_id={feature_id}; link={design.get('link','')}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; target_edge={_fat_trace_point(target_edge)}; target_layer={_fat_trace_point(target_layer)}; anchor_distance={anchor_distance:.6f}; move_distance={hypot(current.x()-target.x(), current.y()-target.y()):.6f}; accepted=YES")
         moves[feature_id] = {
             "design_index": reference["design_index"],
             "sequence_pos": reference["sequence_pos"],
@@ -1071,10 +1104,13 @@ def apply_offset_layout(
         if design.get("written") and not design.get("needs_resync"):
             continue
 
+        trace_design = _fat_trace_focus(design)
         new_segments = []
         total = 0.0
         different = False
         for segment_index, segment in enumerate(design.get("segments", []) or []):
+            segment["_fat_trace_design"] = bool(trace_design)
+            segment["_fat_trace_segment_index"] = segment_index
             edge_count = len(segment.get("edge_sequence", []) or [])
             by_edge = {
                 index: slot_map.get((design_index, segment_index, index), 0)
@@ -1093,6 +1129,8 @@ def apply_offset_layout(
                 edge_crs,
                 control_distance_m,
             )
+            if trace_design:
+                _log(f"[FAT-TRACE][FINAL-GEOMETRY] link={design.get('link','')}; segment={segment_index}; seq={design.get('sequence', [])}; slots={by_edge}; first={_fat_trace_point(new_points[0]) if new_points else 'None'}; last={_fat_trace_point(new_points[-1]) if new_points else 'None'}; corners={segment.get('_corner_decisions', [])}")
             copied = dict(segment)
             if len(new_points) >= 2:
                 geometry = QgsGeometry.fromPolylineXY(new_points)
