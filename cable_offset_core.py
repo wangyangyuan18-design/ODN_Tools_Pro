@@ -112,7 +112,12 @@ def _node_users(designs,edge_crs,work):
             nodes=_base._extract_route_graph_nodes(s,work,edge_crs,edge_crs)
             if len(nodes)!=len(edges)+1:continue
             for ni,p in enumerate(nodes):
+                # Only sequence endpoints are Cable landings. Intermediate
+                # graph nodes are merely passed-through Pole vertices and MUST
+                # NOT be treated as independent Cable connections.
                 item=ids[si] if ni==0 and si<len(ids) else ids[si+1] if ni==len(nodes)-1 and si+1<len(ids) else None
+                if item is None:
+                    continue
                 out.setdefault(_node_key(p),[]).append({"design_index":di,"segment_index":si,"node_index":ni,"node_count":len(nodes),"special":_shared_node(item),"kind":_kind(item)})
     return out
 
@@ -178,13 +183,8 @@ def _plan(designs,dc,edge_layer,spacing):
 
     for e,uses in uses_by_edge.items():
         used=set(reserved(e))
-        # Existing slot 0 means the edge already has its one main occupant.
         main_taken=0 in used
         ordered_uses=sorted(uses,key=lambda u:(rank.get(u.design_index,999999),u.segment_index,u.edge_index))
-
-        # Prefer the cable that was already on slot 0 on the previous edge.
-        # This preserves the same-route primary position through continuous
-        # shared routes. Otherwise the highest-priority route becomes primary.
         primary=None
         if not main_taken:
             for u in ordered_uses:
@@ -201,10 +201,6 @@ def _plan(designs,dc,edge_layer,spacing):
             used.add(0)
             edge_group_slots[e].append(0)
 
-        # Assign the remaining cables. A continuing cable keeps its previous
-        # slot when possible. If that slot conflicts with the primary or an
-        # existing cable, move only outward; never insert a new cable between
-        # existing group members.
         for u in ordered_uses:
             key=(u.design_index,u.segment_index,u.edge_index)
             if key in assigned:continue
@@ -228,9 +224,6 @@ def _plan(designs,dc,edge_layer,spacing):
         for u in ordered_uses:
             key=(u.design_index,u.segment_index,u.edge_index);chosen=int(assigned[key]);slots[key]=chosen;u.slot=chosen
 
-        # Hard assertion/logging for the engineering invariant. If an existing
-        # cable occupies slot 0, it is the sole main occupant. Otherwise exactly
-        # one planned cable must be slot 0 whenever this edge has a planned use.
         planned_zero=sum(1 for u in ordered_uses if slots.get((u.design_index,u.segment_index,u.edge_index))==0)
         if not main_taken and ordered_uses and planned_zero!=1:
             raise RuntimeError(f"Offset Core: Pole Edge main-lane invariant violated for edge {e}: planned_zero={planned_zero}")
@@ -419,5 +412,5 @@ def apply_offset_layout(designs,distribution_layer,edge_layer,spacing=DEFAULT_SP
         d["source_crs"]=edge_crs.authid();d["layout"]={"version":23,"engine":"OffsetCore","work_crs":work.authid(),"spacing_m":round(spacing,3),"fanout_control_distance_m":round(control_distance_m,3),"main_lane":"exactly_one_primary_slot0_per_edge","lane":"relative_position_continuity_group_outside","pole":"one_independent_cable_landing","corner":"continuous_offset","takeoff":"special_endpoint_only","fat":"owning_link_final_geometry"}
     moves,stats=_prepare_fat_moves(designs,fat_layer,edge_layer,work,fat_max_distance_m) if fat_layer is not None else ({},{"total":0,"skipped":0,"corner":0,"straight":0});endpoint_updates=_replace_fat_endpoints(designs,moves,edge_crs) if moves else 0;_validate(designs,edge_crs,work)
     summary={"changed_designs":len(changed),"changed_indices":sorted(changed),"spacing_m":spacing,"extra_length_m":round(extra,3),"version":23,"work_crs":work.authid(),"lane_allocator":"OffsetCore","priority":ordered,"slot_map":{str(k):int(v) for k,v in slot_map.items()},"corner_geometry":"continuous_offset","fanout_control_distance_m":control_distance_m,"fat_moves":moves,"fat_total":stats["total"],"fat_skipped":stats["skipped"],"fat_corner":stats["corner"],"fat_straight":stats["straight"],"fat_endpoint_updates":endpoint_updates,"fat_max_distance_m":float(fat_max_distance_m)}
-    _log(f"[OffsetCore] links={len(ordered)}; changed={len(changed)}; spacing={spacing:.3f}m; control={control_distance_m:.3f}m; main=EXACTLY_ONE_SLOT0_PER_EDGE; relative=GROUP_CONTINUITY; ordinary_corner_control=NOT_USED; fat={stats['total']}; fat_skipped={stats['skipped']}")
+    _log(f"[OffsetCore] links={len(ordered)}; changed={len(changed)}; spacing={spacing:.3f}m; control={control_distance_m:.3f}m; main=EXACTLY_ONE_SLOT0_PER_EDGE; relative=GROUP_CONTINUITY; ordinary_corner_control=NOT_USED; fat={stats['total']}; fat_skipped={stats['fat_skipped'] if False else stats['skipped']}")
     return summary
