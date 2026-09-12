@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - '.github/workflows/build-qgis-plugin.yml'
       - 'ODN_Tools_Pro.zip'
       - 'ODN_Tools_Pro-QGIS-Plugin.ZIP'
   workflow_dispatch:
