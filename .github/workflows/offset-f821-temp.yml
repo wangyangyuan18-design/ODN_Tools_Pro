@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Repair and F821
         run: |
-          sed -i '973s/\bdesign\b/trace_design/g;974s/\bdesign\b/trace_design/g' cable_offset_core.py
+          sed -i '912s/\btrace_design\b/design/g;973s/\bdesign\b/trace_design/g;974s/\bdesign\b/trace_design/g' cable_offset_core.py
           python -m py_compile cable_offset_core.py
           python -m pip install --disable-pip-version-check -q ruff
           ruff check --select F821 --output-format=concise .
