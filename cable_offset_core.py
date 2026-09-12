@@ -17,7 +17,7 @@ DEFAULT_CONTROL_M=.30
 DEFAULT_FAT_MAX_DISTANCE_M=3.0
 SPACING_KEY="ODNToolsPro/CableOffsetLayout/spacing_m"
 CONTROL_DISTANCE_KEY="ODNToolsPro/CableOffsetLayout/control_distance_m"
-SHARED_NODE_TYPES={"FDT","BB","CL","CLOSURE","SFCCL","SFCCLOSURE"}
+SHARED_NODE_TYPES={"FDT","BB","CL","CLOSURE","SFCCL","SFCCLOSURE","FATRETURN"}
 ENDPOINT_TYPES=SHARED_NODE_TYPES|{"FAT"}
 
 def _log(message,level=Qgis.Info):
@@ -36,9 +36,13 @@ def save_settings(spacing,control_distance):
 
 def _kind(item): return "".join(ch for ch in str(item[0]).strip().upper() if ch.isalnum()) if item else ""
 def _shared_node(item):
-    k=_kind(item);return k in SHARED_NODE_TYPES or (k.startswith("SFC") and ("CL" in k or "CLOSURE" in k))
+    k=_kind(item)
+    return (k.startswith("FDT") or k.startswith("BB") or k in {"CL","CLOSURE"}
+            or k.startswith("SFCCL") or k.startswith("SFCCLOSURE")
+            or k.startswith("FATRETURN"))
 def _endpoint_special(item):
-    k=_kind(item);return k in ENDPOINT_TYPES or (k.startswith("SFC") and ("CL" in k or "CLOSURE" in k))
+    k=_kind(item)
+    return _shared_node(item) or k.startswith("FAT")
 def _metric_crs(edge,dc=None):
     for layer in (dc,edge):
         if layer is None: continue
@@ -112,8 +116,32 @@ def _node_users(designs,edge_crs,work):
                 out.setdefault(_node_key(p),[]).append({"design_index":di,"segment_index":si,"node_index":ni,"node_count":len(nodes),"special":_shared_node(item),"kind":_kind(item)})
     return out
 
+def _validate_pole_exclusivity(designs,edge_crs,work):
+    """Hard rule 1: an ordinary Pole may have only one independent cable landing.
+
+    Shared landing is allowed only at FDT, FAT Return, BB and SFC/CL nodes.
+    The check is endpoint/landing based; merely passing through an ordinary Pole
+    is not treated as a second cable landing.
+    """
+    conflicts=[]
+    for key,items in _node_users(designs,edge_crs,work).items():
+        ordinary=[x for x in items if not x["special"]]
+        independent={x["design_index"] for x in ordinary}
+        if len(independent)>1:
+            conflicts.append((key,sorted(independent),ordinary))
+    if conflicts:
+        details=[]
+        for key,design_ids,items in conflicts[:20]:
+            labels=[]
+            for di in design_ids:
+                d=designs[di] if 0<=di<len(designs) else {}
+                labels.append(str(d.get("_link_id",d.get("name",di))))
+            details.append(f"node={key}; links={labels}")
+        raise RuntimeError("Offset Core: 普通 Pole 只允许 1 条独立 Cable 连接；发现共点冲突："+" | ".join(details))
+
 def _plan(designs,dc,edge_layer,spacing):
     edge_crs=edge_layer.crs();work=_metric_crs(edge_layer,dc);pending,routes=_collect_uses(designs,edge_crs,work)
+    _validate_pole_exclusivity(designs,edge_crs,work)
     ordered=sorted(routes,key=lambda d:(-float(routes[d].get("priority_score",0)),-float(routes[d].get("longest_directional_run",0)),-float(routes[d].get("route_length",0)),int(d)))
     occ=_occupancy(dc,designs,work);idx,geoms=_base._build_existing_index(occ,work)
     reserved_cache={};used_by_edge={};slots={};route_uses={d:[] for d in ordered}
