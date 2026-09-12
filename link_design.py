@@ -20,6 +20,10 @@ from .link_design_core import (
     LinkDesignController,
 )
 
+# Install the final relative-lane compression policy after the authoritative
+# OffsetCore module has been loaded. Corner D/E/F geometry is not modified.
+from . import cable_offset_lane_allocator  # noqa: F401,E402
+
 __all__ = [
     "LinkDesignDock",
     "LinkDesignCore",
