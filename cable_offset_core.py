@@ -27,10 +27,11 @@ from . import cable_offset_layout as _base
 LOG_TAG = "ODN_Tools_Pro / Cable Offset"
 
 
-FAT_TRACE_DESIGN = "DAR436_H1A1"
+FAT_TRACE_DESIGN = "DAR463_H1A1"
 FAT_TRACE_LINKS = {"L3", "L4"}
 FAT_TRACE_NODE = "N0020"
 FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"
+FAT_TRACE_FAT_POINT = (-6.924924275, 39.455387000)
 
 def _fat_trace_focus(design, feature_name=""):
     if not isinstance(design, dict):
