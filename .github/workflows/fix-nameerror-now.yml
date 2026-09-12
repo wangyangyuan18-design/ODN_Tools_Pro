@@ -1,0 +1,39 @@
+name: Fix FAT trace NameError
+on:
+  push:
+    paths:
+      - 'OFFSET_NAMEERROR_TRIGGER.md'
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fix undefined design reference
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('cable_offset_core.py')
+          s = p.read_text(encoding='utf-8')
+          old = 'if _fat_trace_focus(trace_design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):'
+          new = 'if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):'
+          if old not in s:
+              raise SystemExit('expected NameError line not found')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          PY
+          python -m py_compile cable_offset_core.py
+      - name: F821 check
+        run: |
+          python -m pip install --disable-pip-version-check -q ruff
+          ruff check --select F821 --output-format=concise .
+      - name: Commit and cleanup
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add cable_offset_core.py
+          git rm -f .github/workflows/fix-nameerror-now.yml OFFSET_NAMEERROR_TRIGGER.md
+          git commit -m 'fix: remove FAT trace NameError in Offset Core'
+          git push
