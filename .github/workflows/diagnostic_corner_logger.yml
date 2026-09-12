@@ -13,55 +13,102 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Patch diagnostic logging
+      - name: Patch targeted diagnostics
         shell: python
         run: |
           from pathlib import Path
           p = Path('cable_offset_core.py')
           s = p.read_text(encoding='utf-8')
 
-          marker = 'def _corner_debug_point(point):\n'
+          old = '    QgsVectorLayer,\n    Qgis,\n)'
+          new = '    QgsVectorLayer,\n    QgsProject,\n    Qgis,\n)'
+          if old not in s:
+              raise SystemExit('QgsProject import anchor not found')
+          s = s.replace(old, new, 1)
+
+          marker = '\n\ndef _corner_debug_point(point):\n'
+          helper = r'''
+
+# Temporary targeted diagnostics for the current Corner investigation.
+_TARGET_DEBUG_LINKS = {
+    "FTTx DAR436_H1A1 L4": ("New Pole", "N0077", "Existing Pole", "E1002"),
+    "FTTx DAR436_H1A1 L3": ("New Pole", "N0020", "Existing Pole", "E0814"),
+}
+
+
+def _debug_find_pole_point(layer_name, name_value, work_crs):
+    wanted = str(layer_name).strip().casefold()
+    for layer in QgsProject.instance().mapLayers().values():
+        try:
+            if layer.name().strip().casefold() != wanted:
+                continue
+            name_idx = layer.fields().indexOf("Name")
+            if name_idx < 0:
+                continue
+            for feature in layer.getFeatures():
+                if str(feature.attribute(name_idx)).strip() != str(name_value).strip():
+                    continue
+                geom = feature.geometry()
+                if geom.isEmpty():
+                    continue
+                point = geom.asPoint() if geom.type() == 0 else geom.centroid().asPoint()
+                return _tp(QgsPointXY(point), layer.crs(), work_crs)
+        except Exception:
+            continue
+    return None
+
+
+def _debug_target_edge(edge, link_name, work_crs):
+    target = _TARGET_DEBUG_LINKS.get(str(link_name).strip())
+    if not target:
+        return False, ""
+    layer_a, name_a, layer_b, name_b = target
+    pa = _debug_find_pole_point(layer_a, name_a, work_crs)
+    pb = _debug_find_pole_point(layer_b, name_b, work_crs)
+    if pa is None or pb is None:
+        return False, (
+            f"target_poles={layer_a}:{name_a}->{layer_b}:{name_b}; "
+            f"pole_lookup=FAILED; edge_id={edge[0]}"
+        )
+    ea, eb = _edge_points_work(edge)
+    tol = 0.10
+    direct = (
+        hypot(ea.x() - pa.x(), ea.y() - pa.y()) <= tol
+        and hypot(eb.x() - pb.x(), eb.y() - pb.y()) <= tol
+    )
+    reverse = (
+        hypot(ea.x() - pb.x(), ea.y() - pb.y()) <= tol
+        and hypot(eb.x() - pa.x(), eb.y() - pa.y()) <= tol
+    )
+    matched = direct or reverse
+    detail = (
+        f"target_poles={layer_a}:{name_a}->{layer_b}:{name_b}; "
+        f"edge_id={edge[0]}; match={matched}; "
+        f"edge_a={_corner_debug_point(ea)}; edge_b={_corner_debug_point(eb)}; "
+        f"pole_a={_corner_debug_point(pa)}; pole_b={_corner_debug_point(pb)}; tol={tol:.2f}m"
+    )
+    return matched, detail
+'''
           if marker not in s:
-              anchor = 'def _safe_unit(a, b):\n'
-              helper = '''def _corner_debug_point(point):\n    try:\n        return f"({float(point.x()):.6f},{float(point.y()):.6f})"\n    except Exception:\n        return str(point)\n\n\ndef _corner_debug_points(points):\n    return "[" + ", ".join(_corner_debug_point(point) for point in (points or [])) + "]"\n\n\n'''
-              if anchor not in s:
-                  raise SystemExit('diagnostic anchor not found')
-              s = s.replace(anchor, helper + anchor, 1)
+              raise SystemExit('corner debug marker not found')
+          s = s.replace(marker, helper + marker, 1)
 
-          old = '''    main_anchor = _point_back(node, in_dir, run_in)\n    main_after = _point_forward(node, out_dir, run_out)\n    target_after = _offset_lane_point(main_after, out_dir, next_slot, spacing)\n\n    # Preserve the Main Lane as a visible short approach before the lane change.\n    # The physical Pole is never inserted as an intermediate geometry vertex.\n    return [main_anchor, target_after]\n'''
-          new = '''    main_anchor = _point_back(node, in_dir, run_in)\n    main_after = _point_forward(node, out_dir, run_out)\n    target_after = _offset_lane_point(main_after, out_dir, next_slot, spacing)\n\n    _log(\n        f"[corner-debug] MAIN_REACH; spacing={float(spacing):.3f}; "\n        f"prev_slot={int(prev_slot)}; next_slot={int(next_slot)}; "\n        f"run_in={float(run_in):.3f}; run_out={float(run_out):.3f}; "\n        f"node={_corner_debug_point(node)}; "\n        f"main_anchor={_corner_debug_point(main_anchor)}; "\n        f"main_after={_corner_debug_point(main_after)}; "\n        f"target_after={_corner_debug_point(target_after)}"\n    )\n\n    # Preserve the Main Lane as a visible short approach before the lane change.\n    # The physical Pole is never inserted as an intermediate geometry vertex.\n    return [main_anchor, target_after]\n'''
+          old = '''            decision, corner_points = _build_corner_geometry(\n                b,\n                edges[edge_index],\n                edges[edge_index + 1],\n                slot,\n                next_slot,\n                spacing,\n                return_context=bool(segment.get("_odn_return_end")) and edge_index + 1 == len(slots) - 1,\n            )'''
+          new = '''            link_name = str(segment.get("name", "")).strip()\n            target_edge_match, target_edge_detail = _debug_target_edge(\n                edges[edge_index], link_name, work\n            )\n            target_next_match, target_next_detail = _debug_target_edge(\n                edges[edge_index + 1], link_name, work\n            )\n            decision, corner_points = _build_corner_geometry(\n                b,\n                edges[edge_index],\n                edges[edge_index + 1],\n                slot,\n                next_slot,\n                spacing,\n                return_context=bool(segment.get("_odn_return_end")) and edge_index + 1 == len(slots) - 1,\n            )\n            if link_name in _TARGET_DEBUG_LINKS and (target_edge_match or target_next_match or slot != next_slot):\n                _log(\n                    f"[TARGET-CORNER] link={link_name}; edge={edge_index}; "\n                    f"prev_slot={slot}; next_slot={next_slot}; decision={decision}; "\n                    f"node={_corner_debug_point(b)}; spacing={float(spacing):.3f}; "\n                    f"corner_points={_corner_debug_points(corner_points)}"\n                )\n                if target_edge_detail:\n                    _log(f"[TARGET-CORNER] incoming-edge {target_edge_detail}")\n                if target_next_detail:\n                    _log(f"[TARGET-CORNER] outgoing-edge {target_next_detail}")\n                _log(\n                    f"[TARGET-CORNER] incoming_edge_raw={edges[edge_index]}; "\n                    f"outgoing_edge_raw={edges[edge_index + 1]}"\n                )'''
           if old not in s:
-              raise SystemExit('MAIN_REACH block not found')
-          s = s.replace(old, new, 1)
-
-          old = '''    incoming = _offset_lane_point(_point_back(node, in_dir, cross_run), in_dir, prev_slot, spacing)\n    main_hold = _point_forward(node, out_dir, hold_run)\n    target = _offset_lane_point(_point_forward(node, out_dir, turn_run), out_dir, next_slot, spacing)\n\n    return [incoming, main_hold, target]\n'''
-          new = '''    incoming = _offset_lane_point(_point_back(node, in_dir, cross_run), in_dir, prev_slot, spacing)\n    main_hold = _point_forward(node, out_dir, hold_run)\n    target = _offset_lane_point(_point_forward(node, out_dir, turn_run), out_dir, next_slot, spacing)\n\n    _log(\n        f"[corner-debug] CROSS_MAIN; spacing={float(spacing):.3f}; "\n        f"prev_slot={int(prev_slot)}; next_slot={int(next_slot)}; "\n        f"magnitude={float(magnitude):.3f}; cross_run={float(cross_run):.3f}; "\n        f"hold_run={float(hold_run):.3f}; turn_run={float(turn_run):.3f}; "\n        f"node={_corner_debug_point(node)}; "\n        f"incoming={_corner_debug_point(incoming)}; "\n        f"main_hold={_corner_debug_point(main_hold)}; "\n        f"target={_corner_debug_point(target)}"\n    )\n\n    return [incoming, main_hold, target]\n'''
-          if old not in s:
-              raise SystemExit('CROSS_MAIN block not found')
-          s = s.replace(old, new, 1)
-
-          old = '''    return decision, points\n'''
-          new = '''    _log(\n        f"[corner-debug] BUILT; decision={decision}; "\n        f"prev_slot={int(prev_slot)}; next_slot={int(next_slot)}; "\n        f"node={_corner_debug_point(node)}; points={_corner_debug_points(points)}"\n    )\n    return decision, points\n'''
-          if old not in s:
-              raise SystemExit('build return not found')
-          s = s.replace(old, new, 1)
-
-          old = '''            _log(\n                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "\n                f"prev_slot={slot}; next_slot={next_slot}; decision={decision}"\n            )\n'''
-          new = '''            _log(\n                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "\n                f"prev_slot={slot}; next_slot={next_slot}; decision={decision}"\n            )\n            _log(\n                f"[corner-debug] FINAL-CORNER; link={segment.get('name', '')}; "\n                f"edge={edge_index}; decision={decision}; "\n                f"points={_corner_debug_points(corner_points)}"\n            )\n'''
-          if old not in s:
-              raise SystemExit('geometry corner log not found')
+              raise SystemExit('geometry call block not found')
           s = s.replace(old, new, 1)
 
           p.write_text(s, encoding='utf-8')
-          print('diagnostic patch applied')
+          print('targeted diagnostic patch applied')
 
       - name: Commit patched core and remove temporary workflow
-        env:
-          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add cable_offset_core.py
-          git commit -m "debug: trace selected cable corner geometry" || true
+          git commit -m "debug: target L3 L4 corner geometry" || true
+          git rm .github/workflows/diagnostic_corner_logger.yml
+          git commit -m "chore: remove temporary corner diagnostic workflow"
           git push
