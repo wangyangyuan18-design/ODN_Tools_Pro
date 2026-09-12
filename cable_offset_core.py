@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """Authoritative ODN cable offset engine.
 
-Only offset planning/geometry implementation for Distribution Cable and final
-FAT landing points. Link topology remains authoritative.
+Global lane planning and final geometry for Distribution Cable/FAT landing.
 """
 from math import acos, degrees, hypot, tan, radians
 from qgis.PyQt.QtCore import QSettings
 from qgis.core import (QgsCoordinateReferenceSystem, QgsFeature, QgsGeometry,
-    QgsMessageLog, QgsPointXY, QgsProject, QgsSpatialIndex, QgsUnitTypes,
-    QgsVectorLayer, Qgis)
+    QgsMessageLog, QgsPointXY, QgsSpatialIndex, QgsUnitTypes, QgsVectorLayer, Qgis)
 from . import cable_offset_layout as _base
 
 LOG_TAG="ODN_Tools_Pro / Cable Offset"
@@ -38,8 +36,7 @@ def _kind(item): return "".join(ch for ch in str(item[0]).strip().upper() if ch.
 def _shared_node(item):
     k=_kind(item)
     return (k.startswith("FDT") or k.startswith("BB") or k in {"CL","CLOSURE"}
-            or k.startswith("SFCCL") or k.startswith("SFCCLOSURE")
-            or k.startswith("FATRETURN"))
+            or k.startswith("SFCCL") or k.startswith("SFCCLOSURE") or k.startswith("FATRETURN"))
 def _endpoint_special(item):
     k=_kind(item)
     return _shared_node(item) or k.startswith("FAT")
@@ -112,152 +109,98 @@ def _node_users(designs,edge_crs,work):
             nodes=_base._extract_route_graph_nodes(s,work,edge_crs,edge_crs)
             if len(nodes)!=len(edges)+1:continue
             for ni,p in enumerate(nodes):
-                # Only sequence endpoints are Cable landings. Intermediate
-                # graph nodes are merely passed-through Pole vertices and MUST
-                # NOT be treated as independent Cable connections.
                 item=ids[si] if ni==0 and si<len(ids) else ids[si+1] if ni==len(nodes)-1 and si+1<len(ids) else None
-                if item is None:
-                    continue
+                if item is None: continue
                 out.setdefault(_node_key(p),[]).append({"design_index":di,"segment_index":si,"node_index":ni,"node_count":len(nodes),"special":_shared_node(item),"kind":_kind(item)})
     return out
 
 def _validate_pole_exclusivity(designs,edge_crs,work):
-    """Hard rule 1: an ordinary Pole may have only one independent cable landing.
-
-    Shared landing is allowed only at FDT, FAT Return, BB and SFC/CL nodes.
-    The check is endpoint/landing based; merely passing through an ordinary Pole
-    is not treated as a second cable landing.
-    """
     conflicts=[]
     for key,items in _node_users(designs,edge_crs,work).items():
-        ordinary=[x for x in items if not x["special"]]
-        independent={x["design_index"] for x in ordinary}
-        if len(independent)>1:
-            conflicts.append((key,sorted(independent),ordinary))
+        ordinary=[x for x in items if not x["special"]];independent={x["design_index"] for x in ordinary}
+        if len(independent)>1: conflicts.append((key,sorted(independent)))
     if conflicts:
         details=[]
-        for key,design_ids,items in conflicts[:20]:
-            labels=[]
-            for di in design_ids:
-                d=designs[di] if 0<=di<len(designs) else {}
-                labels.append(str(d.get("_link_id",d.get("name",di))))
+        for key,design_ids in conflicts[:20]:
+            labels=[str(designs[di].get("_link_id",designs[di].get("name",di))) for di in design_ids if 0<=di<len(designs)]
             details.append(f"node={key}; links={labels}")
         raise RuntimeError("Offset Core: 普通 Pole 只允许 1 条独立 Cable 连接；发现共点冲突："+" | ".join(details))
 
 def _plan(designs,dc,edge_layer,spacing):
+    """Global lane allocation; preserve Main Lane, Relative Position and Group Outside."""
     edge_crs=edge_layer.crs();work=_metric_crs(edge_layer,dc);pending,routes=_collect_uses(designs,edge_crs,work)
     _validate_pole_exclusivity(designs,edge_crs,work)
     ordered=sorted(routes,key=lambda d:(-float(routes[d].get("priority_score",0)),-float(routes[d].get("longest_directional_run",0)),-float(routes[d].get("route_length",0)),int(d)))
+    rank={d:i for i,d in enumerate(ordered)}
     occ=_occupancy(dc,designs,work);idx,geoms=_base._build_existing_index(occ,work)
-    reserved_cache={};used_by_edge={};slots={};route_uses={d:[] for d in ordered}
-    for u in pending:route_uses.setdefault(u.design_index,[]).append(u)
-    rank={d:i for i,d in enumerate(ordered)};owners={}
-    for key,items in _node_users(designs,edge_crs,work).items():
-        ordinary=[x for x in items if not x["special"]]
-        if ordinary:owners[key]=min(ordinary,key=lambda x:rank.get(x["design_index"],999999))["design_index"]
+    reserved_cache={};slots={};edge_group_slots={};uses_by_edge={}
+    for u in pending:
+        uses_by_edge.setdefault(u.edge_key,[]).append(u);edge_group_slots.setdefault(u.edge_key,[])
+    for uses in uses_by_edge.values(): uses.sort(key=lambda u:(rank.get(u.design_index,999999),u.segment_index,u.edge_index))
     def reserved(e):
         if e not in reserved_cache:
             a,b=_base._edge_points(e);a,b=_tp(a,edge_crs,work),_tp(b,edge_crs,work)
             reserved_cache[e]=_base._existing_slot_occupancy(QgsGeometry.fromPolylineXY([a,b]),spacing,idx,geoms)
         return set(reserved_cache[e])
-
-    # 6-7 invariant:
-    # For every traversed Pole Edge, if an existing independent cable does not
-    # already occupy the main lane, exactly ONE planned cable occupies slot 0.
-    # The primary cable is kept as the same route continues; other cables keep
-    # their relative side/ordering and are added from the outside.
-    edge_group_slots={}
-    for e in {u.edge_key for u in pending}:
-        edge_group_slots[e]=[]
-
-    for di in ordered:
-        prev_by_seg={}
-        for u in sorted(route_uses.get(di,[]),key=lambda x:(x.segment_index,x.edge_index)):
-            prev_by_seg[u.segment_index]=u
-
-    # Process each edge as a group, not cable-by-cable. This is essential for
-    # the "exactly one slot 0" invariant.
-    uses_by_edge={}
-    for u in pending:
-        uses_by_edge.setdefault(u.edge_key,[]).append(u)
-
-    for e,uses in uses_by_edge.items():
-        used=set(reserved(e))
-        main_taken=0 in used
-        ordered_uses=sorted(uses,key=lambda u:(rank.get(u.design_index,999999),u.segment_index,u.edge_index))
-        primary=None
+    def edge_order_key(e):
+        return min((rank.get(u.design_index,999999),u.segment_index,u.edge_index) for u in uses_by_edge[e])
+    slot_changes=0;continuity_preserved=0
+    for e in sorted(uses_by_edge,key=edge_order_key):
+        uses=uses_by_edge[e];used=set(reserved(e));main_taken=0 in used;assigned={};primary=None
         if not main_taken:
-            for u in ordered_uses:
-                prev_key=(u.design_index,u.segment_index,u.edge_index-1)
-                if u.edge_index>0 and slots.get(prev_key)==0:
+            for u in uses:
+                if u.edge_index>0 and slots.get((u.design_index,u.segment_index,u.edge_index-1))==0:
                     primary=u;break
-            if primary is None:
-                primary=ordered_uses[0] if ordered_uses else None
-
-        assigned={}
-        if primary is not None and not main_taken:
-            key=(primary.design_index,primary.segment_index,primary.edge_index)
-            assigned[key]=0
-            used.add(0)
-            edge_group_slots[e].append(0)
-
-        for u in ordered_uses:
+            if primary is None and uses: primary=uses[0]
+        if primary is not None:
+            key=(primary.design_index,primary.segment_index,primary.edge_index);assigned[key]=0;used.add(0);edge_group_slots[e].append(0)
+        for u in uses:
             key=(u.design_index,u.segment_index,u.edge_index)
-            if key in assigned:continue
+            if key in assigned: continue
             prev=slots.get((u.design_index,u.segment_index,u.edge_index-1)) if u.edge_index>0 else None
-            if prev is not None and int(prev) not in used:
-                chosen=int(prev)
+            if prev is not None and prev not in used:
+                chosen=int(prev);continuity_preserved+=1
             else:
-                sign=1 if u.side_hint>=0 else -1
-                occupied_group=set(edge_group_slots[e])
+                sign=1 if u.side_hint>=0 else -1;occupied_group=set(edge_group_slots[e]);chosen=None
                 start=max(1,max([abs(int(x)) for x in used|occupied_group]+[0])+1)
-                chosen=None
                 for mag in range(start,101):
                     for cand in (sign*mag,-sign*mag):
-                        if cand not in used and cand not in occupied_group:
-                            chosen=cand;break
+                        if cand not in used and cand not in occupied_group: chosen=cand;break
                     if chosen is not None:break
-                if chosen is None:
-                    chosen=(max([abs(int(x)) for x in used|occupied_group]+[0])+1)*sign
+                if chosen is None: chosen=(max([abs(int(x)) for x in used|occupied_group]+[0])+1)*sign
             assigned[key]=int(chosen);used.add(int(chosen));edge_group_slots[e].append(int(chosen))
-
-        for u in ordered_uses:
-            key=(u.design_index,u.segment_index,u.edge_index);chosen=int(assigned[key]);slots[key]=chosen;u.slot=chosen
-
-        planned_zero=sum(1 for u in ordered_uses if slots.get((u.design_index,u.segment_index,u.edge_index))==0)
-        if not main_taken and ordered_uses and planned_zero!=1:
-            raise RuntimeError(f"Offset Core: Pole Edge main-lane invariant violated for edge {e}: planned_zero={planned_zero}")
-        if main_taken and planned_zero:
-            raise RuntimeError(f"Offset Core: Pole Edge has duplicate main-lane ownership for edge {e}")
-
-    _log(f"[route-plan] links={len(ordered)}; main=EXACTLY_ONE_SLOT0_PER_EDGE; continuity=RELATIVE_POSITION; group-outside=ON; pole-exclusivity=ON")
+        for u in uses:
+            key=(u.design_index,u.segment_index,u.edge_index);slots[key]=int(assigned[key]);u.slot=int(assigned[key])
+            if u.edge_index>0:
+                prev=slots.get((u.design_index,u.segment_index,u.edge_index-1))
+                if prev is not None and prev!=u.slot: slot_changes+=1
+        planned_zero=sum(1 for u in uses if slots.get((u.design_index,u.segment_index,u.edge_index))==0)
+        if not main_taken and uses and planned_zero!=1: raise RuntimeError(f"Offset Core: Pole Edge main-lane invariant violated for edge {e}: planned_zero={planned_zero}")
+        if main_taken and planned_zero: raise RuntimeError(f"Offset Core: Pole Edge has duplicate main-lane ownership for edge {e}")
+    _log(f"[route-plan] links={len(ordered)}; main=EXACTLY_ONE_SLOT0_PER_EDGE; continuity=RELATIVE_POSITION; group-outside=ON; pole-exclusivity=ON; global-order=ON; slot-changes={slot_changes}; preserved={continuity_preserved}")
     return edge_crs,work,ordered,routes,slots
 
 def _intersection(p1,p2,q1,q2):
     rx,ry=p2.x()-p1.x(),p2.y()-p1.y();sx,sy=q2.x()-q1.x(),q2.y()-q1.y();den=rx*sy-ry*sx;scale=max(hypot(rx,ry)*hypot(sx,sy),1.)
     if abs(den)<=1e-10*scale:return None
     qpx,qpy=q1.x()-p1.x(),q1.y()-p1.y();t=(qpx*sy-qpy*sx)/den;return QgsPointXY(p1.x()+t*rx,p1.y()+t*ry)
-
 def _same_lane_join(node,pa,pb,na,nb,slot,spacing):
     if slot==0:return QgsPointXY(node)
     pt=_base._unit(pa,pb);nt=_base._unit(na,nb);d=float(slot)*float(spacing);p1=_base._offset_point(node,pt,d);p2=_base._offset_point(QgsPointXY(pa.x()+pt[0],pa.y()+pt[1]),pt,d);q1=_base._offset_point(node,nt,d);q2=_base._offset_point(QgsPointXY(na.x()+nt[0],na.y()+nt[1]),nt,d);hit=_intersection(p1,p2,q1,q2)
     if hit is not None and hypot(hit.x()-node.x(),hit.y()-node.y())<=max(3*abs(d),5*max(float(spacing),.01)):return hit
     return (_base._offset_point(node,pt,d),_base._offset_point(node,nt,d))
-
 def _transition_entry(a,b,slot,spacing):
     d=abs(int(slot))*float(spacing)
     if slot==0 or d<=1e-12:return QgsPointXY(a)
     length=hypot(b.x()-a.x(),b.y()-a.y())
     if length<=1e-12:return QgsPointXY(a)
     angle=60. if abs(int(slot))<=2 else 75. if abs(int(slot))<=4 else 90.;tr=tan(radians(angle));run=min(d/(tr if abs(tr)>1e-12 else 1.),length*.45);center=_base._point_along(a,b,run/length);return _base._offset_point(center,_base._unit(a,b),int(slot)*float(spacing))
-
 def _takeoff_entry(a,b,slot,spacing,control):
     d=int(slot)*float(spacing)
     if slot==0 or abs(d)<=1e-12:return QgsPointXY(a)
     length=hypot(b.x()-a.x(),b.y()-a.y())
     if length<=1e-12:return QgsPointXY(a)
     run=min(max(.01,float(control)),length*.45);center=_base._point_along(a,b,run/length);return _base._offset_point(center,_base._unit(a,b),d)
-
 def _geometry(segment,slot_by_edge,spacing,work,edge_crs,control):
     edges=[e for raw in segment.get("edge_sequence",[]) or [] if (e:=_base._canonical_edge(raw))];stored=segment.get("points",[]) or [];old=[_tp(QgsPointXY(float(p[0]),float(p[1])),edge_crs,work) for p in stored if len(p)>=2]
     if not edges or len(old)<2:return old
@@ -269,19 +212,26 @@ def _geometry(segment,slot_by_edge,spacing,work,edge_crs,control):
     def add(p):
         p=QgsPointXY(p)
         if not out or hypot(out[-1].x()-p.x(),out[-1].y()-p.y())>1e-7:out.append(p)
-    add(old[0]);special=bool(segment.get("_odn_special_start"))
+    add(old[0]);special_start=bool(segment.get("_odn_special_start"));special_end=bool(segment.get("_odn_special_end"))
     for i,slot in enumerate(slots):
         a,b=nodes[i],nodes[i+1]
-        if i==0:add(a) if slot==0 or not special else add(_takeoff_entry(a,b,slot,spacing,control))
+        if i==0:
+            if slot==0 or not special_start:add(a)
+            else:add(_takeoff_entry(a,b,slot,spacing,control))
         if i>0:
             prev=slots[i-1]
             if prev==slot:
                 joined=_same_lane_join(a,nodes[i-1],nodes[i],a,b,slot,spacing)
                 if isinstance(joined,tuple):add(joined[0]);add(joined[1])
                 else:add(joined)
-            elif slot==0:add(a)
+            elif slot==0:
+                # A main-lane change at an intermediate graph node is a normal
+                # lane transition. It is not the 0.3 m special endpoint rule.
+                add(a)
             else:add(_transition_entry(a,b,slot,spacing))
-        if i==len(slots)-1:add(b)
+        if i==len(slots)-1:
+            if slot==0:add(b)
+            else:add(_base._offset_point(b,_base._unit(a,b),slot*spacing)) if not special_end else add(b)
         elif slot==0:add(b)
         else:add(_base._offset_point(b,_base._unit(a,b),slot*spacing))
     add(old[-1]);return out
@@ -291,7 +241,6 @@ def _set_flags(designs):
         ids=d.get("sequence_ids",[]) or []
         for i,s in enumerate(d.get("segments",[]) or []):
             s["_odn_special_start"]=_endpoint_special(ids[i]) if i<len(ids) else False;s["_odn_special_end"]=_endpoint_special(ids[i+1]) if i+1<len(ids) else False
-
 def _validate(designs,edge_crs,work):
     for di,d in enumerate(designs or []):
         for si,s in enumerate(d.get("segments",[]) or []):
@@ -300,15 +249,12 @@ def _validate(designs,edge_crs,work):
             nodes=_base._extract_route_graph_nodes(s,work,edge_crs,edge_crs)
             if len(nodes)!=len(edges)+1:raise RuntimeError(f"Offset Core: Link {di} segment {si} topology invalid")
             if len(s.get("points",[]) or [])<2:raise RuntimeError(f"Offset Core: Link {di} segment {si} points 无效")
-
 def _feature_point(feature,layer,work):
     try:return _tp(QgsPointXY(feature.geometry().centroid().asPoint()),layer.crs(),work)
     except Exception:return None
-
 def _crs(authid):
     try:c=QgsCoordinateReferenceSystem(str(authid));return c if c.isValid() else None
     except Exception:return None
-
 def _fat_refs(designs):
     refs={};dups=set()
     for di,d in enumerate(designs or []):
@@ -319,7 +265,6 @@ def _fat_refs(designs):
             if fid in refs:dups.add(fid)
             else:refs[fid]={"design_index":di,"sequence_pos":pos}
     return refs,dups
-
 def _nearest_on_route(design,anchor,edge_crs,work):
     best=None
     for si,s in enumerate(design.get("segments",[]) or []):
@@ -330,7 +275,6 @@ def _nearest_on_route(design,anchor,edge_crs,work):
         p=QgsPointXY(n.asPoint());dist=hypot(p.x()-anchor.x(),p.y()-anchor.y());cand=(dist,si,p)
         if best is None or cand<best:best=cand
     return best
-
 def _fat_target(ref,design,feature,fat_layer,edge_crs,work):
     segs=design.get("segments",[]) or [];pos=int(ref["sequence_pos"]);incoming=pos-1 if 0<=pos-1<len(segs) else None;outgoing=pos if 0<=pos<len(segs) else None;anchor=None
     if incoming is not None:
@@ -344,7 +288,6 @@ def _fat_target(ref,design,feature,fat_layer,edge_crs,work):
     nearest=_nearest_on_route(design,anchor,edge_crs,work)
     if nearest is None:return None,anchor,{"reason":"无法从最终 Offset Cable 几何确定 FAT 落点"}
     return nearest[2],anchor,{"segment_index":nearest[1],"distance":nearest[0]}
-
 def _prepare_fat_moves(designs,fat_layer,edge_layer,work,fat_limit):
     if fat_layer is None:return {},{"total":0,"skipped":0,"corner":0,"straight":0}
     edge_crs=edge_layer.crs();features={int(f.id()):f for f in fat_layer.getFeatures()};refs,dups=_fat_refs(designs)
@@ -360,7 +303,6 @@ def _prepare_fat_moves(designs,fat_layer,edge_layer,work,fat_limit):
         target_edge=_tp(target,work,edge_crs);target_layer=_tp(target_edge,edge_crs,fat_layer.crs())
         moves[fid]={"design_index":ref["design_index"],"sequence_pos":ref["sequence_pos"],"target_edge":QgsPointXY(target_edge),"target_layer":QgsPointXY(target_layer),"target_work":target,"anchor":anchor,"move_distance":hypot(current.x()-target.x(),current.y()-target.y()) if current else 0.,"mode":"final_route_geometry"};stats["straight"]+=1
     return moves,stats
-
 def _replace_fat_endpoints(designs,moves,edge_crs):
     touched=set()
     for move in moves.values():
@@ -379,7 +321,6 @@ def _replace_fat_endpoints(designs,moves,edge_crs):
             p=s.get("points",[]) or [];length=sum(hypot(float(p[i][0])-float(p[i-1][0]),float(p[i][1])-float(p[i-1][1])) for i in range(1,len(p))) if len(p)>=2 else 0.;s["distance"]=round(length,3);total+=length
         d["length"]=round(total,3)
     return len(touched)
-
 def _apply_fat_moves(layer,moves):
     moved=0
     for fid,move in moves.items():
@@ -391,10 +332,8 @@ def _apply_fat_moves(layer,moves):
             if not layer.updateFeature(f):raise RuntimeError(f"无法写入 FAT feature {fid}")
             moved+=1
     return moved
-
 def commit_fat_landing_points(fat_layer,summary):
     moved=_apply_fat_moves(fat_layer,(summary or {}).get("fat_moves") or {});summary["fat_written"]=moved;return moved
-
 def apply_offset_layout(designs,distribution_layer,edge_layer,spacing=DEFAULT_SPACING_M,control_distance_m=DEFAULT_CONTROL_M,fat_layer=None,fat_max_distance_m=DEFAULT_FAT_MAX_DISTANCE_M):
     spacing=max(.01,float(spacing));control_distance_m=max(.01,float(control_distance_m));_set_flags(designs);edge_crs,work,ordered,routes,slot_map=_plan(designs,distribution_layer,edge_layer,spacing);changed=set();extra=0.
     for di,d in enumerate(designs or []):
@@ -409,8 +348,8 @@ def apply_offset_layout(designs,distribution_layer,edge_layer,spacing=DEFAULT_SP
                 cp["points"]=out;cp["distance"]=round(g.length(),3);cp["layout_spacing"]=round(spacing,3);new.append(cp);total+=g.length()
             else:new.append(cp);total+=float(cp.get("distance",0.) or 0.)
         if diff:d["segments"]=new;d["length"]=round(total,3);changed.add(di)
-        d["source_crs"]=edge_crs.authid();d["layout"]={"version":23,"engine":"OffsetCore","work_crs":work.authid(),"spacing_m":round(spacing,3),"fanout_control_distance_m":round(control_distance_m,3),"main_lane":"exactly_one_primary_slot0_per_edge","lane":"relative_position_continuity_group_outside","pole":"one_independent_cable_landing","corner":"continuous_offset","takeoff":"special_endpoint_only","fat":"owning_link_final_geometry"}
+        d["source_crs"]=edge_crs.authid();d["layout"]={"version":24,"engine":"OffsetCore","work_crs":work.authid(),"spacing_m":round(spacing,3),"fanout_control_distance_m":round(control_distance_m,3),"main_lane":"exactly_one_primary_slot0_per_edge","lane":"global_relative_position_continuity_group_outside","pole":"one_independent_cable_landing","corner":"continuous_offset","takeoff":"special_endpoint_only","fat":"owning_link_final_geometry"}
     moves,stats=_prepare_fat_moves(designs,fat_layer,edge_layer,work,fat_max_distance_m) if fat_layer is not None else ({},{"total":0,"skipped":0,"corner":0,"straight":0});endpoint_updates=_replace_fat_endpoints(designs,moves,edge_crs) if moves else 0;_validate(designs,edge_crs,work)
-    summary={"changed_designs":len(changed),"changed_indices":sorted(changed),"spacing_m":spacing,"extra_length_m":round(extra,3),"version":23,"work_crs":work.authid(),"lane_allocator":"OffsetCore","priority":ordered,"slot_map":{str(k):int(v) for k,v in slot_map.items()},"corner_geometry":"continuous_offset","fanout_control_distance_m":control_distance_m,"fat_moves":moves,"fat_total":stats["total"],"fat_skipped":stats["skipped"],"fat_corner":stats["corner"],"fat_straight":stats["straight"],"fat_endpoint_updates":endpoint_updates,"fat_max_distance_m":float(fat_max_distance_m)}
-    _log(f"[OffsetCore] links={len(ordered)}; changed={len(changed)}; spacing={spacing:.3f}m; control={control_distance_m:.3f}m; main=EXACTLY_ONE_SLOT0_PER_EDGE; relative=GROUP_CONTINUITY; ordinary_corner_control=NOT_USED; fat={stats['total']}; fat_skipped={stats['fat_skipped'] if False else stats['skipped']}")
+    summary={"changed_designs":len(changed),"changed_indices":sorted(changed),"spacing_m":spacing,"extra_length_m":round(extra,3),"version":24,"work_crs":work.authid(),"lane_allocator":"OffsetCore","priority":ordered,"slot_map":{str(k):int(v) for k,v in slot_map.items()},"corner_geometry":"continuous_offset","fanout_control_distance_m":control_distance_m,"fat_moves":moves,"fat_total":stats["total"],"fat_skipped":stats["skipped"],"fat_corner":stats["corner"],"fat_straight":stats["straight"],"fat_endpoint_updates":endpoint_updates,"fat_max_distance_m":float(fat_max_distance_m)}
+    _log(f"[OffsetCore] links={len(ordered)}; changed={len(changed)}; spacing={spacing:.3f}m; control={control_distance_m:.3f}m; main=EXACTLY_ONE_SLOT0_PER_EDGE; relative=GLOBAL_CONTINUITY; ordinary_corner_control=NOT_USED; fat={stats['total']}; fat_skipped={stats['skipped']}")
     return summary
