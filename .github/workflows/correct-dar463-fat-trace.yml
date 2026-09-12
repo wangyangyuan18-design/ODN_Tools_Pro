@@ -1,7 +1,8 @@
 name: Correct DAR463 FAT trace
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
 
 jobs:
   patch:
@@ -18,7 +19,9 @@ jobs:
           p = Path('cable_offset_core.py')
           s = p.read_text(encoding='utf-8')
           s = s.replace('FAT_TRACE_DESIGN = "DAR436_H1A1"', 'FAT_TRACE_DESIGN = "DAR463_H1A1"')
-          s = s.replace('FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"', 'FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"\nFAT_TRACE_FAT_POINT = (-6.924924275, 39.455387000)')
+          marker = 'FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"'
+          if 'FAT_TRACE_FAT_POINT' not in s:
+              s = s.replace(marker, marker + '\nFAT_TRACE_FAT_POINT = (-6.924924275, 39.455387000)')
           p.write_text(s, encoding='utf-8')
           PY
           python -m py_compile cable_offset_core.py
@@ -29,5 +32,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add cable_offset_core.py
           git diff --cached --check
-          git commit -m "fix: correct FAT trace target to DAR463"
+          git commit -m "fix: correct FAT trace target to DAR463" || exit 0
           git push
