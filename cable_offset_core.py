@@ -184,23 +184,58 @@ def _intersection(p1,p2,q1,q2):
     rx,ry=p2.x()-p1.x(),p2.y()-p1.y();sx,sy=q2.x()-q1.x(),q2.y()-q1.y();den=rx*sy-ry*sx;scale=max(hypot(rx,ry)*hypot(sx,sy),1.)
     if abs(den)<=1e-10*scale:return None
     qpx,qpy=q1.x()-p1.x(),q1.y()-p1.y();t=(qpx*sy-qpy*sx)/den;return QgsPointXY(p1.x()+t*rx,p1.y()+t*ry)
+
+def _offset_line(node,p0,p1,slot,spacing):
+    """Infinite lane line through a physical corner, offset by the lane slot."""
+    direction=_base._unit(p0,p1)
+    base=_base._offset_point(node,direction,float(slot)*float(spacing))
+    return base,QgsPointXY(base.x()+direction[0],base.y()+direction[1])
+
+def _lane_corner_join(node,in_a,in_b,out_a,out_b,prev_slot,slot,spacing):
+    """Build a lane-aware ordinary corner from the two offset route lines.
+
+    The physical Pole is only the topology vertex. The actual cable corner is
+    the intersection of the incoming and outgoing offset lane lines. This
+    gives the D/E/F behaviour naturally: depending on the previous/next lane,
+    the corner forms before the Main Lane, on it, or after crossing it.
+    """
+    if prev_slot==slot:
+        if slot==0:return QgsPointXY(node)
+        joined=_same_lane_join(node,in_a,in_b,out_a,out_b,slot,spacing)
+        if isinstance(joined,tuple):return joined[0]
+        return joined
+    p1,p2=_offset_line(node,in_a,in_b,prev_slot,spacing)
+    q1,q2=_offset_line(node,out_a,out_b,slot,spacing)
+    hit=_intersection(p1,p2,q1,q2)
+    if hit is not None:
+        limit=max(5.0,float(spacing)*max(2,abs(int(prev_slot)),abs(int(slot)))*6.0)
+        if hypot(hit.x()-node.x(),hit.y()-node.y())<=limit:
+            return hit
+    # Parallel/non-corner fallback: preserve both lane offsets and transition
+    # without using the special 0.3 m control distance.
+    return (_base._offset_point(node,_base._unit(in_a,in_b),prev_slot*spacing),
+            _base._offset_point(node,_base._unit(out_a,out_b),slot*spacing))
+
 def _same_lane_join(node,pa,pb,na,nb,slot,spacing):
     if slot==0:return QgsPointXY(node)
     pt=_base._unit(pa,pb);nt=_base._unit(na,nb);d=float(slot)*float(spacing);p1=_base._offset_point(node,pt,d);p2=_base._offset_point(QgsPointXY(pa.x()+pt[0],pa.y()+pt[1]),pt,d);q1=_base._offset_point(node,nt,d);q2=_base._offset_point(QgsPointXY(na.x()+nt[0],na.y()+nt[1]),nt,d);hit=_intersection(p1,p2,q1,q2)
     if hit is not None and hypot(hit.x()-node.x(),hit.y()-node.y())<=max(3*abs(d),5*max(float(spacing),.01)):return hit
     return (_base._offset_point(node,pt,d),_base._offset_point(node,nt,d))
+
 def _transition_entry(a,b,slot,spacing):
     d=abs(int(slot))*float(spacing)
     if slot==0 or d<=1e-12:return QgsPointXY(a)
     length=hypot(b.x()-a.x(),b.y()-a.y())
     if length<=1e-12:return QgsPointXY(a)
     angle=60. if abs(int(slot))<=2 else 75. if abs(int(slot))<=4 else 90.;tr=tan(radians(angle));run=min(d/(tr if abs(tr)>1e-12 else 1.),length*.45);center=_base._point_along(a,b,run/length);return _base._offset_point(center,_base._unit(a,b),int(slot)*float(spacing))
+
 def _takeoff_entry(a,b,slot,spacing,control):
     d=int(slot)*float(spacing)
     if slot==0 or abs(d)<=1e-12:return QgsPointXY(a)
     length=hypot(b.x()-a.x(),b.y()-a.y())
     if length<=1e-12:return QgsPointXY(a)
     run=min(max(.01,float(control)),length*.45);center=_base._point_along(a,b,run/length);return _base._offset_point(center,_base._unit(a,b),d)
+
 def _geometry(segment,slot_by_edge,spacing,work,edge_crs,control):
     edges=[e for raw in segment.get("edge_sequence",[]) or [] if (e:=_base._canonical_edge(raw))];stored=segment.get("points",[]) or [];old=[_tp(QgsPointXY(float(p[0]),float(p[1])),edge_crs,work) for p in stored if len(p)>=2]
     if not edges or len(old)<2:return old
@@ -221,14 +256,19 @@ def _geometry(segment,slot_by_edge,spacing,work,edge_crs,control):
         if i>0:
             prev=slots[i-1]
             if prev==slot:
-                joined=_same_lane_join(a,nodes[i-1],nodes[i],a,b,slot,spacing)
+                joined=_lane_corner_join(a,_base._edge_points(edges[i-1])[0],_base._edge_points(edges[i-1])[1],_base._edge_points(edges[i])[0],_base._edge_points(edges[i])[1],prev,slot,spacing)
                 if isinstance(joined,tuple):add(joined[0]);add(joined[1])
                 else:add(joined)
-            elif slot==0:
-                # A main-lane change at an intermediate graph node is a normal
-                # lane transition. It is not the 0.3 m special endpoint rule.
-                add(a)
-            else:add(_transition_entry(a,b,slot,spacing))
+            elif slot==0 or prev==0:
+                # Ordinary lane-change corners use the intersection of the two
+                # offset lanes. Never force the cable through the physical Pole.
+                joined=_lane_corner_join(a,_base._edge_points(edges[i-1])[0],_base._edge_points(edges[i-1])[1],_base._edge_points(edges[i])[0],_base._edge_points(edges[i])[1],prev,slot,spacing)
+                if isinstance(joined,tuple):add(joined[0]);add(joined[1])
+                else:add(joined)
+            else:
+                joined=_lane_corner_join(a,_base._edge_points(edges[i-1])[0],_base._edge_points(edges[i-1])[1],_base._edge_points(edges[i])[0],_base._edge_points(edges[i])[1],prev,slot,spacing)
+                if isinstance(joined,tuple):add(joined[0]);add(joined[1])
+                else:add(joined)
         if i==len(slots)-1:
             if slot==0:add(b)
             else:add(_base._offset_point(b,_base._unit(a,b),slot*spacing)) if not special_end else add(b)
@@ -241,6 +281,7 @@ def _set_flags(designs):
         ids=d.get("sequence_ids",[]) or []
         for i,s in enumerate(d.get("segments",[]) or []):
             s["_odn_special_start"]=_endpoint_special(ids[i]) if i<len(ids) else False;s["_odn_special_end"]=_endpoint_special(ids[i+1]) if i+1<len(ids) else False
+
 def _validate(designs,edge_crs,work):
     for di,d in enumerate(designs or []):
         for si,s in enumerate(d.get("segments",[]) or []):
@@ -249,12 +290,15 @@ def _validate(designs,edge_crs,work):
             nodes=_base._extract_route_graph_nodes(s,work,edge_crs,edge_crs)
             if len(nodes)!=len(edges)+1:raise RuntimeError(f"Offset Core: Link {di} segment {si} topology invalid")
             if len(s.get("points",[]) or [])<2:raise RuntimeError(f"Offset Core: Link {di} segment {si} points 无效")
+
 def _feature_point(feature,layer,work):
     try:return _tp(QgsPointXY(feature.geometry().centroid().asPoint()),layer.crs(),work)
     except Exception:return None
+
 def _crs(authid):
     try:c=QgsCoordinateReferenceSystem(str(authid));return c if c.isValid() else None
     except Exception:return None
+
 def _fat_refs(designs):
     refs={};dups=set()
     for di,d in enumerate(designs or []):
@@ -265,6 +309,7 @@ def _fat_refs(designs):
             if fid in refs:dups.add(fid)
             else:refs[fid]={"design_index":di,"sequence_pos":pos}
     return refs,dups
+
 def _nearest_on_route(design,anchor,edge_crs,work):
     best=None
     for si,s in enumerate(design.get("segments",[]) or []):
@@ -275,6 +320,7 @@ def _nearest_on_route(design,anchor,edge_crs,work):
         p=QgsPointXY(n.asPoint());dist=hypot(p.x()-anchor.x(),p.y()-anchor.y());cand=(dist,si,p)
         if best is None or cand<best:best=cand
     return best
+
 def _fat_target(ref,design,feature,fat_layer,edge_crs,work):
     segs=design.get("segments",[]) or [];pos=int(ref["sequence_pos"]);incoming=pos-1 if 0<=pos-1<len(segs) else None;outgoing=pos if 0<=pos<len(segs) else None;anchor=None
     if incoming is not None:
@@ -288,6 +334,7 @@ def _fat_target(ref,design,feature,fat_layer,edge_crs,work):
     nearest=_nearest_on_route(design,anchor,edge_crs,work)
     if nearest is None:return None,anchor,{"reason":"无法从最终 Offset Cable 几何确定 FAT 落点"}
     return nearest[2],anchor,{"segment_index":nearest[1],"distance":nearest[0]}
+
 def _prepare_fat_moves(designs,fat_layer,edge_layer,work,fat_limit):
     if fat_layer is None:return {},{"total":0,"skipped":0,"corner":0,"straight":0}
     edge_crs=edge_layer.crs();features={int(f.id()):f for f in fat_layer.getFeatures()};refs,dups=_fat_refs(designs)
@@ -303,6 +350,7 @@ def _prepare_fat_moves(designs,fat_layer,edge_layer,work,fat_limit):
         target_edge=_tp(target,work,edge_crs);target_layer=_tp(target_edge,edge_crs,fat_layer.crs())
         moves[fid]={"design_index":ref["design_index"],"sequence_pos":ref["sequence_pos"],"target_edge":QgsPointXY(target_edge),"target_layer":QgsPointXY(target_layer),"target_work":target,"anchor":anchor,"move_distance":hypot(current.x()-target.x(),current.y()-target.y()) if current else 0.,"mode":"final_route_geometry"};stats["straight"]+=1
     return moves,stats
+
 def _replace_fat_endpoints(designs,moves,edge_crs):
     touched=set()
     for move in moves.values():
@@ -321,6 +369,7 @@ def _replace_fat_endpoints(designs,moves,edge_crs):
             p=s.get("points",[]) or [];length=sum(hypot(float(p[i][0])-float(p[i-1][0]),float(p[i][1])-float(p[i-1][1])) for i in range(1,len(p))) if len(p)>=2 else 0.;s["distance"]=round(length,3);total+=length
         d["length"]=round(total,3)
     return len(touched)
+
 def _apply_fat_moves(layer,moves):
     moved=0
     for fid,move in moves.items():
@@ -332,8 +381,10 @@ def _apply_fat_moves(layer,moves):
             if not layer.updateFeature(f):raise RuntimeError(f"无法写入 FAT feature {fid}")
             moved+=1
     return moved
+
 def commit_fat_landing_points(fat_layer,summary):
     moved=_apply_fat_moves(fat_layer,(summary or {}).get("fat_moves") or {});summary["fat_written"]=moved;return moved
+
 def apply_offset_layout(designs,distribution_layer,edge_layer,spacing=DEFAULT_SPACING_M,control_distance_m=DEFAULT_CONTROL_M,fat_layer=None,fat_max_distance_m=DEFAULT_FAT_MAX_DISTANCE_M):
     spacing=max(.01,float(spacing));control_distance_m=max(.01,float(control_distance_m));_set_flags(designs);edge_crs,work,ordered,routes,slot_map=_plan(designs,distribution_layer,edge_layer,spacing);changed=set();extra=0.
     for di,d in enumerate(designs or []):
@@ -348,8 +399,8 @@ def apply_offset_layout(designs,distribution_layer,edge_layer,spacing=DEFAULT_SP
                 cp["points"]=out;cp["distance"]=round(g.length(),3);cp["layout_spacing"]=round(spacing,3);new.append(cp);total+=g.length()
             else:new.append(cp);total+=float(cp.get("distance",0.) or 0.)
         if diff:d["segments"]=new;d["length"]=round(total,3);changed.add(di)
-        d["source_crs"]=edge_crs.authid();d["layout"]={"version":24,"engine":"OffsetCore","work_crs":work.authid(),"spacing_m":round(spacing,3),"fanout_control_distance_m":round(control_distance_m,3),"main_lane":"exactly_one_primary_slot0_per_edge","lane":"global_relative_position_continuity_group_outside","pole":"one_independent_cable_landing","corner":"continuous_offset","takeoff":"special_endpoint_only","fat":"owning_link_final_geometry"}
+        d["source_crs"]=edge_crs.authid();d["layout"]={"version":24,"engine":"OffsetCore","work_crs":work.authid(),"spacing_m":round(spacing,3),"fanout_control_distance_m":round(control_distance_m,3),"main_lane":"exactly_one_primary_slot0_per_edge","lane":"global_relative_position_continuity_group_outside","pole":"one_independent_cable_landing","corner":"lane_aware_90deg_offset","takeoff":"special_endpoint_only","fat":"owning_link_final_geometry"}
     moves,stats=_prepare_fat_moves(designs,fat_layer,edge_layer,work,fat_max_distance_m) if fat_layer is not None else ({},{"total":0,"skipped":0,"corner":0,"straight":0});endpoint_updates=_replace_fat_endpoints(designs,moves,edge_crs) if moves else 0;_validate(designs,edge_crs,work)
-    summary={"changed_designs":len(changed),"changed_indices":sorted(changed),"spacing_m":spacing,"extra_length_m":round(extra,3),"version":24,"work_crs":work.authid(),"lane_allocator":"OffsetCore","priority":ordered,"slot_map":{str(k):int(v) for k,v in slot_map.items()},"corner_geometry":"continuous_offset","fanout_control_distance_m":control_distance_m,"fat_moves":moves,"fat_total":stats["total"],"fat_skipped":stats["skipped"],"fat_corner":stats["corner"],"fat_straight":stats["straight"],"fat_endpoint_updates":endpoint_updates,"fat_max_distance_m":float(fat_max_distance_m)}
-    _log(f"[OffsetCore] links={len(ordered)}; changed={len(changed)}; spacing={spacing:.3f}m; control={control_distance_m:.3f}m; main=EXACTLY_ONE_SLOT0_PER_EDGE; relative=GLOBAL_CONTINUITY; ordinary_corner_control=NOT_USED; fat={stats['total']}; fat_skipped={stats['skipped']}")
+    summary={"changed_designs":len(changed),"changed_indices":sorted(changed),"spacing_m":spacing,"extra_length_m":round(extra,3),"version":24,"work_crs":work.authid(),"lane_allocator":"OffsetCore","priority":ordered,"slot_map":{str(k):int(v) for k,v in slot_map.items()},"corner_geometry":"lane_aware_90deg_offset","fanout_control_distance_m":control_distance_m,"fat_moves":moves,"fat_total":stats["total"],"fat_skipped":stats["skipped"],"fat_corner":stats["corner"],"fat_straight":stats["straight"],"fat_endpoint_updates":endpoint_updates,"fat_max_distance_m":float(fat_max_distance_m)}
+    _log(f"[OffsetCore] links={len(ordered)}; changed={len(changed)}; spacing={spacing:.3f}m; control={control_distance_m:.3f}m; main=EXACTLY_ONE_SLOT0_PER_EDGE; relative=GLOBAL_CONTINUITY; ordinary_corner_control=NOT_USED; corner=LANE_AWARE_90DEG; fat={stats['total']}; fat_skipped={stats['skipped']}")
     return summary
