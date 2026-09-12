@@ -12,21 +12,24 @@ if 'FAT_TRACE_DESIGN = "DAR436_H1A1"' not in s:
         raise SystemExit('LOG_TAG anchor missing')
     s = s.replace(anchor, anchor + helper, 1)
 
-# 1) Log the exact owning-link/fat-target decision.
 needle = '    return nearest[2], anchor, {\n        "segment_index": nearest[1],\n        "distance": nearest[0],\n    }\n'
 replacement = '''    if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):\n        _log(f"[FAT-TRACE][TARGET] link={design.get('link','')}; feature_id={feature.id()}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; seq_pos={position}; anchor={_fat_trace_point(anchor)}; segment={nearest[1]}; distance={nearest[0]:.6f}; target={_fat_trace_point(nearest[2])}")\n    return nearest[2], anchor, {\n        "segment_index": nearest[1],\n        "distance": nearest[0],\n    }\n'''
 if needle not in s:
     raise SystemExit('fat target return anchor missing')
 s = s.replace(needle, replacement, 1)
 
-# 2) Log whether the move survives the FAT distance guard and its final coordinates.
+needle = '        target, anchor, info = _fat_target(\n            reference,\n            designs[reference["design_index"]],\n            feature,\n            fat_layer,\n            edge_crs,\n            work,\n        )\n'
+replacement = '''        target, anchor, info = _fat_target(\n            reference,\n            designs[reference["design_index"]],\n            feature,\n            fat_layer,\n            edge_crs,\n            work,\n        )\n        trace_design = designs[reference["design_index"]]\n        if _fat_trace_focus(trace_design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):\n            _log(f"[FAT-TRACE][DECISION] feature_id={feature_id}; link={trace_design.get('link','')}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; target={_fat_trace_point(target) if target else 'None'}; info={info}")\n'''
+if needle not in s:
+    raise SystemExit('prepare target block not found')
+s = s.replace(needle, replacement, 1)
+
 needle = '        target_edge = _tp(target, work, edge_crs)\n        target_layer = _tp(target_edge, edge_crs, fat_layer.crs())\n'
-replacement = '''        target_edge = _tp(target, work, edge_crs)\n        target_layer = _tp(target_edge, edge_crs, fat_layer.crs())\n        if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):\n            _log(f"[FAT-TRACE][MOVE-PREP] link={design.get('link','')}; feature_id={feature_id}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; target_edge={_fat_trace_point(target_edge)}; target_layer={_fat_trace_point(target_layer)}; anchor_distance={anchor_distance:.6f}; move_distance={hypot(current.x()-target.x(), current.y()-target.y()):.6f}; accepted=YES")\n'''
+replacement = '''        target_edge = _tp(target, work, edge_crs)\n        target_layer = _tp(target_edge, edge_crs, fat_layer.crs())\n        if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):\n            _log(f"[FAT-TRACE][MOVE-PREP] feature_id={feature_id}; link={design.get('link','')}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; target_edge={_fat_trace_point(target_edge)}; target_layer={_fat_trace_point(target_layer)}; anchor_distance={anchor_distance:.6f}; move_distance={hypot(current.x()-target.x(), current.y()-target.y()):.6f}; accepted=YES")\n'''
 if needle not in s:
     raise SystemExit('fat move coordinate anchor missing')
 s = s.replace(needle, replacement, 1)
 
-# 3) Tag the reported design's segments and log final geometry endpoints.
 needle = '        new_segments = []\n        total = 0.0\n        different = False\n'
 replacement = '''        trace_design = _fat_trace_focus(design)\n        new_segments = []\n        total = 0.0\n        different = False\n'''
 if needle not in s:
@@ -45,7 +48,6 @@ if needle not in s:
     raise SystemExit('geometry call anchor missing')
 s = s.replace(needle, replacement, 1)
 
-# 4) Log the critical special_end branch: FAT currently forces physical Pole endpoint.
 needle = '''            if special_end:\n                add(b)\n            else:\n                add(_offset_lane_point(b, direction, slot, spacing))\n'''
 replacement = '''            if special_end:\n                add(b)\n                if segment.get("_fat_trace_design"):\n                    _log(f"[FAT-TRACE][GEOMETRY-END] segment={segment.get('_fat_trace_segment_index')}; slot={slot}; special_end=TRUE; endpoint=PHYSICAL_NODE; node={_fat_trace_point(b)}")\n            else:\n                endpoint = _offset_lane_point(b, direction, slot, spacing)\n                add(endpoint)\n                if segment.get("_fat_trace_design"):\n                    _log(f"[FAT-TRACE][GEOMETRY-END] segment={segment.get('_fat_trace_segment_index')}; slot={slot}; special_end=FALSE; endpoint=OFFSET_LANE; node={_fat_trace_point(b)}; endpoint={_fat_trace_point(endpoint)}")\n'''
 if needle not in s:
