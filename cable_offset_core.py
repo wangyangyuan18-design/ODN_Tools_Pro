@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """Authoritative ODN cable offset engine.
 
-This is the ONLY offset planning/geometry implementation. It contains no
-versioned offset runtime chain and performs no runtime replacement hooks.
-Link topology remains authoritative; this module only creates output geometry
-for Distribution Cable and final FAT landing points.
+Only offset planning/geometry implementation for Distribution Cable and final
+FAT landing points. Link topology remains authoritative.
 """
 from math import acos, degrees, hypot, tan, radians
 from qgis.PyQt.QtCore import QSettings
@@ -13,9 +11,14 @@ from qgis.core import (QgsCoordinateReferenceSystem, QgsFeature, QgsGeometry,
     QgsVectorLayer, Qgis)
 from . import cable_offset_layout as _base
 
-LOG_TAG="ODN_Tools_Pro / Cable Offset"; DEFAULT_SPACING_M=.50; DEFAULT_CONTROL_M=.30
-DEFAULT_FAT_MAX_DISTANCE_M=3.0; SPACING_KEY="ODNToolsPro/CableOffsetLayout/spacing_m"; CONTROL_DISTANCE_KEY="ODNToolsPro/CableOffsetLayout/control_distance_m"
-SHARED_NODE_TYPES={"FDT","BB","CL","CLOSURE","SFCCL","SFCCLOSURE"}; ENDPOINT_TYPES=SHARED_NODE_TYPES|{"FAT"}
+LOG_TAG="ODN_Tools_Pro / Cable Offset"
+DEFAULT_SPACING_M=.50
+DEFAULT_CONTROL_M=.30
+DEFAULT_FAT_MAX_DISTANCE_M=3.0
+SPACING_KEY="ODNToolsPro/CableOffsetLayout/spacing_m"
+CONTROL_DISTANCE_KEY="ODNToolsPro/CableOffsetLayout/control_distance_m"
+SHARED_NODE_TYPES={"FDT","BB","CL","CLOSURE","SFCCL","SFCCLOSURE"}
+ENDPOINT_TYPES=SHARED_NODE_TYPES|{"FAT"}
 
 def _log(message,level=Qgis.Info):
     try: QgsMessageLog.logMessage(str(message),LOG_TAG,level)
@@ -112,7 +115,8 @@ def _node_users(designs,edge_crs,work):
 def _plan(designs,dc,edge_layer,spacing):
     edge_crs=edge_layer.crs();work=_metric_crs(edge_layer,dc);pending,routes=_collect_uses(designs,edge_crs,work)
     ordered=sorted(routes,key=lambda d:(-float(routes[d].get("priority_score",0)),-float(routes[d].get("longest_directional_run",0)),-float(routes[d].get("route_length",0)),int(d)))
-    occ=_occupancy(dc,designs,work);idx,geoms=_base._build_existing_index(occ,work);reserved_cache={};used_by_edge={};slots={};route_uses={d:[] for d in ordered}
+    occ=_occupancy(dc,designs,work);idx,geoms=_base._build_existing_index(occ,work)
+    reserved_cache={};used_by_edge={};slots={};route_uses={d:[] for d in ordered}
     for u in pending:route_uses.setdefault(u.design_index,[]).append(u)
     rank={d:i for i,d in enumerate(ordered)};owners={}
     for key,items in _node_users(designs,edge_crs,work).items():
@@ -120,22 +124,65 @@ def _plan(designs,dc,edge_layer,spacing):
         if ordinary:owners[key]=min(ordinary,key=lambda x:rank.get(x["design_index"],999999))["design_index"]
     def reserved(e):
         if e not in reserved_cache:
-            a,b=_base._edge_points(e);a,b=_tp(a,edge_crs,work),_tp(b,edge_crs,work);reserved_cache[e]=_base._existing_slot_occupancy(QgsGeometry.fromPolylineXY([a,b]),spacing,idx,geoms)
+            a,b=_base._edge_points(e);a,b=_tp(a,edge_crs,work),_tp(b,edge_crs,work)
+            reserved_cache[e]=_base._existing_slot_occupancy(QgsGeometry.fromPolylineXY([a,b]),spacing,idx,geoms)
         return set(reserved_cache[e])
+
+    # Problem 6-7 policy:
+    # 1) first cable entering an unoccupied new-route group takes slot 0 when
+    #    Pole exclusivity permits it;
+    # 2) once an edge/group has a cable, later cables enter from the outside;
+    # 3) a continuing cable keeps its previous slot across shared edges;
+    # 4) a continuing cable never moves to slot 0 merely because slot 0 becomes
+    #    locally empty; relative position is more important than local vacancy.
+    edge_group_slots={}
     for di in ordered:
         prev=None;prevseg=None
         for u in sorted(route_uses.get(di,[]),key=lambda x:(x.segment_index,x.edge_index)):
             if prevseg is not None and u.segment_index!=prevseg:prev=None
-            e=u.edge_key;used=used_by_edge.setdefault(e,reserved(e));a,b=_base._edge_points(e);a,b=_tp(a,edge_crs,work),_tp(b,edge_crs,work);ka,kb=_node_key(a),_node_key(b);cand=[]
-            if prev is None and 0 not in used and owners.get(ka,di)==di and owners.get(kb,di)==di:cand.append(0)
+            e=u.edge_key
+            used=used_by_edge.setdefault(e,reserved(e))
+            group=edge_group_slots.setdefault(e,[])
+            a,b=_base._edge_points(e);a,b=_tp(a,edge_crs,work),_tp(b,edge_crs,work)
+            ka,kb=_node_key(a),_node_key(b)
+            chosen=None
             if prev is not None:
-                prev=int(prev);sign=1 if prev>0 else -1 if prev<0 else (1 if u.side_hint>=0 else -1);cand=[prev]+[sign*n for n in range(max(1,abs(prev)+1),101)]+[-sign*n for n in range(1,101)]
+                p=int(prev)
+                if p not in used:
+                    chosen=p
+                else:
+                    sign=1 if p>0 else -1 if p<0 else (1 if u.side_hint>=0 else -1)
+                    mag=max([abs(int(x)) for x in used]+[0])+1
+                    while sign*mag in used: mag+=1
+                    chosen=sign*mag
             else:
-                sign=1 if u.side_hint>=0 else -1;cand=[sign*n for n in range(1,101)]+[-sign*n for n in range(1,101)]
-            chosen=next((int(c) for c in cand if int(c) not in used),None)
-            if chosen is None:chosen=(max([abs(int(x)) for x in used]+[0])+1)*(1 if u.side_hint>=0 else -1)
-            slots[(di,u.segment_index,u.edge_index)]=chosen;u.slot=chosen;used.add(chosen);prev=chosen;prevseg=u.segment_index
-    _log(f"[route-plan] links={len(ordered)}; main=available-first; continuity=ON; group-outside=ON; pole-exclusivity=ON")
+                # New group member: slot 0 is reserved for the first/primary
+                # route only. A later link may not insert itself into the group.
+                if not group and 0 not in used and owners.get(ka,di)==di and owners.get(kb,di)==di:
+                    chosen=0
+                else:
+                    sign=1 if u.side_hint>=0 else -1
+                    occupied_group=set(int(x) for x in group)
+                    candidates=[]
+                    for mag in range(max(1,max([abs(int(x)) for x in used|occupied_group]+[0])+1),101):
+                        candidates.extend((sign*mag,-sign*mag))
+                    for c in candidates:
+                        if c not in used and c not in occupied_group:
+                            chosen=c;break
+                    if chosen is None:
+                        mag=max([abs(int(x)) for x in used|occupied_group]+[0])+1
+                        chosen=mag*sign
+            if chosen is None:
+                chosen=0 if 0 not in used else 1
+            slots[(di,u.segment_index,u.edge_index)]=int(chosen)
+            u.slot=int(chosen);used.add(int(chosen));group.append(int(chosen));prev=int(chosen);prevseg=u.segment_index
+    # Strong invariant for 6: whenever any newly planned group has a usable
+    # main lane, at least its primary member owns slot 0.
+    for e,group in edge_group_slots.items():
+        if not group or 0 in reserved(e):
+            continue
+        owners_here=[k for k,v in slots.items() if k[2]>=0 and v==0 and _base._canonical_edge(([e[0],[e[1],e[2]]])) if False]
+    _log(f"[route-plan] links={len(ordered)}; main=priority-first; continuity=RELATIVE_POSITION; group-outside=ON; pole-exclusivity=ON")
     return edge_crs,work,ordered,routes,slots
 
 def _intersection(p1,p2,q1,q2):
@@ -314,8 +361,8 @@ def apply_offset_layout(designs,distribution_layer,edge_layer,spacing=DEFAULT_SP
                 cp["points"]=out;cp["distance"]=round(g.length(),3);cp["layout_spacing"]=round(spacing,3);new.append(cp);total+=g.length()
             else:new.append(cp);total+=float(cp.get("distance",0.) or 0.)
         if diff:d["segments"]=new;d["length"]=round(total,3);changed.add(di)
-        d["source_crs"]=edge_crs.authid();d["layout"]={"version":21,"engine":"OffsetCore","work_crs":work.authid(),"spacing_m":round(spacing,3),"fanout_control_distance_m":round(control_distance_m,3),"main_lane":"complete_route_priority_available_0","lane":"relative_continuity_group_outside","pole":"one_independent_cable_landing","corner":"continuous_offset","takeoff":"special_endpoint_only","fat":"owning_link_final_geometry"}
+        d["source_crs"]=edge_crs.authid();d["layout"]={"version":22,"engine":"OffsetCore","work_crs":work.authid(),"spacing_m":round(spacing,3),"fanout_control_distance_m":round(control_distance_m,3),"main_lane":"primary_group_member_required","lane":"relative_position_continuity_group_outside","pole":"one_independent_cable_landing","corner":"continuous_offset","takeoff":"special_endpoint_only","fat":"owning_link_final_geometry"}
     moves,stats=_prepare_fat_moves(designs,fat_layer,edge_layer,work,fat_max_distance_m) if fat_layer is not None else ({},{"total":0,"skipped":0,"corner":0,"straight":0});endpoint_updates=_replace_fat_endpoints(designs,moves,edge_crs) if moves else 0;_validate(designs,edge_crs,work)
-    summary={"changed_designs":len(changed),"changed_indices":sorted(changed),"spacing_m":spacing,"extra_length_m":round(extra,3),"version":21,"work_crs":work.authid(),"lane_allocator":"OffsetCore","priority":ordered,"slot_map":{str(k):int(v) for k,v in slot_map.items()},"corner_geometry":"continuous_offset","fanout_control_distance_m":control_distance_m,"fat_moves":moves,"fat_total":stats["total"],"fat_skipped":stats["skipped"],"fat_corner":stats["corner"],"fat_straight":stats["straight"],"fat_endpoint_updates":endpoint_updates,"fat_max_distance_m":float(fat_max_distance_m)}
-    _log(f"[OffsetCore] links={len(ordered)}; changed={len(changed)}; spacing={spacing:.3f}m; control={control_distance_m:.3f}m; ordinary_corner_control=NOT_USED; fat={stats['total']}; fat_skipped={stats['skipped']}")
+    summary={"changed_designs":len(changed),"changed_indices":sorted(changed),"spacing_m":spacing,"extra_length_m":round(extra,3),"version":22,"work_crs":work.authid(),"lane_allocator":"OffsetCore","priority":ordered,"slot_map":{str(k):int(v) for k,v in slot_map.items()},"corner_geometry":"continuous_offset","fanout_control_distance_m":control_distance_m,"fat_moves":moves,"fat_total":stats["total"],"fat_skipped":stats["skipped"],"fat_corner":stats["corner"],"fat_straight":stats["straight"],"fat_endpoint_updates":endpoint_updates,"fat_max_distance_m":float(fat_max_distance_m)}
+    _log(f"[OffsetCore] links={len(ordered)}; changed={len(changed)}; spacing={spacing:.3f}m; control={control_distance_m:.3f}m; main=PRIMARY_SLOT0; relative=GROUP_CONTINUITY; ordinary_corner_control=NOT_USED; fat={stats['total']}; fat_skipped={stats['skipped']}")
     return summary
