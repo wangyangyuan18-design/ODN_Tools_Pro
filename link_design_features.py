@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """Link Design auxiliary feature entry points.
 
-Keeps FAT归杆 and 变更检测 UI wiring outside the canonical Link Design core.
-The routing/offset core is not modified by these entry points.
+Keeps FAT归杆, 变更检测 and planning-overlay UI wiring outside the canonical
+Link Design core. The routing/offset core is not modified by these entry points.
 """
 
 from qgis.PyQt import QtWidgets
-from qgis.PyQt.QtCore import Qt
 
 
 def _find_layout(layout, target):
@@ -85,8 +84,56 @@ def _change_detection(dock):
     return accepted
 
 
+def _exit_design_to_overlay(dock):
+    """Exit Link planning while keeping the left Link Design dock open.
+
+    The canonical controller exit currently closes its host dock. The user-facing
+    Exit Design action belongs to the top PlanningOverlay, so this adapter keeps
+    the dock open and closes only that top planning interface.
+    """
+    controller = getattr(dock, "_controller", None)
+    if controller is None:
+        return False
+    try:
+        controller.exit_design()
+    finally:
+        try:
+            # exit_design() currently hides the host dock; restore it because
+            # the left "已完成设计" panel is not the design-session window.
+            dock.show()
+            dock.raise_()
+        except Exception:
+            pass
+        try:
+            overlay = getattr(dock, "_overlay", None)
+            if overlay is not None:
+                overlay.hide()
+        except Exception:
+            pass
+    return True
+
+
+def _install_exit_behavior(dock):
+    """Make the top PlanningOverlay Exit Design button close only the overlay."""
+    if getattr(dock, "_exit_design_behavior_fixed", False):
+        return True
+    overlay = getattr(dock, "_overlay", None)
+    controller = getattr(dock, "_controller", None)
+    if overlay is None or controller is None or not hasattr(overlay, "exit"):
+        return False
+    try:
+        overlay.exit.clicked.disconnect(controller.exit_design)
+    except Exception:
+        pass
+    overlay.exit.clicked.connect(lambda: _exit_design_to_overlay(dock))
+    dock._exit_design_behavior_fixed = True
+    return True
+
+
 def install_link_design_feature_buttons(dock):
-    """Restore the two Link Design entry buttons without touching core logic."""
+    """Restore Link Design entry buttons and correct the Exit Design target."""
+    _install_exit_behavior(dock)
+
     row = _ensure_summary_row(dock)
     if row is None:
         return False
