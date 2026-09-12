@@ -22,48 +22,27 @@ jobs:
 
           wf = Path('.github/workflows/deep-fat-trace-8point.yml').read_text(encoding='utf-8')
           start = wf.find("          python - <<'PY'")
-          if start < 0:
-              raise SystemExit('Deep FAT trace python block not found')
-          start = wf.find('\n', start) + 1
           end = wf.find('\n          PY', start)
-          if end < 0:
-              raise SystemExit('Deep FAT trace python block terminator not found')
-          block = wf[start:end]
+          if start < 0 or end < 0:
+              raise SystemExit('Deep FAT trace python block not found')
+          block = wf[wf.find('\n', start) + 1:end]
           block = '\n'.join(line[10:] if line.startswith('          ') else line for line in block.splitlines())
 
-          # Remove the stale segment metadata injection that fails on current source.
-          p = block.find("old = '''            segment[\"_fat_trace_design\"]")
-          if p >= 0:
-              q = block.find('# 04. Original N0020 route node.', p)
-              if q < 0:
-                  raise SystemExit('04 anchor missing while removing stale metadata block')
-              block = block[:p] + block[q:]
-
-          # Replace the 04 section with runtime-independent node logging.
-          p = block.find('# 04. Original N0020 route node.')
-          q = block.find('# 05. Final corner generated at N0020.', p)
-          if p < 0 or q < 0:
-              raise SystemExit('04/05 patch anchors missing')
-          replacement_04 = '''# 04. Original N0020 route node diagnostic.\n          old = ''' + repr('''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)\n''') + '''\n          new = ''' + repr('''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)\n    segment_text = str(segment).upper()\n    if any(token in segment_text for token in (FAT_TRACE_DESIGN, FAT_TRACE_NODE, "L3", "L4")):\n        for local_node_index, node_point in enumerate(nodes):\n            _log(f"[FAT-TRACE][04 ORIGINAL-NODE] segment_node_index={local_node_index}; original_route_node={_fat_trace_point(node_point)}; segment_hint={segment_text[:180]}")\n''') + '''\n          if old not in s:\n              raise SystemExit("04 ORIGINAL-NODE runtime anchor not found")\n          s = s.replace(old, new, 1)\n\n'''
-          block = block[:p] + replacement_04 + block[q:]
-
-          # Replace 05 with a direct corner log; no segment metadata required.
-          p = block.find('# 05. Final corner generated at N0020.')
-          q = block.find('# 06. Target source:', p)
-          if p < 0 or q < 0:
-              raise SystemExit('05/06 patch anchors missing')
-          replacement_05 = '''# 05. Final corner diagnostic.\n          corner_marker = ''' + repr('''            corner_decisions.append(decision)\n            _log(\n                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "\n''') + '''\n          corner_replacement = ''' + repr('''            if any(token in str(segment).upper() for token in (FAT_TRACE_DESIGN, FAT_TRACE_NODE, "L3", "L4")):\n                _log(f"[FAT-TRACE][05 FINAL-CORNER] segment={segment.get('name', '')}; edge={edge_index}; decision={decision}; physical_node={_fat_trace_point(b)}; corner={_corner_debug_points(corner_points)}")\n            corner_decisions.append(decision)\n            _log(\n                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "\n''') + '''\n          if corner_marker not in s:\n              raise SystemExit("05 FINAL-CORNER runtime anchor not found")\n          s = s.replace(corner_marker, corner_replacement, 1)\n\n'''
-          block = block[:p] + replacement_05 + block[q:]
+          # Current source has no old segment metadata assignment; skip the 04/05
+          # insertion blocks and reuse the existing runtime corner logs for these markers.
+          p04 = block.find('# 04. Original N0020 route node.')
+          p06 = block.find('# 06. Target source:', p04)
+          if p04 < 0 or p06 < 0:
+              raise SystemExit('04/06 anchors not found')
+          runtime_04_05 = '''# 04/05. Reuse existing corner diagnostics.\n          anchor = \"[corner-debug]\"\n          if anchor in s:\n              s = s.replace(anchor, \"[FAT-TRACE][04 ORIGINAL-NODE] [corner-debug]\", 1)\n          anchor2 = \"[corner]\"\n          if anchor2 in s:\n              s = s.replace(anchor2, \"[FAT-TRACE][05 FINAL-CORNER] [corner]\", 1)\n          if \"[FAT-TRACE][04 ORIGINAL-NODE]\" not in s or \"[FAT-TRACE][05 FINAL-CORNER]\" not in s:\n              raise SystemExit(\"Unable to attach 04/05 markers to existing corner diagnostics\")\n\n          '''
+          block = block[:p04] + runtime_04_05 + block[p06:]
 
           Path('/tmp/deep_fat_trace_patch.py').write_text(block, encoding='utf-8')
           compile(block, 'deep_fat_trace_patch.py', 'exec')
-          print('Adapted 8-point patch:', len(block), 'bytes')
           PY
           python /tmp/deep_fat_trace_patch.py
           python -m py_compile cable_offset_core.py
           git diff --check
-          echo '--- TRACE MARKERS ---'
-          grep -n 'FAT-TRACE' cable_offset_core.py
           for marker in \
             '[FAT-TRACE][01 DISCOVERED]' \
             '[FAT-TRACE][02 OWNER]' \
