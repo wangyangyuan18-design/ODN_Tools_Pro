@@ -286,7 +286,12 @@ def _validate_pole_exclusivity(designs, edge_crs, work):
 
 
 def _plan(designs, dc, edge_layer, spacing):
-    """Global lane allocation; preserve Main Lane, Relative Position and Group Outside."""
+    """Global lane allocation with compact relative lanes and stable physical sides.
+
+    Lane index is a relative position, not a permanent absolute identifier.
+    Existing members compress toward the Main Lane when membership changes,
+    while preserving each cable's physical left/right side whenever possible.
+    """
     edge_crs = edge_layer.crs()
     work = _metric_crs(edge_layer, dc)
     pending, routes = _collect_uses(designs, edge_crs, work)
@@ -307,11 +312,9 @@ def _plan(designs, dc, edge_layer, spacing):
 
     reserved_cache = {}
     slots = {}
-    edge_group_slots = {}
     uses_by_edge = {}
     for use in pending:
         uses_by_edge.setdefault(use.edge_key, []).append(use)
-        edge_group_slots.setdefault(use.edge_key, [])
     for uses in uses_by_edge.values():
         uses.sort(key=lambda use: (rank.get(use.design_index, 999999), use.segment_index, use.edge_index))
 
@@ -327,102 +330,136 @@ def _plan(designs, dc, edge_layer, spacing):
 
     def edge_order_key(edge):
         return min(
-            (
-                rank.get(use.design_index, 999999),
-                use.segment_index,
-                use.edge_index,
-            )
+            (rank.get(use.design_index, 999999), use.segment_index, use.edge_index)
             for use in uses_by_edge[edge]
         )
 
+    def previous_slot(use):
+        if use.edge_index <= 0:
+            return None
+        return slots.get((use.design_index, use.segment_index, use.edge_index - 1))
+
     slot_changes = 0
     continuity_preserved = 0
+    side_stable = 0
+    compressed_edges = 0
+
     for edge in sorted(uses_by_edge, key=edge_order_key):
         uses = uses_by_edge[edge]
-        used = set(reserved(edge))
-        main_taken = 0 in used
+        reserved_slots = reserved(edge)
+        used = set(reserved_slots)
         assigned = {}
+
+        # Main Lane: keep exactly one primary cable on slot 0 whenever
+        # the physical Main Lane is not already occupied by an external DC.
         primary = None
-
-        if not main_taken:
-            for use in uses:
-                if use.edge_index > 0 and slots.get((use.design_index, use.segment_index, use.edge_index - 1)) == 0:
-                    primary = use
-                    break
-            if primary is None and uses:
+        if 0 not in reserved_slots:
+            previous_zero = [use for use in uses if previous_slot(use) == 0]
+            if previous_zero:
+                primary = min(
+                    previous_zero,
+                    key=lambda use: (rank.get(use.design_index, 999999), use.segment_index, use.edge_index),
+                )
+            elif uses:
                 primary = uses[0]
-
         if primary is not None:
             key = (primary.design_index, primary.segment_index, primary.edge_index)
             assigned[key] = 0
             used.add(0)
-            edge_group_slots[edge].append(0)
 
+        non_main = [
+            use for use in uses
+            if (use.design_index, use.segment_index, use.edge_index) not in assigned
+        ]
+
+        # Determine the physical side from the existing lane first;
+        # fall back to route geometry only for a newly joining cable.
+        side_groups = {1: [], -1: []}
+        for use in non_main:
+            previous = previous_slot(use)
+            if previous is not None and previous != 0:
+                side = 1 if previous > 0 else -1
+            else:
+                side = 1 if use.side_hint > 0 else -1
+            side_groups[side].append((use, previous))
+
+        for side in (1, -1):
+            members = side_groups[side]
+            # Existing cables are ordered by their former relative distance;
+            # new members are then inserted deterministically by route rank.
+            members.sort(
+                key=lambda item: (
+                    0 if item[1] not in (None, 0) else 1,
+                    abs(int(item[1])) if item[1] not in (None, 0) else 10**9,
+                    rank.get(item[0].design_index, 999999),
+                    item[0].segment_index,
+                    item[0].edge_index,
+                )
+            )
+
+            magnitude = 1
+            for use, previous in members:
+                while side * magnitude in used:
+                    magnitude += 1
+                chosen = side * magnitude
+                key = (use.design_index, use.segment_index, use.edge_index)
+                assigned[key] = chosen
+                used.add(chosen)
+                if previous is not None and previous != 0:
+                    if (1 if previous > 0 else -1) == side:
+                        side_stable += 1
+                    if previous == chosen:
+                        continuity_preserved += 1
+                magnitude += 1
+
+        # Defensive completion. This should never be reached, but guarantees
+        # that malformed input cannot leave a pending cable without a lane.
         for use in uses:
             key = (use.design_index, use.segment_index, use.edge_index)
             if key in assigned:
                 continue
-            previous_slot = (
-                slots.get((use.design_index, use.segment_index, use.edge_index - 1))
-                if use.edge_index > 0
-                else None
-            )
-            if previous_slot is not None and previous_slot not in used:
-                chosen = int(previous_slot)
-                continuity_preserved += 1
-            else:
-                sign = 1 if use.side_hint >= 0 else -1
-                occupied_group = set(edge_group_slots[edge])
-                chosen = None
-                start = max(1, max([abs(int(value)) for value in used | occupied_group] + [0]) + 1)
-                for magnitude in range(start, 101):
-                    for candidate in (sign * magnitude, -sign * magnitude):
-                        if candidate not in used and candidate not in occupied_group:
-                            chosen = candidate
-                            break
-                    if chosen is not None:
-                        break
-                if chosen is None:
-                    chosen = (max([abs(int(value)) for value in used | occupied_group] + [0]) + 1) * sign
-            assigned[key] = int(chosen)
-            used.add(int(chosen))
-            edge_group_slots[edge].append(int(chosen))
+            side = 1 if use.side_hint > 0 else -1
+            magnitude = 1
+            while side * magnitude in used:
+                magnitude += 1
+            assigned[key] = side * magnitude
+            used.add(side * magnitude)
+
+        non_zero = sorted(abs(int(value)) for value in assigned.values() if int(value) != 0)
+        if non_zero and non_zero != list(range(1, len(non_zero) + 1)):
+            compressed_edges += 1
 
         for use in uses:
             key = (use.design_index, use.segment_index, use.edge_index)
-            slots[key] = int(assigned[key])
-            use.slot = int(assigned[key])
-            if use.edge_index > 0:
-                previous = slots.get((use.design_index, use.segment_index, use.edge_index - 1))
-                if previous is not None and previous != use.slot:
-                    slot_changes += 1
+            chosen = int(assigned[key])
+            prior = previous_slot(use)
+            slots[key] = chosen
+            use.slot = chosen
+            if prior is not None and prior != chosen:
+                slot_changes += 1
 
         planned_zero = sum(
             1
             for use in uses
             if slots.get((use.design_index, use.segment_index, use.edge_index)) == 0
         )
-        if not main_taken and uses and planned_zero != 1:
+        if 0 not in reserved_slots and uses and planned_zero != 1:
             raise RuntimeError(
                 f"Offset Core: Pole Edge main-lane invariant violated for edge {edge}: planned_zero={planned_zero}"
             )
-        if main_taken and planned_zero:
+        if 0 in reserved_slots and planned_zero:
             raise RuntimeError(
                 f"Offset Core: Pole Edge has duplicate main-lane ownership for edge {edge}"
             )
 
     _log(
         f"[route-plan] links={len(ordered)}; main=EXACTLY_ONE_SLOT0_PER_EDGE; "
-        f"continuity=RELATIVE_POSITION; group-outside=ON; pole-exclusivity=ON; "
-        f"global-order=ON; slot-changes={slot_changes}; preserved={continuity_preserved}"
+        f"relative=COMPACT_RELATIVE_POSITION; side-stability=ON; "
+        f"spacing={float(spacing):.3f}m; pole-exclusivity=ON; "
+        f"slot-changes={slot_changes}; preserved={continuity_preserved}; "
+        f"side-stable={side_stable}; compressed={compressed_edges}"
     )
     return edge_crs, work, ordered, routes, slots
-
-
-# ---------------------------------------------------------------------------
-# Corner Decision + Corner Geometry
-# ---------------------------------------------------------------------------
-
 def _safe_unit(a, b):
     vector = _base._unit(a, b)
     if abs(vector[0]) <= 1e-12 and abs(vector[1]) <= 1e-12:
