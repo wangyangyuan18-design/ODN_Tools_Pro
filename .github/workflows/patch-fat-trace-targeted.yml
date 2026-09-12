@@ -18,160 +18,249 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
+
           p = Path('cable_offset_core.py')
           s = p.read_text(encoding='utf-8')
 
-          old = '''FAT_TRACE_DESIGN = "DAR436_H1A1"
-          FAT_TRACE_LINKS = {"L3", "L4"}
-          FAT_TRACE_NODE = "N0020"
-          FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"
+          def replace_once(old, new, label):
+              global s
+              if old not in s:
+                  raise SystemExit(f'{label} not found')
+              s = s.replace(old, new, 1)
 
-          def _fat_trace_focus(design, feature_name=""):
-              if not isinstance(design, dict):
-                  return False
-              link = str(design.get("link", "")).upper().strip()
-              text = " ".join(str(design.get(k, "")) for k in ("name", "fdt", "link")).upper()
-              seq = " ".join(str(x) for x in (design.get("sequence", []) or [])).upper()
-              return (FAT_TRACE_DESIGN in text and link in FAT_TRACE_LINKS and
-                      (FAT_TRACE_NODE in seq or FAT_TRACE_FAT in str(feature_name).upper()))
+          # Exact diagnostic scope only.
+          s = re.sub(r'FAT_TRACE_DESIGN\s*=\s*"[^"]+"', 'FAT_TRACE_DESIGN = "DAR463_H1A1"', s, count=1)
+          s = re.sub(r'FAT_TRACE_FAT\s*=\s*"[^"]+"', 'FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"', s, count=1)
+          if 'FAT_TRACE_EPS_M' not in s:
+              replace_once(
+                  'FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"\n',
+                  'FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"\nFAT_TRACE_EPS_M = 0.05\n',
+                  'trace epsilon'
+              )
 
-          def _fat_trace_point(point):
+          # Ensure feature-name helper exists.
+          if 'def _fat_trace_feature_name(feature):' not in s:
+              marker = 'def _fat_trace_point(point):\n'
+              helper = '''def _fat_trace_feature_name(feature):
+              try:
+                  index = feature.fields().indexOf("Name")
+                  return str(feature[index] or "") if index >= 0 else ""
+              except Exception:
+                  return ""
+
           '''
-          new = '''FAT_TRACE_DESIGN = "DAR436_H1A1"
-          FAT_TRACE_LINKS = {"L3", "L4"}
-          FAT_TRACE_NODE = "N0020"
-          FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"
+              replace_once(marker, helper + marker, 'feature helper marker')
 
-          def _fat_trace_link_match(design):
-              if not isinstance(design, dict):
-                  return False
-              link = str(design.get("link", "")).upper().strip()
-              text = " ".join(
-                  str(design.get(k, ""))
-                  for k in ("name", "fdt", "link", "_link_id")
-              ).upper()
-              return FAT_TRACE_DESIGN in text and link in FAT_TRACE_LINKS
+          # ①② exact FAT discovery and actual owner Link.
+          marker = '''    moves = {}
+    stats = {
+'''
+          inject = '''    # ---- FAT TRACE ①②: discovery + actual owner -------------------------
+    for feature_id, reference in references.items():
+        feature = features.get(int(feature_id))
+        if feature is None:
+            continue
+        fat_name = _fat_trace_feature_name(feature)
+        if fat_name.upper() != FAT_TRACE_FAT.upper():
+            continue
+        owner_index = int(reference.get("design_index", -1))
+        owner_design = designs[owner_index] if 0 <= owner_index < len(designs) else {}
+        owner_link = str(owner_design.get("link", ""))
+        _log(
+            f"[FAT-TRACE][01 DISCOVERED] fat={fat_name}; feature_id={feature_id}; "
+            f"owner_design_index={owner_index}; owner_link={owner_link}; "
+            f"seq_pos={reference.get('sequence_pos')}; expected_owner=L3"
+        )
+        _log(
+            f"[FAT-TRACE][02 OWNER] fat={fat_name}; owner={owner_link}; expected=L3; "
+            f"design={owner_design.get('name', '')}; link_id={owner_design.get('_link_id', '')}"
+        )
 
-          def _fat_trace_node_match(design):
-              if not isinstance(design, dict):
-                  return False
-              values = []
-              for key in ("sequence", "sequence_ids"):
-                  values.extend(design.get(key, []) or [])
-              for segment in design.get("segments", []) or []:
-                  values.extend(segment.get("sequence_ids", []) or [])
-                  values.extend(segment.get("nodes", []) or [])
-              return FAT_TRACE_NODE in " ".join(str(x) for x in values).upper()
+    moves = {}
+    stats = {
+'''
+          if marker in s and 'FAT-TRACE][01 DISCOVERED' not in s:
+              replace_once(marker, inject, 'prepare stats marker')
 
-          def _fat_trace_focus(design, feature_name="", require_node=True):
-              if not _fat_trace_link_match(design):
-                  return False
-              if not require_node:
-                  return True
-              return _fat_trace_node_match(design) or FAT_TRACE_FAT in str(feature_name).upper()
+          # ③ owner L3/L4 entering Offset Core.
+          old = '''        trace_design = _fat_trace_focus(design)
+        new_segments = []
+'''
+          new = '''        trace_design = _fat_trace_focus(design)
+        if trace_design:
+            seq = design.get("sequence_ids", []) or []
+            node_positions = [
+                i for i, item in enumerate(seq)
+                if FAT_TRACE_NODE in " ".join(str(x) for x in item).upper()
+                if isinstance(item, (list, tuple))
+            ]
+            _log(
+                f"[FAT-TRACE][03 OFFSET-ENTER] link={design.get('link','')}; "
+                f"node={FAT_TRACE_NODE}; node_seq_positions={node_positions}; "
+                f"sequence_count={len(seq)}"
+            )
+        new_segments = []
+'''
+          replace_once(old, new, 'offset enter trace')
 
-          def _fat_trace_label(design):
-              return str(
-                  design.get("_link_id")
-                  or design.get("name")
-                  or f"{design.get('fdt', '')} {design.get('link', '')}"
-              ).strip()
+          old = '''            segment["_fat_trace_design"] = bool(trace_design)
+            segment["_fat_trace_segment_index"] = segment_index
+'''
+          new = '''            segment["_fat_trace_design"] = bool(trace_design)
+            segment["_fat_trace_segment_index"] = segment_index
+            if trace_design:
+                segment["_fat_trace_sequence_ids"] = list(design.get("sequence_ids", []) or [])
+                segment["_fat_trace_link"] = str(design.get("link", ""))
+'''
+          replace_once(old, new, 'segment trace metadata')
 
-          def _fat_trace_point(point):
-          '''
-          if old not in s:
-              raise SystemExit('target trace block not found')
-          s = s.replace(old, new, 1)
+          # ④ original N0020 route position.
+          old = '''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)
+    if len(nodes) != len(edges) + 1:
+'''
+          new = '''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)
+    if segment.get("_fat_trace_design"):
+        seq = segment.get("_fat_trace_sequence_ids", []) or []
+        seg_index = int(segment.get("_fat_trace_segment_index", -1))
+        local_positions = {
+            int(pos) - seg_index
+            for pos, item in enumerate(seq)
+            if FAT_TRACE_NODE in " ".join(str(x) for x in item).upper()
+        }
+        for local_pos in sorted(x for x in local_positions if 0 <= x < len(nodes)):
+            _log(
+                f"[FAT-TRACE][04 ORIGINAL-NODE] link={segment.get('_fat_trace_link','')}; "
+                f"segment={seg_index}; node={FAT_TRACE_NODE}; local_index={local_pos}; "
+                f"node={_fat_trace_point(nodes[local_pos])}"
+            )
+    if len(nodes) != len(edges) + 1:
+'''
+          replace_once(old, new, 'original node trace')
 
-          marker = '''def _fat_target(ref, design, feature, fat_layer, edge_crs, work):\n'''
-          helper = '''def _fat_trace_owner_candidates(designs, references, features):
-              """Resolve FATs adjacent to N0020 on the traced Link."""
-              result = []
-              for feature_id, reference in references.items():
-                  design_index = int(reference.get("design_index", -1))
-                  if not (0 <= design_index < len(designs)):
-                      continue
-                  design = designs[design_index]
-                  if not _fat_trace_link_match(design):
-                      continue
-                  sequence_ids = design.get("sequence_ids", []) or []
-                  pos = int(reference.get("sequence_pos", -1))
-                  neighbors = []
-                  if 0 <= pos - 1 < len(sequence_ids):
-                      neighbors.append(str(sequence_ids[pos - 1]))
-                  if 0 <= pos + 1 < len(sequence_ids):
-                      neighbors.append(str(sequence_ids[pos + 1]))
-                  if FAT_TRACE_NODE not in " ".join(neighbors).upper():
-                      continue
-                  feature = features.get(int(feature_id))
-                  name = ""
-                  if feature is not None:
-                      try:
-                          if feature.fields().indexOf("Name") >= 0:
-                              name = str(feature["Name"] or "")
-                      except Exception:
-                          pass
-                  result.append({
-                      "feature_id": int(feature_id),
-                      "name": name,
-                      "design_index": design_index,
-                      "sequence_pos": pos,
-                      "link": str(design.get("link", "")),
-                  })
-              return result
+          # ⑤ actual final corner generated at N0020.
+          old = '''            corner_decisions.append(decision)
+            _log(
+                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "
+'''
+          new = '''            trace_node_positions = {
+                int(pos) - int(segment.get("_fat_trace_segment_index", -1))
+                for pos, item in enumerate(segment.get("_fat_trace_sequence_ids", []) or [])
+                if FAT_TRACE_NODE in " ".join(str(x) for x in item).upper()
+            }
+            if segment.get("_fat_trace_design") and (edge_index + 1) in trace_node_positions:
+                _log(
+                    f"[FAT-TRACE][05 FINAL-CORNER] link={segment.get('_fat_trace_link','')}; "
+                    f"segment={segment.get('_fat_trace_segment_index')}; node={FAT_TRACE_NODE}; "
+                    f"edge={edge_index}; decision={decision}; "
+                    f"physical_node={_fat_trace_point(b)}; corner={_corner_debug_points(corner_points)}"
+                )
+                segment.setdefault("_fat_trace_corner_points", []).append({
+                    "edge": int(edge_index),
+                    "decision": str(decision),
+                    "points": [[float(p.x()), float(p.y())] for p in corner_points],
+                })
+            corner_decisions.append(decision)
+            _log(
+                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "
+'''
+          replace_once(old, new, 'final corner trace')
 
+          # ⑥ target source: is target actually one of the final corners?
+          old = '''    if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):
+        _log(f"[FAT-TRACE][TARGET] link={design.get('link','')}; feature_id={feature.id()}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; seq_pos={position}; anchor={_fat_trace_point(anchor)}; segment={nearest[1]}; distance={nearest[0]:.6f}; target={_fat_trace_point(nearest[2])}")
+'''
+          new = '''    if _fat_trace_focus(design, _fat_trace_feature_name(feature)):
+        fat_name = _fat_trace_feature_name(feature)
+        hits = []
+        for seg_index, segment in enumerate(design.get("segments", []) or []):
+            for corner in segment.get("_fat_trace_corner_points", []) or []:
+                for point in corner.get("points", []) or []:
+                    cp = QgsPointXY(float(point[0]), float(point[1]))
+                    hits.append((hypot(cp.x() - nearest[2].x(), cp.y() - nearest[2].y()), seg_index, corner, cp))
+        hit = min(hits, key=lambda x: x[0]) if hits else None
+        source = "NO_CORNER_DATA" if hit is None else (
+            f"CORNER seg={hit[1]} edge={hit[2].get('edge')} decision={hit[2].get('decision')} "
+            f"corner={_fat_trace_point(hit[3])} delta={hit[0]:.6f}m"
+            if hit[0] <= FAT_TRACE_EPS_M else
+            f"ROUTE_SEGMENT nearest_corner_delta={hit[0]:.6f}m"
+        )
+        _log(
+            f"[FAT-TRACE][06 TARGET] link={design.get('link','')}; feature_id={feature.id()}; "
+            f"fat_name={fat_name}; seq_pos={position}; anchor={_fat_trace_point(anchor)}; "
+            f"route_segment={nearest[1]}; route_distance={nearest[0]:.6f}; "
+            f"target={_fat_trace_point(nearest[2])}; source={source}"
+        )
+'''
+          replace_once(old, new, 'target source trace')
 
-          def _fat_target(ref, design, feature, fat_layer, edge_crs, work):
-          '''
-          if marker not in s:
-              raise SystemExit('fat target marker not found')
-          s = s.replace(marker, helper, 1)
+          # ⑦ target selection/move acceptance, including rejection reasons.
+          old = '''        if target is None or anchor is None:
+            stats["skipped"] += 1
+            continue
+'''
+          new = '''        if target is None or anchor is None:
+            if _fat_trace_feature_name(feature).upper() == FAT_TRACE_FAT.upper():
+                _log(
+                    f"[FAT-TRACE][07 MOVE] feature_id={feature_id}; link={trace_design.get('link','')}; "
+                    f"accepted=False; reason=NO_TARGET_OR_ANCHOR"
+                )
+            stats["skipped"] += 1
+            continue
+'''
+          replace_once(old, new, 'move reject 1')
 
-          old_start = '''    features = {int(feature.id()): feature for feature in fat_layer.getFeatures()}
-              references, duplicates = _fat_refs(designs)
-              if duplicates:
-          '''
-          new_start = '''    features = {int(feature.id()): feature for feature in fat_layer.getFeatures()}
-              references, duplicates = _fat_refs(designs)
+          old = '''        if anchor_distance > max(0.01, float(fat_limit)):
+            stats["skipped"] += 1
+            continue
+'''
+          new = '''        if anchor_distance > max(0.01, float(fat_limit)):
+            if _fat_trace_feature_name(feature).upper() == FAT_TRACE_FAT.upper():
+                _log(
+                    f"[FAT-TRACE][07 MOVE] feature_id={feature_id}; link={trace_design.get('link','')}; "
+                    f"accepted=False; reason=ANCHOR_DISTANCE; anchor_distance={anchor_distance:.6f}; "
+                    f"limit={float(fat_limit):.6f}; target={_fat_trace_point(target)}"
+                )
+            stats["skipped"] += 1
+            continue
+'''
+          replace_once(old, new, 'move reject 2')
 
-              traced = [
-                  (index, design)
-                  for index, design in enumerate(designs or [])
-                  if _fat_trace_focus(design, require_node=False)
-              ]
-              if traced:
-                  for design_index, design in traced:
-                      _log(
-                          f"[FAT-TRACE][TARGET-LINK] link={_fat_trace_label(design)}; "
-                          f"design_index={design_index}; node={FAT_TRACE_NODE}; "
-                          f"node_in_sequence={_fat_trace_node_match(design)}"
-                      )
-                      for owner in _fat_trace_owner_candidates(designs, references, features):
-                          if owner["design_index"] == design_index:
-                              _log(
-                                  f"[FAT-TRACE][FAT-OWNER] link={owner['link']}; "
-                                  f"node={FAT_TRACE_NODE}; feature_id={owner['feature_id']}; "
-                                  f"fat_name={owner['name']}; seq_pos={owner['sequence_pos']}; "
-                                  f"owner_design_index={owner['design_index']}"
-                              )
-                  _log(
-                      f"[FAT-TRACE][PREP-START] design={FAT_TRACE_DESIGN}; "
-                      f"links=L3,L4; node={FAT_TRACE_NODE}; "
-                      f"owning_fat_candidates="
-                      f"{sum(1 for x in _fat_trace_owner_candidates(designs, references, features))}"
-                  )
-              if duplicates:
-          '''
-          if old_start not in s:
-              raise SystemExit('prepare start block not found')
-          s = s.replace(old_start, new_start, 1)
+          old = '''            _log(f"[FAT-TRACE][MOVE-PREP] feature_id={feature_id}; link={trace_design.get('link','')}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; target_edge={_fat_trace_point(target_edge)}; target_layer={_fat_trace_point(target_layer)}; anchor_distance={anchor_distance:.6f}; move_distance={hypot(current.x()-target.x(), current.y()-target.y()):.6f}; accepted=YES")
+'''
+          new = '''            _log(
+                f"[FAT-TRACE][07 MOVE] feature_id={feature_id}; link={trace_design.get('link','')}; "
+                f"accepted=True; current={_fat_trace_point(current)}; target_work={_fat_trace_point(target)}; "
+                f"target_edge={_fat_trace_point(target_edge)}; target_layer={_fat_trace_point(target_layer)}; "
+                f"anchor_distance={anchor_distance:.6f}; move_distance={hypot(current.x()-target.x(), current.y()-target.y()):.6f}"
+            )
+'''
+          replace_once(old, new, 'move accepted trace')
+
+          # ⑧ final layer coordinate actually written back.
+          old = '''        geometry = QgsGeometry.fromPointXY(QgsPointXY(target))
+        if feature.geometry().distance(geometry) > 1e-9:
+            feature.setGeometry(geometry)
+            if not layer.updateFeature(feature):
+'''
+          new = '''        geometry = QgsGeometry.fromPointXY(QgsPointXY(target))
+        if _fat_trace_feature_name(feature).upper() == FAT_TRACE_FAT.upper():
+            _log(
+                f"[FAT-TRACE][08 WRITEBACK] feature_id={feature_id}; fat_name={_fat_trace_feature_name(feature)}; "
+                f"before={_fat_trace_point(feature.geometry().centroid().asPoint())}; "
+                f"after={_fat_trace_point(QgsPointXY(target))}; "
+                f"changed={feature.geometry().distance(geometry) > 1e-9}"
+            )
+        if feature.geometry().distance(geometry) > 1e-9:
+            feature.setGeometry(geometry)
+            if not layer.updateFeature(feature):
+'''
+          replace_once(old, new, 'writeback trace')
 
           p.write_text(s, encoding='utf-8')
           PY
           python -m py_compile cable_offset_core.py
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git diff --check
           git add cable_offset_core.py
-          git diff --cached --check
-          git commit -m "fix: target FAT trace to DAR436 L3 L4 N0020"
+          git commit -m "debug: full 8-point FAT trace for DAR463 L3 L4 N0020"
           git push
