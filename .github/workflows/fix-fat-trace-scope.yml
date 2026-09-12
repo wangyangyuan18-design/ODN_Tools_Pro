@@ -1,0 +1,44 @@
+name: Fix FAT trace scope
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'FAT_TRACE_SCOPE_TRIGGER.md'
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fix trace variable scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('cable_offset_core.py')
+          s = p.read_text(encoding='utf-8')
+          old = 'if _fat_trace_focus(trace_design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):'
+          new = 'if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):'
+          if old not in s:
+              raise SystemExit('expected FAT trace scope line not found')
+          s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+      - name: Global undefined-name check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -q ruff
+          ruff check --select F821 --output-format=concise .
+      - name: Commit fix and remove temporary workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm -f .github/workflows/fix-fat-trace-scope.yml FAT_TRACE_SCOPE_TRIGGER.md
+          git add cable_offset_core.py
+          git commit -m 'fix: correct FAT trace variable scope'
+          git push
