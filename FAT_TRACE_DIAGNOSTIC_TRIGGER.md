@@ -1,1 +1,1 @@
-Trigger FAT trace diagnostic patch.
+RUN DEEP FAT TRACE 8-POINT
