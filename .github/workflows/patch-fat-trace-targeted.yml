@@ -1,6 +1,9 @@
 name: Patch targeted FAT trace
 
 on:
+  push:
+    paths:
+      - '.github/workflows/patch-fat-trace-targeted.yml'
   workflow_dispatch:
 
 jobs:
@@ -82,18 +85,13 @@ jobs:
 
           marker = '''def _fat_target(ref, design, feature, fat_layer, edge_crs, work):\n'''
           helper = '''def _fat_trace_owner_candidates(designs, references, features):
-              """Resolve FATs adjacent to N0020 on the traced Link.
-
-              FAT ownership is taken from the actual sequence reference, never
-              from the FAT display name.  This deliberately tolerates the known
-              DAR436/DAR463 name discrepancy in the test case.
-              """
+              """Resolve FATs adjacent to N0020 on the traced Link."""
               result = []
               for feature_id, reference in references.items():
-                  design_index = reference.get("design_index")
-                  if not (0 <= int(design_index) < len(designs)):
+                  design_index = int(reference.get("design_index", -1))
+                  if not (0 <= design_index < len(designs)):
                       continue
-                  design = designs[int(design_index)]
+                  design = designs[design_index]
                   if not _fat_trace_link_match(design):
                       continue
                   sequence_ids = design.get("sequence_ids", []) or []
@@ -116,7 +114,7 @@ jobs:
                   result.append({
                       "feature_id": int(feature_id),
                       "name": name,
-                      "design_index": int(design_index),
+                      "design_index": design_index,
                       "sequence_pos": pos,
                       "link": str(design.get("link", "")),
                   })
@@ -124,7 +122,7 @@ jobs:
 
 
           def _fat_target(ref, design, feature, fat_layer, edge_crs, work):
-'''
+          '''
           if marker not in s:
               raise SystemExit('fat target marker not found')
           s = s.replace(marker, helper, 1)
@@ -132,7 +130,7 @@ jobs:
           old_start = '''    features = {int(feature.id()): feature for feature in fat_layer.getFeatures()}
               references, duplicates = _fat_refs(designs)
               if duplicates:
-'''
+          '''
           new_start = '''    features = {int(feature.id()): feature for feature in fat_layer.getFeatures()}
               references, duplicates = _fat_refs(designs)
 
@@ -163,19 +161,14 @@ jobs:
                       f"{sum(1 for x in _fat_trace_owner_candidates(designs, references, features))}"
                   )
               if duplicates:
-'''
+          '''
           if old_start not in s:
               raise SystemExit('prepare start block not found')
           s = s.replace(old_start, new_start, 1)
 
           p.write_text(s, encoding='utf-8')
           PY
-
           python -m py_compile cable_offset_core.py
-
-      - name: Commit patch
-        shell: bash
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add cable_offset_core.py
