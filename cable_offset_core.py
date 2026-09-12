@@ -2,9 +2,9 @@
 """Authoritative ODN cable offset engine.
 
 This is the ONLY offset planning/geometry implementation. It contains no
-versioned offset runtime chain and performs no monkey-patching. Link topology
-remains authoritative; this module only creates output geometry for
-Distribution Cable and final FAT landing points.
+versioned offset runtime chain and performs no runtime replacement hooks.
+Link topology remains authoritative; this module only creates output geometry
+for Distribution Cable and final FAT landing points.
 """
 from math import acos, degrees, hypot, tan, radians
 from qgis.PyQt.QtCore import QSettings
@@ -15,10 +15,7 @@ from . import cable_offset_layout as _base
 
 LOG_TAG="ODN_Tools_Pro / Cable Offset"; DEFAULT_SPACING_M=.50; DEFAULT_CONTROL_M=.30
 DEFAULT_FAT_MAX_DISTANCE_M=3.0; SPACING_KEY="ODNToolsPro/CableOffsetLayout/spacing_m"; CONTROL_DISTANCE_KEY="ODNToolsPro/CableOffsetLayout/control_distance_m"
-# FAT is intentionally NOT in SPECIAL: FAT must remain exclusive between
-# independent Links. It is special only as a same-point endpoint/fan-out.
-SHARED_NODE_TYPES={"FDT","BB","CL","CLOSURE","SFCCL","SFCCLOSURE"}
-ENDPOINT_TYPES=SHARED_NODE_TYPES|{"FAT"}
+SHARED_NODE_TYPES={"FDT","BB","CL","CLOSURE","SFCCL","SFCCLOSURE"}; ENDPOINT_TYPES=SHARED_NODE_TYPES|{"FAT"}
 
 def _log(message,level=Qgis.Info):
     try: QgsMessageLog.logMessage(str(message),LOG_TAG,level)
@@ -177,7 +174,7 @@ def _geometry(segment,slot_by_edge,spacing,work,edge_crs,control):
     def add(p):
         p=QgsPointXY(p)
         if not out or hypot(out[-1].x()-p.x(),out[-1].y()-p.y())>1e-7:out.append(p)
-    add(old[0]);special=_endpoint_special(segment.get("_endpoint_start_type") and (segment.get("_endpoint_start_type"),0) or None) or bool(segment.get("_odn_special_start"))
+    add(old[0]);special=bool(segment.get("_odn_special_start"))
     for i,slot in enumerate(slots):
         a,b=nodes[i],nodes[i+1]
         if i==0:add(a) if slot==0 or not special else add(_takeoff_entry(a,b,slot,spacing,control))
