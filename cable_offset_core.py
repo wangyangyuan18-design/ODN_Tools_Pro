@@ -595,34 +595,34 @@ def _early_turn_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spa
 
 
 def _main_reach_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spacing):
-    """F: reach the Main Lane region first, then turn into the target lane."""
-    in_dir = _safe_unit(in_a, in_b)
+    """F: leave Main Lane through the corner and enter the target lane directly.
+
+    The old implementation inserted ``main_anchor`` behind the route vertex
+    (0.45 * spacing = 0.225 m at the default spacing). For a Main Lane ->
+    side Lane transition this created the observed backward-then-forward
+    dog-leg. The corner must not travel backward after reaching the Pole.
+    """
     out_dir = _safe_unit(out_a, out_b)
-    d_prev = abs(int(prev_slot)) * float(spacing)
     d_next = abs(int(next_slot)) * float(spacing)
-    run = max(float(spacing), d_prev, d_next)
-    edge_in_length = hypot(in_b.x() - in_a.x(), in_b.y() - in_a.y())
+    run = max(float(spacing), d_next)
     edge_out_length = hypot(out_b.x() - out_a.x(), out_b.y() - out_a.y())
-    run_in = _clamped_run(edge_in_length, 0.45 * run)
     run_out = _clamped_run(edge_out_length, 0.90 * run)
 
-    main_anchor = _point_back(node, in_dir, run_in)
-    main_after = _point_forward(node, out_dir, run_out)
-    target_after = _offset_lane_point(main_after, out_dir, next_slot, spacing)
+    target_after = _offset_lane_point(
+        _point_forward(node, out_dir, run_out),
+        out_dir,
+        next_slot,
+        spacing,
+    )
 
     _log(
         f"[corner-debug] MAIN_REACH; spacing={float(spacing):.3f}; "
         f"prev_slot={int(prev_slot)}; next_slot={int(next_slot)}; "
-        f"run_in={float(run_in):.3f}; run_out={float(run_out):.3f}; "
-        f"node={_corner_debug_point(node)}; "
-        f"main_anchor={_corner_debug_point(main_anchor)}; "
-        f"main_after={_corner_debug_point(main_after)}; "
+        f"run_in=REMOVED; run_out={float(run_out):.3f}; "
+        f"main_anchor=REMOVED; node={_corner_debug_point(node)}; "
         f"target_after={_corner_debug_point(target_after)}"
     )
-
-    # Preserve the Main Lane as a visible short approach before the lane change.
-    # The physical Pole is never inserted as an intermediate geometry vertex.
-    return [main_anchor, target_after]
+    return [target_after]
 
 
 def _cross_main_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spacing):
