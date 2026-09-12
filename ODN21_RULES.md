@@ -33,3 +33,5 @@ Link Design 继续使用现有 Pole Edge 路由。ODN 2.1 不建立第二套物�
 - ODN 2.0 行为保持不变。
 - ODN 2.1 只在项目配置明确启用 ODN 2.1 且 BB/SFC Closure 节点已配置时启用对应规则。
 - 所有自动判断先写入详细 QGIS Message Log，至少记录：Link、Segment、实际长度、限制值、回缆边、候选 BB 节点、SFC 最后合法杆节点及累计距离。
+
+<!-- rebuild marker: endpoint-only Pole occupancy rules restored -->
