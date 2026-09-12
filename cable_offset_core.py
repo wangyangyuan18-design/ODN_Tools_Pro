@@ -460,6 +460,17 @@ def _plan(designs, dc, edge_layer, spacing):
         f"side-stable={side_stable}; compressed={compressed_edges}"
     )
     return edge_crs, work, ordered, routes, slots
+def _corner_debug_point(point):
+    try:
+        return f"({float(point.x()):.6f},{float(point.y()):.6f})"
+    except Exception:
+        return str(point)
+
+
+def _corner_debug_points(points):
+    return "[" + ", ".join(_corner_debug_point(point) for point in (points or [])) + "]"
+
+
 def _safe_unit(a, b):
     vector = _base._unit(a, b)
     if abs(vector[0]) <= 1e-12 and abs(vector[1]) <= 1e-12:
@@ -599,6 +610,16 @@ def _main_reach_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spa
     main_after = _point_forward(node, out_dir, run_out)
     target_after = _offset_lane_point(main_after, out_dir, next_slot, spacing)
 
+    _log(
+        f"[corner-debug] MAIN_REACH; spacing={float(spacing):.3f}; "
+        f"prev_slot={int(prev_slot)}; next_slot={int(next_slot)}; "
+        f"run_in={float(run_in):.3f}; run_out={float(run_out):.3f}; "
+        f"node={_corner_debug_point(node)}; "
+        f"main_anchor={_corner_debug_point(main_anchor)}; "
+        f"main_after={_corner_debug_point(main_after)}; "
+        f"target_after={_corner_debug_point(target_after)}"
+    )
+
     # Preserve the Main Lane as a visible short approach before the lane change.
     # The physical Pole is never inserted as an intermediate geometry vertex.
     return [main_anchor, target_after]
@@ -624,6 +645,17 @@ def _cross_main_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spa
     incoming = _offset_lane_point(_point_back(node, in_dir, cross_run), in_dir, prev_slot, spacing)
     main_hold = _point_forward(node, out_dir, hold_run)
     target = _offset_lane_point(_point_forward(node, out_dir, turn_run), out_dir, next_slot, spacing)
+
+    _log(
+        f"[corner-debug] CROSS_MAIN; spacing={float(spacing):.3f}; "
+        f"prev_slot={int(prev_slot)}; next_slot={int(next_slot)}; "
+        f"magnitude={float(magnitude):.3f}; cross_run={float(cross_run):.3f}; "
+        f"hold_run={float(hold_run):.3f}; turn_run={float(turn_run):.3f}; "
+        f"node={_corner_debug_point(node)}; "
+        f"incoming={_corner_debug_point(incoming)}; "
+        f"main_hold={_corner_debug_point(main_hold)}; "
+        f"target={_corner_debug_point(target)}"
+    )
 
     return [incoming, main_hold, target]
 
@@ -651,6 +683,11 @@ def _build_corner_geometry(node, in_edge, out_edge, prev_slot, next_slot, spacin
         if filtered:
             points = filtered
 
+    _log(
+        f"[corner-debug] BUILT; decision={decision}; "
+        f"prev_slot={int(prev_slot)}; next_slot={int(next_slot)}; "
+        f"node={_corner_debug_point(node)}; points={_corner_debug_points(points)}"
+    )
     return decision, points
 
 
@@ -757,6 +794,11 @@ def _geometry(segment, slot_by_edge, spacing, work, edge_crs, control):
             _log(
                 f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "
                 f"prev_slot={slot}; next_slot={next_slot}; decision={decision}"
+            )
+            _log(
+                f"[corner-debug] FINAL-CORNER; link={segment.get('name', '')}; "
+                f"edge={edge_index}; decision={decision}; "
+                f"points={_corner_debug_points(corner_points)}"
             )
             for point in corner_points:
                 add(point)
