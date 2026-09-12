@@ -17,14 +17,12 @@ def classFactory(iface):
     from .link_design import LinkDesignDock
     from .fat_return import install_fat_return_button
     from .plugin_undo import undo_last
-    from .fat_landing_coincident_patch import install_coincident_fat_fallback
     from .odn_link_rules import install_project_config_defaults
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
     initialize_project_manager_context()
     install_project_config_defaults()
-    install_coincident_fat_fallback()
 
     class ODNToolsPro:
         def __init__(self, iface):
