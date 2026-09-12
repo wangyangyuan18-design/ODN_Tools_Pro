@@ -57,8 +57,15 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
     base = _v3._v2._base
     original_base_assign = base._assign_slots
     original_base_build = base._build_segment_points
+    original_v3_geometry = _v3._build_explicit_points
     counters = {"edges": 0, "overlap_edges": 0, "slots": {}}
     try:
+        # IMPORTANT: v3.apply_layout_to_designs internally installs its own
+        # base._build_segment_points wrapper, but that wrapper calls the
+        # module-local v3._build_explicit_points(). Therefore patching only
+        # base._build_segment_points is NOT sufficient. This was the reason
+        # the previous v10 geometry changes had almost no visible effect in
+        # QGIS even though the v10 allocator logs appeared.
         global_assigner, lane_debug = _v10.make_global_slot_assigner(
             designs, distribution_layer, edge_layer, spacing, counters
         )
@@ -82,8 +89,20 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
         )
 
         base._assign_slots = global_assigner
+
+        # v10 must become the geometry function actually called by v3.
+        # v10's wrapper uses the v8 continuous-corner builder with explicit
+        # endpoint semantics: normal Pole = direct landing, special shared
+        # endpoint = 0.30 m takeoff.
         base._build_segment_points = _v10.make_build_wrapper(
             original_base_build, control_distance_m
+        )
+        _v3._build_explicit_points = _v10.make_build_wrapper(
+            original_v3_geometry, control_distance_m
+        )
+        _log(
+            "[geometry-v10] module-local v3 builder patched; "
+            "endpoint semantics and continuous-corner geometry are ACTIVE"
         )
 
         original_factory_local = _v3._transition_factory
@@ -130,6 +149,7 @@ def _apply(designs, distribution_layer, edge_layer, spacing, control_distance_m)
     finally:
         base._assign_slots = original_base_assign
         base._build_segment_points = original_base_build
+        _v3._build_explicit_points = original_v3_geometry
 
 
 def apply_explicit_layout_to_designs(
@@ -163,12 +183,12 @@ def apply_explicit_layout_to_designs(
 
     for design in designs or []:
         layout = dict(design.get("layout") or {})
-        layout["version"] = 16
+        layout["version"] = 17
         layout["spacing_m"] = round(spacing, 3)
         layout["corner_control_distance_m"] = round(control_distance_m, 3)
         layout["rule"] = "global_route_sequential_relative_lanes"
         layout["transition_angle"] = "geometry_from_offset_lane_spacing"
-        layout["corner_geometry"] = "v9_continuous_offset_lanes"
+        layout["corner_geometry"] = "v10_continuous_offset_lanes"
         layout["main_lane_rule"] = "available_main_lane_first"
         layout["lane_continuity_rule"] = "preserve_previous_relative_lane"
         layout["group_join_rule"] = "new_cable_outside_existing_group"
@@ -183,7 +203,7 @@ def apply_explicit_layout_to_designs(
     summary["ordinary_corner_control_distance"] = None
     summary["fanout_control_distance_m"] = control_distance_m
     summary["transition_rule"] = "continuous relative-lane geometry; no ordinary 0.30m control"
-    summary["corner_geometry"] = "v9_continuous_offset_lanes"
+    summary["corner_geometry"] = "v10_continuous_offset_lanes"
     summary["lane_allocator"] = "v10_route_sequential_main_first"
     summary["fat_landing"] = "owning_link_final_offset_geometry"
     _log(
