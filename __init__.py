@@ -13,7 +13,7 @@ def classFactory(iface):
     from .odn_project_validation import install_validation_page
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
-    from .link_design_v17 import LinkDesignDock
+    from .link_design import LinkDesignDock
     from .fat_return import install_fat_return_button
     from .plugin_undo import undo_last
     from .fat_landing_coincident_patch import install_coincident_fat_fallback
