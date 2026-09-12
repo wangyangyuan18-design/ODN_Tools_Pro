@@ -909,7 +909,7 @@ def _fat_target(ref, design, feature, fat_layer, edge_crs, work):
     nearest = _nearest_on_route(design, anchor, edge_crs, work)
     if nearest is None:
         return None, anchor, {"reason": "无法从最终 Offset Cable 几何确定 FAT 落点"}
-    if _fat_trace_focus(trace_design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):
+    if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):
         _log(f"[FAT-TRACE][TARGET] link={design.get('link','')}; feature_id={feature.id()}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; seq_pos={position}; anchor={_fat_trace_point(anchor)}; segment={nearest[1]}; distance={nearest[0]:.6f}; target={_fat_trace_point(nearest[2])}")
     return nearest[2], anchor, {
         "segment_index": nearest[1],
