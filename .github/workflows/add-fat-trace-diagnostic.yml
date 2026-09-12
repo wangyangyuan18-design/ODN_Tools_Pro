@@ -1,4 +1,4 @@
-name: Add FAT trace diagnostic
+name: Run Deep FAT trace 8-point
 on:
   push:
     paths:
@@ -10,58 +10,54 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Add diagnostic logs
+        with:
+          fetch-depth: 0
+
+      - name: Run the existing 8-point patch
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
-          p = Path('cable_offset_core.py')
-          s = p.read_text(encoding='utf-8')
+          import re
 
-          old_focus = '''def _fat_trace_focus(design, feature_name=""):\n    if not isinstance(design, dict):\n        return False\n    link = str(design.get("link", "")).upper().strip()\n    text = " ".join(str(design.get(k, "")) for k in ("name", "fdt", "link")).upper()\n    seq = " ".join(str(x) for x in (design.get("sequence", []) or [])).upper()\n    return (FAT_TRACE_DESIGN in text and link in FAT_TRACE_LINKS and\n            (FAT_TRACE_NODE in seq or FAT_TRACE_FAT in str(feature_name).upper()))\n'''
-          new_focus = '''def _fat_trace_focus(design, feature_name=""):\n    if not isinstance(design, dict):\n        return False\n    link = str(design.get("link", "")).upper().strip()\n    text = " ".join(str(design.get(k, "")) for k in ("name", "fdt", "link")).upper()\n    seq = " ".join(str(x) for x in (design.get("sequence", []) or [])).upper()\n    feature_text = str(feature_name).upper()\n    design_match = FAT_TRACE_DESIGN in text\n    link_match = link in FAT_TRACE_LINKS or any(f" {x}" in text or text.endswith(x) for x in FAT_TRACE_LINKS)\n    node_match = FAT_TRACE_NODE in seq\n    fat_match = FAT_TRACE_FAT in feature_text\n    return design_match and link_match and (node_match or fat_match)\n'''
-          if old_focus not in s:
-              raise SystemExit('expected _fat_trace_focus block not found')
-          s = s.replace(old_focus, new_focus, 1)
-
-          old_start = '''def _prepare_fat_moves(designs, fat_layer, edge_layer, work, fat_limit):\n    if fat_layer is None:\n'''
-          new_start = '''def _prepare_fat_moves(designs, fat_layer, edge_layer, work, fat_limit):\n    _log(f"[FAT-TRACE][PREP-START] designs={len(designs or [])}; fat_layer={'YES' if fat_layer is not None else 'NO'}; fat_limit={float(fat_limit):.3f}")\n    if fat_layer is None:\n'''
-          if old_start not in s:
-              raise SystemExit('expected _prepare_fat_moves start not found')
-          s = s.replace(old_start, new_start, 1)
-
-          old_loop = '''    for feature_id, feature in features.items():\n        reference = references.get(feature_id)\n'''
-          new_loop = '''    for feature_id, feature in features.items():\n        reference = references.get(feature_id)\n        feature_name = str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""\n        if FAT_TRACE_FAT in feature_name.upper():\n            _log(f"[FAT-TRACE][FEATURE-SCAN] feature_id={feature_id}; fat_name={feature_name}; reference={reference}")\n'''
-          if old_loop not in s:
-              raise SystemExit('expected FAT feature loop not found')
-          s = s.replace(old_loop, new_loop, 1)
-
-          old_ref = '''        if reference is None:\n            stats["skipped"] += 1\n            continue\n        target, anchor, info = _fat_target(\n'''
-          new_ref = '''        if reference is None:\n            stats["skipped"] += 1\n            continue\n        trace_candidate = False\n        try:\n            trace_candidate = _fat_trace_focus(designs[reference["design_index"]], feature_name)\n        except Exception:\n            trace_candidate = False\n        if trace_candidate:\n            trace_design_scan = designs[reference["design_index"]]\n            _log(f"[FAT-TRACE][CANDIDATE] feature_id={feature_id}; link={trace_design_scan.get('link','')}; name={trace_design_scan.get('name','')}; fdt={trace_design_scan.get('fdt','')}; sequence={trace_design_scan.get('sequence', [])}; seq_pos={reference.get('sequence_pos')}")\n        target, anchor, info = _fat_target(\n'''
-          if old_ref not in s:
-              raise SystemExit('expected FAT reference block not found')
-          s = s.replace(old_ref, new_ref, 1)
-
-          # Add design scan once before FAT iteration, so a focus mismatch is visible.
-          old_features = '''    features = {int(feature.id()): feature for feature in fat_layer.getFeatures()}\n    references = _fat_refs(designs)\n'''
-          new_features = '''    features = {int(feature.id()): feature for feature in fat_layer.getFeatures()}\n    references = _fat_refs(designs)\n    for scan_index, scan_design in enumerate(designs or []):\n        scan_text = " ".join(str(scan_design.get(k, "")) for k in ("name", "fdt", "link")).upper()\n        if FAT_TRACE_DESIGN in scan_text:\n            _log(f"[FAT-TRACE][DESIGN-SCAN] index={scan_index}; link={scan_design.get('link','')}; name={scan_design.get('name','')}; fdt={scan_design.get('fdt','')}; sequence={scan_design.get('sequence', [])}; segments={len(scan_design.get('segments', []) or [])}")\n'''
-          if old_features not in s:
-              raise SystemExit('expected feature/reference initialization not found')
-          s = s.replace(old_features, new_features, 1)
-
-          p.write_text(s, encoding='utf-8')
+          wf = Path('.github/workflows/deep-fat-trace-8point.yml').read_text(encoding='utf-8')
+          start = wf.find('          python - <<\'PY\'')
+          if start < 0:
+              raise SystemExit('Deep FAT trace python block not found')
+          start = wf.find('\n', start) + 1
+          end = wf.find('\n          PY', start)
+          if end < 0:
+              raise SystemExit('Deep FAT trace python block terminator not found')
+          block = wf[start:end]
+          block = '\n'.join(line[10:] if line.startswith('          ') else line for line in block.splitlines())
+          Path('/tmp/deep_fat_trace_patch.py').write_text(block, encoding='utf-8')
+          compile(block, 'deep_fat_trace_patch.py', 'exec')
+          print('Extracted 8-point patch:', len(block), 'bytes')
           PY
+          python /tmp/deep_fat_trace_patch.py
           python -m py_compile cable_offset_core.py
-          python -m pip install --disable-pip-version-check -q ruff
-          ruff check --select F821 --output-format=concise .
-      - name: Commit and remove temporary workflow
+          git diff --check
+          echo '--- TRACE MARKERS ---'
+          grep -n 'FAT-TRACE' cable_offset_core.py
+          test "$(grep -c '\[FAT-TRACE\]\[01 DISCOVERED\]' cable_offset_core.py)" -ge 1
+          test "$(grep -c '\[FAT-TRACE\]\[02 OWNER\]' cable_offset_core.py)" -ge 1
+          test "$(grep -c '\[FAT-TRACE\]\[03 OFFSET-ENTER\]' cable_offset_core.py)" -ge 1
+          test "$(grep -c '\[FAT-TRACE\]\[04 ORIGINAL-NODE\]' cable_offset_core.py)" -ge 1
+          test "$(grep -c '\[FAT-TRACE\]\[05 FINAL-CORNER\]' cable_offset_core.py)" -ge 1
+          test "$(grep -c '\[FAT-TRACE\]\[06 TARGET\]' cable_offset_core.py)" -ge 1
+          test "$(grep -c '\[FAT-TRACE\]\[07 MOVE\]' cable_offset_core.py)" -ge 1
+          test "$(grep -c '\[FAT-TRACE\]\[08 WRITEBACK\]' cable_offset_core.py)" -ge 1
+
+      - name: Commit and verify
         shell: bash
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add cable_offset_core.py
-          git rm -f .github/workflows/add-fat-trace-diagnostic.yml FAT_TRACE_DIAGNOSTIC_TRIGGER.md
-          git commit -m 'debug: make FAT trace diagnostics reachable'
-          git push
+          git rm -f FAT_TRACE_DIAGNOSTIC_TRIGGER.md .github/workflows/add-fat-trace-diagnostic.yml
+          git commit -m 'debug: restore complete FAT trace 8-point chain'
+          git push origin HEAD:main
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
