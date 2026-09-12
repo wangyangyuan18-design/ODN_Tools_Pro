@@ -19,7 +19,6 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
-          import re
 
           wf = Path('.github/workflows/deep-fat-trace-8point.yml').read_text(encoding='utf-8')
           start = wf.find("          python - <<'PY'")
@@ -32,30 +31,29 @@ jobs:
           block = wf[start:end]
           block = '\n'.join(line[10:] if line.startswith('          ') else line for line in block.splitlines())
 
-          # The live source no longer contains the old segment metadata assignment.
-          # Remove that optional injection and make 04/05 self-contained diagnostics.
-          block = re.sub(
-              r'\n          # 05\. Final corner generated at N0020\..*?(?=\n          # 06\. Target source:)',
-              '\n          # 05 removed below and replaced by runtime-independent logging.\n\n          # 06. Target source:',
-              block,
-              flags=re.S,
-          )
+          # Remove the stale segment metadata injection that fails on current source.
+          p = block.find("old = '''            segment[\"_fat_trace_design\"]")
+          if p >= 0:
+              q = block.find('# 04. Original N0020 route node.', p)
+              if q < 0:
+                  raise SystemExit('04 anchor missing while removing stale metadata block')
+              block = block[:p] + block[q:]
 
-          # Replace 04/05 with diagnostics that do not require _fat_trace_design metadata.
-          block = re.sub(
-              r'\n          # 04\. Original N0020 route node\..*?(?=\n          # 05 removed below)',
-              '''\n          # 04. Log original route nodes for the traced DAR/L3/L4 context.\n          old = ''' + repr('''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)\n''') + '''\n          new = ''' + repr('''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)\n    segment_text = str(segment).upper()\n    if any(token in segment_text for token in (FAT_TRACE_DESIGN, FAT_TRACE_NODE, "L3", "L4")):\n        for local_node_index, node_point in enumerate(nodes):\n            _log(f"[FAT-TRACE][04 ORIGINAL-NODE] segment_node_index={local_node_index}; original_route_node={_fat_trace_point(node_point)}; segment_hint={segment_text[:180]}")\n''') + '''\n          if old not in s:\n              raise SystemExit("04 ORIGINAL-NODE runtime anchor not found")\n          s = s.replace(old, new, 1)\n\n''',
-              block,
-              flags=re.S,
-          )
+          # Replace the 04 section with runtime-independent node logging.
+          p = block.find('# 04. Original N0020 route node.')
+          q = block.find('# 05. Final corner generated at N0020.', p)
+          if p < 0 or q < 0:
+              raise SystemExit('04/05 patch anchors missing')
+          replacement_04 = '''# 04. Original N0020 route node diagnostic.\n          old = ''' + repr('''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)\n''') + '''\n          new = ''' + repr('''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)\n    segment_text = str(segment).upper()\n    if any(token in segment_text for token in (FAT_TRACE_DESIGN, FAT_TRACE_NODE, "L3", "L4")):\n        for local_node_index, node_point in enumerate(nodes):\n            _log(f"[FAT-TRACE][04 ORIGINAL-NODE] segment_node_index={local_node_index}; original_route_node={_fat_trace_point(node_point)}; segment_hint={segment_text[:180]}")\n''') + '''\n          if old not in s:\n              raise SystemExit("04 ORIGINAL-NODE runtime anchor not found")\n          s = s.replace(old, new, 1)\n\n'''
+          block = block[:p] + replacement_04 + block[q:]
 
-          # The 05 section is replaced by a direct corner-decision log.
-          corner_marker = '''            corner_decisions.append(decision)\n            _log(\n                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; \\n'''
-          block = block.replace(
-              corner_marker,
-              '''            if any(token in str(segment).upper() for token in (FAT_TRACE_DESIGN, FAT_TRACE_NODE, "L3", "L4")):\n                _log(f"[FAT-TRACE][05 FINAL-CORNER] segment={segment.get('name', '')}; edge={edge_index}; decision={decision}; physical_node={_fat_trace_point(b)}; corner={_corner_debug_points(corner_points)}")\n            corner_decisions.append(decision)\n            _log(\n                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; \\n''',
-              1,
-          )
+          # Replace 05 with a direct corner log; no segment metadata required.
+          p = block.find('# 05. Final corner generated at N0020.')
+          q = block.find('# 06. Target source:', p)
+          if p < 0 or q < 0:
+              raise SystemExit('05/06 patch anchors missing')
+          replacement_05 = '''# 05. Final corner diagnostic.\n          corner_marker = ''' + repr('''            corner_decisions.append(decision)\n            _log(\n                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "\n''') + '''\n          corner_replacement = ''' + repr('''            if any(token in str(segment).upper() for token in (FAT_TRACE_DESIGN, FAT_TRACE_NODE, "L3", "L4")):\n                _log(f"[FAT-TRACE][05 FINAL-CORNER] segment={segment.get('name', '')}; edge={edge_index}; decision={decision}; physical_node={_fat_trace_point(b)}; corner={_corner_debug_points(corner_points)}")\n            corner_decisions.append(decision)\n            _log(\n                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "\n''') + '''\n          if corner_marker not in s:\n              raise SystemExit("05 FINAL-CORNER runtime anchor not found")\n          s = s.replace(corner_marker, corner_replacement, 1)\n\n'''
+          block = block[:p] + replacement_05 + block[q:]
 
           Path('/tmp/deep_fat_trace_patch.py').write_text(block, encoding='utf-8')
           compile(block, 'deep_fat_trace_patch.py', 'exec')
