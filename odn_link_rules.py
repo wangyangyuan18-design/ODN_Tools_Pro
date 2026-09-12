@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """Authoritative engineering rules for ODN Link Design.
 
-The values below are project-schema defaults. Operational code reads the
-active ODN Project parameters; these constants are used only when a project
-is new/legacy and does not yet contain the rule fields.
+The active ODN Project is the only operational source. These constants are
+schema defaults and the one-time migration target for legacy projects.
 """
 
 FDT_MAX_LINKS = 8
@@ -20,31 +19,30 @@ def default_parameters():
 
 
 def migrate_parameters(parameters):
-    """Normalize legacy Link capacity defaults to the current project schema."""
+    """Normalize legacy/missing Link capacity fields to the current schema."""
     params = parameters if isinstance(parameters, dict) else {}
     version = params.get("link_rule_version")
-
-    # 4/4 was the old Project Config default. A project without the new rule
-    # marker is migrated once to the current engineering rule 8/4.
     if version != RULE_VERSION:
         params["fdt_max_links"] = FDT_MAX_LINKS
         params["max_fats_per_link"] = MAX_FATS_PER_LINK
         params["link_rule_version"] = RULE_VERSION
-    else:
-        try:
-            params["fdt_max_links"] = max(1, int(params.get("fdt_max_links", FDT_MAX_LINKS)))
-        except (TypeError, ValueError):
-            params["fdt_max_links"] = FDT_MAX_LINKS
-        try:
-            params["max_fats_per_link"] = max(1, int(params.get("max_fats_per_link", MAX_FATS_PER_LINK)))
-        except (TypeError, ValueError):
-            params["max_fats_per_link"] = MAX_FATS_PER_LINK
+        return params
+    try:
+        params["fdt_max_links"] = max(1, int(params.get("fdt_max_links", FDT_MAX_LINKS)))
+    except (TypeError, ValueError):
+        params["fdt_max_links"] = FDT_MAX_LINKS
+    try:
+        params["max_fats_per_link"] = max(1, int(params.get("max_fats_per_link", MAX_FATS_PER_LINK)))
+    except (TypeError, ValueError):
+        params["max_fats_per_link"] = MAX_FATS_PER_LINK
     return params
 
 
 def install_project_config_defaults():
-    """Keep Project Config UI and newly-created projects on the same rule source."""
+    """Bind Project Config to the same rule source and migrate its payload."""
     from . import odn_project_config as config
+    from . import odn_project_context as context
+
     config.PARAM_DEFAULTS["fdt_max_links"] = FDT_MAX_LINKS
     config.PARAM_DEFAULTS["max_fats_per_link"] = MAX_FATS_PER_LINK
 
@@ -65,9 +63,20 @@ def install_project_config_defaults():
         config.OdnProjectConfigDialog._load_current = _load_current_with_rules
         config.OdnProjectConfigDialog._link_rules_installed = True
 
+    path = context.current_path()
+    if path:
+        migrate_project_file(path)
+        try:
+            payload = context.current_payload()
+            if isinstance(payload, dict):
+                migrate_parameters(payload.setdefault("parameters", {}))
+                context.set_current(path, payload=payload)
+        except Exception:
+            pass
+
 
 def migrate_project_file(path):
-    """Upgrade an existing .odn file in place when opened by the plugin."""
+    """Upgrade an existing .odn file in place when the plugin loads it."""
     import json
     if not path:
         return False
