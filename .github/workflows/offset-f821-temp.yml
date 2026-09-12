@@ -11,13 +11,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Repair and F821
         run: |
-          python -c "from pathlib import Path; p=Path('cable_offset_core.py'); s=p.read_text(encoding='utf-8'); s=s.replace('_fat_trace_focus(design, str(feature[\"Name\"]) if feature.fields().indexOf(\"Name\") >= 0 else \"\")','_fat_trace_focus(trace_design, str(feature[\"Name\"]) if feature.fields().indexOf(\"Name\") >= 0 else \"\")',1); s=s.replace('link={design.get(\'link\',\'\')}; fat_name=','link={trace_design.get(\'link\',\'\')}; fat_name=',1); p.write_text(s,encoding='utf-8')"
+          sed -i '973s/\bdesign\b/trace_design/g;974s/\bdesign\b/trace_design/g' cable_offset_core.py
           python -m py_compile cable_offset_core.py
+          python -m pip install --disable-pip-version-check -q ruff
           ruff check --select F821 --output-format=concise .
-          if ! git diff --quiet -- cable_offset_core.py; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add cable_offset_core.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add cable_offset_core.py
+          if ! git diff --cached --quiet; then
             git commit -m 'fix: repair Offset FAT trace NameError'
             git push
           fi
