@@ -13,7 +13,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run the existing 8-point patch
+      - name: Run adapted 8-point patch
         shell: bash
         run: |
           set -euo pipefail
@@ -22,7 +22,7 @@ jobs:
           import re
 
           wf = Path('.github/workflows/deep-fat-trace-8point.yml').read_text(encoding='utf-8')
-          start = wf.find('          python - <<\'PY\'')
+          start = wf.find("          python - <<'PY'")
           if start < 0:
               raise SystemExit('Deep FAT trace python block not found')
           start = wf.find('\n', start) + 1
@@ -31,23 +31,52 @@ jobs:
               raise SystemExit('Deep FAT trace python block terminator not found')
           block = wf[start:end]
           block = '\n'.join(line[10:] if line.startswith('          ') else line for line in block.splitlines())
+
+          # The live source no longer contains the old segment metadata assignment.
+          # Remove that optional injection and make 04/05 self-contained diagnostics.
+          block = re.sub(
+              r'\n          # 05\. Final corner generated at N0020\..*?(?=\n          # 06\. Target source:)',
+              '\n          # 05 removed below and replaced by runtime-independent logging.\n\n          # 06. Target source:',
+              block,
+              flags=re.S,
+          )
+
+          # Replace 04/05 with diagnostics that do not require _fat_trace_design metadata.
+          block = re.sub(
+              r'\n          # 04\. Original N0020 route node\..*?(?=\n          # 05 removed below)',
+              '''\n          # 04. Log original route nodes for the traced DAR/L3/L4 context.\n          old = ''' + repr('''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)\n''') + '''\n          new = ''' + repr('''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)\n    segment_text = str(segment).upper()\n    if any(token in segment_text for token in (FAT_TRACE_DESIGN, FAT_TRACE_NODE, "L3", "L4")):\n        for local_node_index, node_point in enumerate(nodes):\n            _log(f"[FAT-TRACE][04 ORIGINAL-NODE] segment_node_index={local_node_index}; original_route_node={_fat_trace_point(node_point)}; segment_hint={segment_text[:180]}")\n''') + '''\n          if old not in s:\n              raise SystemExit("04 ORIGINAL-NODE runtime anchor not found")\n          s = s.replace(old, new, 1)\n\n''',
+              block,
+              flags=re.S,
+          )
+
+          # The 05 section is replaced by a direct corner-decision log.
+          corner_marker = '''            corner_decisions.append(decision)\n            _log(\n                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; \\n'''
+          block = block.replace(
+              corner_marker,
+              '''            if any(token in str(segment).upper() for token in (FAT_TRACE_DESIGN, FAT_TRACE_NODE, "L3", "L4")):\n                _log(f"[FAT-TRACE][05 FINAL-CORNER] segment={segment.get('name', '')}; edge={edge_index}; decision={decision}; physical_node={_fat_trace_point(b)}; corner={_corner_debug_points(corner_points)}")\n            corner_decisions.append(decision)\n            _log(\n                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; \\n''',
+              1,
+          )
+
           Path('/tmp/deep_fat_trace_patch.py').write_text(block, encoding='utf-8')
           compile(block, 'deep_fat_trace_patch.py', 'exec')
-          print('Extracted 8-point patch:', len(block), 'bytes')
+          print('Adapted 8-point patch:', len(block), 'bytes')
           PY
           python /tmp/deep_fat_trace_patch.py
           python -m py_compile cable_offset_core.py
           git diff --check
           echo '--- TRACE MARKERS ---'
           grep -n 'FAT-TRACE' cable_offset_core.py
-          test "$(grep -c '\[FAT-TRACE\]\[01 DISCOVERED\]' cable_offset_core.py)" -ge 1
-          test "$(grep -c '\[FAT-TRACE\]\[02 OWNER\]' cable_offset_core.py)" -ge 1
-          test "$(grep -c '\[FAT-TRACE\]\[03 OFFSET-ENTER\]' cable_offset_core.py)" -ge 1
-          test "$(grep -c '\[FAT-TRACE\]\[04 ORIGINAL-NODE\]' cable_offset_core.py)" -ge 1
-          test "$(grep -c '\[FAT-TRACE\]\[05 FINAL-CORNER\]' cable_offset_core.py)" -ge 1
-          test "$(grep -c '\[FAT-TRACE\]\[06 TARGET\]' cable_offset_core.py)" -ge 1
-          test "$(grep -c '\[FAT-TRACE\]\[07 MOVE\]' cable_offset_core.py)" -ge 1
-          test "$(grep -c '\[FAT-TRACE\]\[08 WRITEBACK\]' cable_offset_core.py)" -ge 1
+          for marker in \
+            '[FAT-TRACE][01 DISCOVERED]' \
+            '[FAT-TRACE][02 OWNER]' \
+            '[FAT-TRACE][03 OFFSET-ENTER]' \
+            '[FAT-TRACE][04 ORIGINAL-NODE]' \
+            '[FAT-TRACE][05 FINAL-CORNER]' \
+            '[FAT-TRACE][06 TARGET]' \
+            '[FAT-TRACE][07 MOVE]' \
+            '[FAT-TRACE][08 WRITEBACK]'; do
+              grep -Fq "$marker" cable_offset_core.py
+          done
 
       - name: Commit and verify
         shell: bash
