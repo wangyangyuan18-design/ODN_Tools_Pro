@@ -56,6 +56,13 @@ jobs:
             exit 1
           fi
 
+      - name: Global undefined-name static check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -q ruff
+          ruff check --select F821 --output-format=concise .
+
       - name: Prepare plugin package
         shell: bash
         run: |
