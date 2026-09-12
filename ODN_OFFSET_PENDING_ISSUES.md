@@ -1,6 +1,6 @@
-# ODN Offset Core — 当前待处理问题
+# ODN Offset Core — 当前问题与解决记录
 
-> 本文件用于记录尚未最终修改的 Offset Core 问题，作为后续代码分析与测试基准。
+> 本文件用于记录 Offset Core 的问题、根因、解决方案以及后续测试基准。
 
 ## 问题 9：Lane / Cable Group 紧凑性与相对侧稳定
 
@@ -10,7 +10,7 @@
 - 连续 Pole Edge 上，同一 Cable Group 的相对顺序和物理左右侧应保持稳定。
 - Lane 重新编号不能导致 Cable 无工程原因从左侧跳到右侧，或从右侧跳到左侧。
 - 对称示例：`-3,-2,0,+2,+4` 应压缩到约 `-2,-1,0,+1,+2`，同时保持左右关系。
-- 当前版本已在 `_plan()` 中初步实现，后续继续用实际 QGIS 数据验证。
+- 当前 `_plan()` 已实现相对 Lane 压缩、物理侧稳定和连续性保护，后续继续用实际 QGIS 数据验证。
 
 ## 问题 10：多条蓝色 Cable 在非端点 Pole 共用同一根杆
 
@@ -18,44 +18,134 @@
 - 正确规则：普通 Pole 只能由一条独立 Cable 真正落点/连接。
 - 其它 Cable 可以在 Pole 附近以自己的 offset Lane 通过，但不能把几何点落到同一个普通 Pole。
 - FDT、FAT Return、BB、SFC/CL Closure 等明确特殊节点可以按工程规则允许多 Cable 共点。
-- 后续需要同时检查 Node Constraint Planner、Corner Geometry、最终 geometry validation，不能只依赖 route-level conflict detection。
+- 当前 Offset Core 已增加普通 Pole exclusivity 校验；后续仍需用实际数据验证。
 
 ## 问题 11：普通拐角出现“先向 Pole 延伸，再继续向外偏移，再反向拐入目标方向”
 
 ### 现象
 
-典型场景：Cable 从上往下经过 Pole，在该 Pole 处向右或向左转。当前生成的几何有时表现为：
+典型场景：Cable 从上往下经过 Pole，在该 Pole 处向右或向左转。旧版本生成的几何有时表现为：
 
 1. Cable 先向某一侧/目标 Pole 方向延伸；
 2. 已经接近或到达 Pole 后，继续向该侧再延伸一段；
 3. 然后才转入真正的目标方向；
 4. 视觉上像“先拐到 Pole，再多走一段，再拐回来”。
 
-### 当前初步代码定位
+### 根因
 
-当前普通 Corner 由 `cable_offset_core.py` 中以下逻辑决定：
+问题不是单一的 `0.225 m` 参数，而是旧 D/E/F Corner Geometry 都人为加入了纵向 `run_*` 控制距离，例如：
 
-- `_corner_decision()`：根据 `prev_slot` 与 `next_slot` 选择 `SAME_LANE_TURN / EARLY_TURN / CROSS_MAIN_TURN / MAIN_REACH_TURN`。
-- `_early_turn_corner()`：在到达 Pole 前开始转弯。
-- `_main_reach_corner()`：先生成 `main_anchor`，再生成 `target_after`。
-- `_cross_main_corner()`：生成 `incoming → main_hold → target` 三个控制点。
-- `_same_lane_corner()`：通过两个 Lane offset line 的交点生成 Corner。
-- `_geometry()`：把 Corner points 加入最终 Cable geometry。
+- `run_in`
+- `run_out`
+- `cross_run`
+- `turn_run`
+- `main_anchor`
+- `main_hold`
 
-当前需要重点分析 `_main_reach_corner()` 与 `_cross_main_corner()` 是否在某些方向组合下人为生成了不必要的“向 Pole 延伸/超过 Pole 后再转向”的控制点，以及 `_geometry()` 对原始端点的 `add(old[0]) / add(old[-1])` 是否造成额外回拉。
+这些距离会随 Lane magnitude 和 Edge 长度变化，因此才会出现约 `0.225 m`、`0.928 m`、`1.265 m`、`1.437 m` 等不同长度的回折/狗腿。
 
-### 当前分析结论
+### 解决方案
 
-先不要修改代码。下一步应使用实际问题路线的 `nodes + edge_sequence + prev_slot + next_slot` 逐步追踪：
+普通 Corner 已统一到 `_unified_lane_corner()`：
 
-`_corner_decision → corner geometry → add(points) → final geometry`
+`实际 Incoming Offset Lane Line + 实际 Outgoing Offset Lane Line → 求交点`
 
-重点确认每一个控制点相对于 Pole 的方向和距离，再决定是修改 Corner Decision、Corner Geometry，还是最终 Geometry 拼接，而不是凭视觉现象直接调整 run 系数。
+- 不再使用人为纵向 `run_*` 作为 Corner 的主要几何依据。
+- 交点合理时直接使用交点。
+- 平行、近似平行或交点过远时，只使用两个真实 Lane Anchor 做直接 bevel。
+- `_same_lane_corner()`、`_early_turn_corner()`、`_main_reach_corner()`、`_cross_main_corner()` 保留原有决策入口，但统一委托给同一个 Corner Primitive。
+- 不再通过“先回到 Pole / Main Lane，再向外走一段，再转回目标 Lane”的方式制造普通拐角。
 
-### 目标规则
+### 当前状态
 
-- 普通 Corner 不应把 Cable 当成“必须先落 Pole 再继续”的线路。
-- 普通非 0 Lane 不应为了转角人为回到物理 Pole。
-- 转角应由两个实际 Pole Edge 的方向、目标 Lane 和 0.50 m spacing 直接形成连续 offset geometry。
-- 只有真正的 Main Lane 物理连接点才允许落到普通 Pole。
-- 不使用 0.30 m special takeoff 处理普通 Corner。
+**问题 11 的主要根因已经解决。** 实际 QGIS 数据仍需继续验证极端角度、平行边和大 Lane magnitude 场景。
+
+---
+
+## 问题 12：FAT 未正确跟随 Owning Link 的最终 Offset Corner
+
+### 现象
+
+部分 FAT 在 Link Design 完成 Offset 后，没有移动到其所属 Link 的最终 Offset Corner，表现为：
+
+- Link `L` 的 Cable Offset 已经生成正确 Corner；
+- FAT 的 `Owning Link` 理论上也是 `L`；
+- 但 FAT 实际位置仍停留在原始 Route / Pole 附近，或者没有准确落到 `L` 的最终 Offset Corner。
+
+### 正确设计思路
+
+当前认可的目标链路为：
+
+`先生成 L 的正确 Offset Corner`
+
+`        ↓`
+
+`L 的 Corner 成为最终几何的一部分`
+
+`        ↓`
+
+`FAT 查询 Owning Link = L`
+
+`        ↓`
+
+`FAT 移到 L 的 Corner`
+
+这个架构本身是正确的，不应该改成 FAT 自己重新计算一套 Offset。
+
+### 本次排查策略
+
+本问题暂不直接修改 FAT 几何算法，先做定点日志追踪，必须把同一个 FAT / Link 从 Offset Core 到 FAT 最终写入完整串起来。
+
+需要重点记录以下 6 个检查点：
+
+1. **Owning Link 判定**
+   - FAT ID / Name
+   - Owning Link ID / Link Name
+   - FDT / Link
+   - FAT 在设计数据中的 node / sequence 位置
+
+2. **Link 最终 Offset Geometry**
+   - Link ID
+   - segment index
+   - FAT 对应的 Route Node index
+   - Corner 是否实际生成
+   - Corner 类型
+   - Corner 最终坐标
+
+3. **FAT Corner 查询**
+   - FAT ID
+   - Owning Link
+   - 查询到的 Corner 数量
+   - 查询命中的 segment / node / vertex index
+   - 命中坐标
+
+4. **FAT 移动前后坐标**
+   - 原始 FAT 坐标
+   - Offset Corner 坐标
+   - 移动距离
+
+5. **最终 FAT 写入**
+   - FAT ID
+   - Owning Link
+   - 最终写入坐标
+   - 是否实际调用了 feature geometry 更新 / commit
+
+6. **失败原因分类**
+   - `NO_OWNING_LINK`
+   - `LINK_NOT_FOUND`
+   - `NO_OFFSET_CORNER`
+   - `CORNER_QUERY_MISS`
+   - `CORNER_COORD_EMPTY`
+   - `MOVE_NOT_APPLIED`
+   - `WRITE_NOT_COMMITTED`
+   - `OK`
+
+### 诊断目标
+
+最终必须能够从一条日志直接回答：
+
+`FAT → Owning Link → Link Segment → Corner → Corner Coordinate → FAT New Coordinate`
+
+到底在哪一步断掉。
+
+**在没有拿到这条完整链路之前，不修改 FAT 偏移算法。**
