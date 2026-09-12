@@ -1,0 +1,13 @@
+name: Temp F821 Check
+on:
+  push:
+    branches: [main]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: F821
+        run: |
+          python -m pip install --disable-pip-version-check -q ruff
+          ruff check --select F821 --output-format=concise .
