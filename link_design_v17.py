@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Legacy compatibility facade for the canonical Link Design implementation.
+"""Compatibility facade for the canonical Link Design runtime.
 
-The active implementation now lives in ``link_design.py``.  This module is
-kept only so older imports do not break during the migration away from the
-historical v9-v17 chain.
+No implementation remains in this versioned module.
 """
 from .link_design import *  # noqa: F401,F403

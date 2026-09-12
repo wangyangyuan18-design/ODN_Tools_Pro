@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Legacy compatibility facade for Link Design v16.
+"""Compatibility facade for the canonical Link Design runtime.
 
-The active Link Design implementation no longer uses v16-specific runtime
-logic. The canonical module imports the required v15 UI base directly through
-this compatibility boundary while the historical file remains importable for
-older integrations.
+No implementation remains in this versioned module.
 """
-from .link_design_v15 import LinkDesignDock  # noqa: F401
+from .link_design import *  # noqa: F401,F403
