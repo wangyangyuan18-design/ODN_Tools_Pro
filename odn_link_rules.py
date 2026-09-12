@@ -39,9 +39,10 @@ def migrate_parameters(parameters):
 
 
 def install_project_config_defaults():
-    """Bind Project Config to the same rule source and migrate its payload."""
+    """Bind Project Config and project creation to the same rule source."""
     from . import odn_project_config as config
     from . import odn_project_context as context
+    from .odn_project import OdnProjectWizard
 
     config.PARAM_DEFAULTS["fdt_max_links"] = FDT_MAX_LINKS
     config.PARAM_DEFAULTS["max_fats_per_link"] = MAX_FATS_PER_LINK
@@ -62,6 +63,20 @@ def install_project_config_defaults():
 
         config.OdnProjectConfigDialog._load_current = _load_current_with_rules
         config.OdnProjectConfigDialog._link_rules_installed = True
+
+    original_create = getattr(OdnProjectWizard, "_create_project", None)
+    if original_create is not None and not getattr(OdnProjectWizard, "_link_rules_installed", False):
+        def _create_project_with_rules(self):
+            original_create(self)
+            try:
+                path = self.state.get("project", {}).get("path")
+                if path:
+                    migrate_project_file(path)
+            except Exception:
+                pass
+
+        OdnProjectWizard._create_project = _create_project_with_rules
+        OdnProjectWizard._link_rules_installed = True
 
     path = context.current_path()
     if path:
