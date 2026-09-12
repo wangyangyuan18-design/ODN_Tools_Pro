@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """Authoritative ODN cable offset engine.
 
-This is the ONLY offset planning/geometry implementation. It deliberately
-contains no versioned offset runtime chain and performs no monkey-patching.
-Link topology remains authoritative; this module only creates output geometry
-for Distribution Cable and final FAT landing points.
+This is the ONLY offset planning/geometry implementation. It contains no
+versioned offset runtime chain and performs no monkey-patching. Link topology
+remains authoritative; this module only creates output geometry for
+Distribution Cable and final FAT landing points.
 """
 from math import acos, degrees, hypot, tan, radians
 from qgis.PyQt.QtCore import QSettings
@@ -15,7 +15,10 @@ from . import cable_offset_layout as _base
 
 LOG_TAG="ODN_Tools_Pro / Cable Offset"; DEFAULT_SPACING_M=.50; DEFAULT_CONTROL_M=.30
 DEFAULT_FAT_MAX_DISTANCE_M=3.0; SPACING_KEY="ODNToolsPro/CableOffsetLayout/spacing_m"; CONTROL_DISTANCE_KEY="ODNToolsPro/CableOffsetLayout/control_distance_m"
-SPECIAL={"FDT","BB","CL","CLOSURE","SFCCL","SFCCLOSURE"}
+# FAT is intentionally NOT in SPECIAL: FAT must remain exclusive between
+# independent Links. It is special only as a same-point endpoint/fan-out.
+SHARED_NODE_TYPES={"FDT","BB","CL","CLOSURE","SFCCL","SFCCLOSURE"}
+ENDPOINT_TYPES=SHARED_NODE_TYPES|{"FAT"}
 
 def _log(message,level=Qgis.Info):
     try: QgsMessageLog.logMessage(str(message),LOG_TAG,level)
@@ -32,8 +35,10 @@ def save_settings(spacing,control_distance):
     s=QSettings();s.setValue(SPACING_KEY,max(.01,float(spacing)));s.setValue(CONTROL_DISTANCE_KEY,max(.01,float(control_distance)));s.sync()
 
 def _kind(item): return "".join(ch for ch in str(item[0]).strip().upper() if ch.isalnum()) if item else ""
-def _special(item):
-    k=_kind(item);return k in SPECIAL or (k.startswith("SFC") and ("CL" in k or "CLOSURE" in k))
+def _shared_node(item):
+    k=_kind(item);return k in SHARED_NODE_TYPES or (k.startswith("SFC") and ("CL" in k or "CLOSURE" in k))
+def _endpoint_special(item):
+    k=_kind(item);return k in ENDPOINT_TYPES or (k.startswith("SFC") and ("CL" in k or "CLOSURE" in k))
 def _metric_crs(edge,dc=None):
     for layer in (dc,edge):
         if layer is None: continue
@@ -104,7 +109,7 @@ def _node_users(designs,edge_crs,work):
             if len(nodes)!=len(edges)+1:continue
             for ni,p in enumerate(nodes):
                 item=ids[si] if ni==0 and si<len(ids) else ids[si+1] if ni==len(nodes)-1 and si+1<len(ids) else None
-                out.setdefault(_node_key(p),[]).append({"design_index":di,"segment_index":si,"node_index":ni,"node_count":len(nodes),"special":_special(item),"kind":_kind(item)})
+                out.setdefault(_node_key(p),[]).append({"design_index":di,"segment_index":si,"node_index":ni,"node_count":len(nodes),"special":_shared_node(item),"kind":_kind(item)})
     return out
 
 def _plan(designs,dc,edge_layer,spacing):
@@ -137,7 +142,7 @@ def _plan(designs,dc,edge_layer,spacing):
     return edge_crs,work,ordered,routes,slots
 
 def _intersection(p1,p2,q1,q2):
-    rx,ry=p2.x()-p1.x(),p2.y()-p1.y();sx,sy=q2.x()-q1.x(),q2.y()-q1.y();den=rx*sy-ry*sx;scale=max(hypot(rx,ry)*hypot(sx,sy),1.); 
+    rx,ry=p2.x()-p1.x(),p2.y()-p1.y();sx,sy=q2.x()-q1.x(),q2.y()-q1.y();den=rx*sy-ry*sx;scale=max(hypot(rx,ry)*hypot(sx,sy),1.)
     if abs(den)<=1e-10*scale:return None
     qpx,qpy=q1.x()-p1.x(),q1.y()-p1.y();t=(qpx*sy-qpy*sx)/den;return QgsPointXY(p1.x()+t*rx,p1.y()+t*ry)
 
@@ -152,7 +157,7 @@ def _transition_entry(a,b,slot,spacing):
     if slot==0 or d<=1e-12:return QgsPointXY(a)
     length=hypot(b.x()-a.x(),b.y()-a.y())
     if length<=1e-12:return QgsPointXY(a)
-    angle=60. if abs(int(slot))<=2 else 75. if abs(int(slot))<=4 else 90.;run=min(d/(tan(radians(angle)) if abs(tan(radians(angle)))>1e-12 else 1.),length*.45);center=_base._point_along(a,b,run/length);return _base._offset_point(center,_base._unit(a,b),int(slot)*float(spacing))
+    angle=60. if abs(int(slot))<=2 else 75. if abs(int(slot))<=4 else 90.;tr=tan(radians(angle));run=min(d/(tr if abs(tr)>1e-12 else 1.),length*.45);center=_base._point_along(a,b,run/length);return _base._offset_point(center,_base._unit(a,b),int(slot)*float(spacing))
 
 def _takeoff_entry(a,b,slot,spacing,control):
     d=int(slot)*float(spacing)
@@ -172,7 +177,7 @@ def _geometry(segment,slot_by_edge,spacing,work,edge_crs,control):
     def add(p):
         p=QgsPointXY(p)
         if not out or hypot(out[-1].x()-p.x(),out[-1].y()-p.y())>1e-7:out.append(p)
-    add(old[0]);special=bool(segment.get("_odn_special_start"))
+    add(old[0]);special=_endpoint_special(segment.get("_endpoint_start_type") and (segment.get("_endpoint_start_type"),0) or None) or bool(segment.get("_odn_special_start"))
     for i,slot in enumerate(slots):
         a,b=nodes[i],nodes[i+1]
         if i==0:add(a) if slot==0 or not special else add(_takeoff_entry(a,b,slot,spacing,control))
@@ -193,7 +198,7 @@ def _set_flags(designs):
     for d in designs or []:
         ids=d.get("sequence_ids",[]) or []
         for i,s in enumerate(d.get("segments",[]) or []):
-            s["_odn_special_start"]=_special(ids[i]) if i<len(ids) else False;s["_odn_special_end"]=_special(ids[i+1]) if i+1<len(ids) else False
+            s["_odn_special_start"]=_endpoint_special(ids[i]) if i<len(ids) else False;s["_odn_special_end"]=_endpoint_special(ids[i+1]) if i+1<len(ids) else False
 
 def _validate(designs,edge_crs,work):
     for di,d in enumerate(designs or []):
@@ -202,16 +207,14 @@ def _validate(designs,edge_crs,work):
             if not edges:continue
             nodes=_base._extract_route_graph_nodes(s,work,edge_crs,edge_crs)
             if len(nodes)!=len(edges)+1:raise RuntimeError(f"Offset Core: Link {di} segment {si} topology invalid")
-            points=s.get("points",[]) or []
-            if len(points)<2:raise RuntimeError(f"Offset Core: Link {di} segment {si} points 无效")
+            if len(s.get("points",[]) or [])<2:raise RuntimeError(f"Offset Core: Link {di} segment {si} points 无效")
 
 def _feature_point(feature,layer,work):
     try:return _tp(QgsPointXY(feature.geometry().centroid().asPoint()),layer.crs(),work)
     except Exception:return None
 
 def _crs(authid):
-    try:
-        c=QgsCoordinateReferenceSystem(str(authid));return c if c.isValid() else None
+    try:c=QgsCoordinateReferenceSystem(str(authid));return c if c.isValid() else None
     except Exception:return None
 
 def _fat_refs(designs):
@@ -263,8 +266,7 @@ def _prepare_fat_moves(designs,fat_layer,edge_layer,work,fat_limit):
         anchor_dist=hypot(current.x()-anchor.x(),current.y()-anchor.y()) if current else 0.
         if anchor_dist>max(.01,float(fat_limit)):stats["skipped"]+=1;continue
         target_edge=_tp(target,work,edge_crs);target_layer=_tp(target_edge,edge_crs,fat_layer.crs())
-        moves[fid]={"design_index":ref["design_index"],"sequence_pos":ref["sequence_pos"],"target_edge":QgsPointXY(target_edge),"target_layer":QgsPointXY(target_layer),"target_work":target,"anchor":anchor,"move_distance":hypot(current.x()-target.x(),current.y()-target.y()) if current else 0.,"mode":"final_route_geometry"}
-        stats["straight"]+=1
+        moves[fid]={"design_index":ref["design_index"],"sequence_pos":ref["sequence_pos"],"target_edge":QgsPointXY(target_edge),"target_layer":QgsPointXY(target_layer),"target_work":target,"anchor":anchor,"move_distance":hypot(current.x()-target.x(),current.y()-target.y()) if current else 0.,"mode":"final_route_geometry"};stats["straight"]+=1
     return moves,stats
 
 def _replace_fat_endpoints(designs,moves,edge_crs):
