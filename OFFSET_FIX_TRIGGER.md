@@ -1,0 +1,1 @@
+Temporary trigger for Offset NameError repair; safe to remove after workflow completes.
