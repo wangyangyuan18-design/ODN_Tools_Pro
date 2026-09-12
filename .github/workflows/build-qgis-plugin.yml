@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -18,26 +18,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Apply CROSS_MAIN geometry fix
-        shell: bash
-        run: python .github/patch_cross_main.py
-
-      - name: Commit CROSS_MAIN fix
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add cable_offset_core.py
-          if git diff --cached --quiet; then
-            echo 'CROSS_MAIN fix already present.'
-          else
-            git commit -m 'Fix CROSS_MAIN corner geometry [skip ci]'
-            git push
-          fi
 
       - name: Validate QGIS plugin structure
         shell: bash
