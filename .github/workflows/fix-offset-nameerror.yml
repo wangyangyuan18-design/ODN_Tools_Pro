@@ -1,0 +1,33 @@
+name: Fix Offset NameError
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  fix:
+    if: github.event.head_commit.message != 'fix: repair Offset FAT trace NameError'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fix undefined design variable
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('cable_offset_core.py')
+          s = p.read_text(encoding='utf-8')
+          old1 = "if _fat_trace_focus(design, str(feature[\"Name\"]) if feature.fields().indexOf(\"Name\") >= 0 else \"\"):"
+          old2 = "_log(f\"[FAT-TRACE][MOVE-PREP] feature_id={feature_id}; link={design.get('link','')}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; target_edge={_fat_trace_point(target_edge)}; target_layer={_fat_trace_point(target_layer)}; anchor_distance={anchor_distance:.6f}; move_distance={hypot(current.x()-target.x(), current.y()-target.y()):.6f}; accepted=YES\")"
+          new1 = "if _fat_trace_focus(trace_design, str(feature[\"Name\"]) if feature.fields().indexOf(\"Name\") >= 0 else \"\"):"
+          new2 = "_log(f\"[FAT-TRACE][MOVE-PREP] feature_id={feature_id}; link={trace_design.get('link','')}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; target_edge={_fat_trace_point(target_edge)}; target_layer={_fat_trace_point(target_layer)}; anchor_distance={anchor_distance:.6f}; move_distance={hypot(current.x()-target.x(), current.y()-target.y()):.6f}; accepted=YES\")"
+          if old1 not in s or old2 not in s:
+              raise SystemExit('Expected Offset NameError lines not found')
+          s = s.replace(old1, new1, 1).replace(old2, new2, 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+          python -m py_compile cable_offset_core.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add cable_offset_core.py
+          git commit -m 'fix: repair Offset FAT trace NameError'
+          git push
