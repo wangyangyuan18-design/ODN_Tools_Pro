@@ -128,61 +128,88 @@ def _plan(designs,dc,edge_layer,spacing):
             reserved_cache[e]=_base._existing_slot_occupancy(QgsGeometry.fromPolylineXY([a,b]),spacing,idx,geoms)
         return set(reserved_cache[e])
 
-    # Problem 6-7 policy:
-    # 1) first cable entering an unoccupied new-route group takes slot 0 when
-    #    Pole exclusivity permits it;
-    # 2) once an edge/group has a cable, later cables enter from the outside;
-    # 3) a continuing cable keeps its previous slot across shared edges;
-    # 4) a continuing cable never moves to slot 0 merely because slot 0 becomes
-    #    locally empty; relative position is more important than local vacancy.
+    # 6-7 invariant:
+    # For every traversed Pole Edge, if an existing independent cable does not
+    # already occupy the main lane, exactly ONE planned cable occupies slot 0.
+    # The primary cable is kept as the same route continues; other cables keep
+    # their relative side/ordering and are added from the outside.
     edge_group_slots={}
+    for e in {u.edge_key for u in pending}:
+        edge_group_slots[e]=[]
+
     for di in ordered:
-        prev=None;prevseg=None
+        prev_by_seg={}
         for u in sorted(route_uses.get(di,[]),key=lambda x:(x.segment_index,x.edge_index)):
-            if prevseg is not None and u.segment_index!=prevseg:prev=None
-            e=u.edge_key
-            used=used_by_edge.setdefault(e,reserved(e))
-            group=edge_group_slots.setdefault(e,[])
-            a,b=_base._edge_points(e);a,b=_tp(a,edge_crs,work),_tp(b,edge_crs,work)
-            ka,kb=_node_key(a),_node_key(b)
-            chosen=None
-            if prev is not None:
-                p=int(prev)
-                if p not in used:
-                    chosen=p
-                else:
-                    sign=1 if p>0 else -1 if p<0 else (1 if u.side_hint>=0 else -1)
-                    mag=max([abs(int(x)) for x in used]+[0])+1
-                    while sign*mag in used: mag+=1
-                    chosen=sign*mag
+            prev_by_seg[u.segment_index]=u
+
+    # Process each edge as a group, not cable-by-cable. This is essential for
+    # the "exactly one slot 0" invariant.
+    uses_by_edge={}
+    for u in pending:
+        uses_by_edge.setdefault(u.edge_key,[]).append(u)
+
+    for e,uses in uses_by_edge.items():
+        used=set(reserved(e))
+        # Existing slot 0 means the edge already has its one main occupant.
+        main_taken=0 in used
+        ordered_uses=sorted(uses,key=lambda u:(rank.get(u.design_index,999999),u.segment_index,u.edge_index))
+
+        # Prefer the cable that was already on slot 0 on the previous edge.
+        # This preserves the same-route primary position through continuous
+        # shared routes. Otherwise the highest-priority route becomes primary.
+        primary=None
+        if not main_taken:
+            for u in ordered_uses:
+                prev_key=(u.design_index,u.segment_index,u.edge_index-1)
+                if u.edge_index>0 and slots.get(prev_key)==0:
+                    primary=u;break
+            if primary is None:
+                primary=ordered_uses[0] if ordered_uses else None
+
+        assigned={}
+        if primary is not None and not main_taken:
+            key=(primary.design_index,primary.segment_index,primary.edge_index)
+            assigned[key]=0
+            used.add(0)
+            edge_group_slots[e].append(0)
+
+        # Assign the remaining cables. A continuing cable keeps its previous
+        # slot when possible. If that slot conflicts with the primary or an
+        # existing cable, move only outward; never insert a new cable between
+        # existing group members.
+        for u in ordered_uses:
+            key=(u.design_index,u.segment_index,u.edge_index)
+            if key in assigned:continue
+            prev=slots.get((u.design_index,u.segment_index,u.edge_index-1)) if u.edge_index>0 else None
+            if prev is not None and int(prev) not in used:
+                chosen=int(prev)
             else:
-                # New group member: slot 0 is reserved for the first/primary
-                # route only. A later link may not insert itself into the group.
-                if not group and 0 not in used and owners.get(ka,di)==di and owners.get(kb,di)==di:
-                    chosen=0
-                else:
-                    sign=1 if u.side_hint>=0 else -1
-                    occupied_group=set(int(x) for x in group)
-                    candidates=[]
-                    for mag in range(max(1,max([abs(int(x)) for x in used|occupied_group]+[0])+1),101):
-                        candidates.extend((sign*mag,-sign*mag))
-                    for c in candidates:
-                        if c not in used and c not in occupied_group:
-                            chosen=c;break
-                    if chosen is None:
-                        mag=max([abs(int(x)) for x in used|occupied_group]+[0])+1
-                        chosen=mag*sign
-            if chosen is None:
-                chosen=0 if 0 not in used else 1
-            slots[(di,u.segment_index,u.edge_index)]=int(chosen)
-            u.slot=int(chosen);used.add(int(chosen));group.append(int(chosen));prev=int(chosen);prevseg=u.segment_index
-    # Strong invariant for 6: whenever any newly planned group has a usable
-    # main lane, at least its primary member owns slot 0.
-    for e,group in edge_group_slots.items():
-        if not group or 0 in reserved(e):
-            continue
-        owners_here=[k for k,v in slots.items() if k[2]>=0 and v==0 and _base._canonical_edge(([e[0],[e[1],e[2]]])) if False]
-    _log(f"[route-plan] links={len(ordered)}; main=priority-first; continuity=RELATIVE_POSITION; group-outside=ON; pole-exclusivity=ON")
+                sign=1 if u.side_hint>=0 else -1
+                occupied_group=set(edge_group_slots[e])
+                start=max(1,max([abs(int(x)) for x in used|occupied_group]+[0])+1)
+                chosen=None
+                for mag in range(start,101):
+                    for cand in (sign*mag,-sign*mag):
+                        if cand not in used and cand not in occupied_group:
+                            chosen=cand;break
+                    if chosen is not None:break
+                if chosen is None:
+                    chosen=(max([abs(int(x)) for x in used|occupied_group]+[0])+1)*sign
+            assigned[key]=int(chosen);used.add(int(chosen));edge_group_slots[e].append(int(chosen))
+
+        for u in ordered_uses:
+            key=(u.design_index,u.segment_index,u.edge_index);chosen=int(assigned[key]);slots[key]=chosen;u.slot=chosen
+
+        # Hard assertion/logging for the engineering invariant. If an existing
+        # cable occupies slot 0, it is the sole main occupant. Otherwise exactly
+        # one planned cable must be slot 0 whenever this edge has a planned use.
+        planned_zero=sum(1 for u in ordered_uses if slots.get((u.design_index,u.segment_index,u.edge_index))==0)
+        if not main_taken and ordered_uses and planned_zero!=1:
+            raise RuntimeError(f"Offset Core: Pole Edge main-lane invariant violated for edge {e}: planned_zero={planned_zero}")
+        if main_taken and planned_zero:
+            raise RuntimeError(f"Offset Core: Pole Edge has duplicate main-lane ownership for edge {e}")
+
+    _log(f"[route-plan] links={len(ordered)}; main=EXACTLY_ONE_SLOT0_PER_EDGE; continuity=RELATIVE_POSITION; group-outside=ON; pole-exclusivity=ON")
     return edge_crs,work,ordered,routes,slots
 
 def _intersection(p1,p2,q1,q2):
@@ -361,8 +388,8 @@ def apply_offset_layout(designs,distribution_layer,edge_layer,spacing=DEFAULT_SP
                 cp["points"]=out;cp["distance"]=round(g.length(),3);cp["layout_spacing"]=round(spacing,3);new.append(cp);total+=g.length()
             else:new.append(cp);total+=float(cp.get("distance",0.) or 0.)
         if diff:d["segments"]=new;d["length"]=round(total,3);changed.add(di)
-        d["source_crs"]=edge_crs.authid();d["layout"]={"version":22,"engine":"OffsetCore","work_crs":work.authid(),"spacing_m":round(spacing,3),"fanout_control_distance_m":round(control_distance_m,3),"main_lane":"primary_group_member_required","lane":"relative_position_continuity_group_outside","pole":"one_independent_cable_landing","corner":"continuous_offset","takeoff":"special_endpoint_only","fat":"owning_link_final_geometry"}
+        d["source_crs"]=edge_crs.authid();d["layout"]={"version":23,"engine":"OffsetCore","work_crs":work.authid(),"spacing_m":round(spacing,3),"fanout_control_distance_m":round(control_distance_m,3),"main_lane":"exactly_one_primary_slot0_per_edge","lane":"relative_position_continuity_group_outside","pole":"one_independent_cable_landing","corner":"continuous_offset","takeoff":"special_endpoint_only","fat":"owning_link_final_geometry"}
     moves,stats=_prepare_fat_moves(designs,fat_layer,edge_layer,work,fat_max_distance_m) if fat_layer is not None else ({},{"total":0,"skipped":0,"corner":0,"straight":0});endpoint_updates=_replace_fat_endpoints(designs,moves,edge_crs) if moves else 0;_validate(designs,edge_crs,work)
-    summary={"changed_designs":len(changed),"changed_indices":sorted(changed),"spacing_m":spacing,"extra_length_m":round(extra,3),"version":22,"work_crs":work.authid(),"lane_allocator":"OffsetCore","priority":ordered,"slot_map":{str(k):int(v) for k,v in slot_map.items()},"corner_geometry":"continuous_offset","fanout_control_distance_m":control_distance_m,"fat_moves":moves,"fat_total":stats["total"],"fat_skipped":stats["skipped"],"fat_corner":stats["corner"],"fat_straight":stats["straight"],"fat_endpoint_updates":endpoint_updates,"fat_max_distance_m":float(fat_max_distance_m)}
-    _log(f"[OffsetCore] links={len(ordered)}; changed={len(changed)}; spacing={spacing:.3f}m; control={control_distance_m:.3f}m; main=PRIMARY_SLOT0; relative=GROUP_CONTINUITY; ordinary_corner_control=NOT_USED; fat={stats['total']}; fat_skipped={stats['skipped']}")
+    summary={"changed_designs":len(changed),"changed_indices":sorted(changed),"spacing_m":spacing,"extra_length_m":round(extra,3),"version":23,"work_crs":work.authid(),"lane_allocator":"OffsetCore","priority":ordered,"slot_map":{str(k):int(v) for k,v in slot_map.items()},"corner_geometry":"continuous_offset","fanout_control_distance_m":control_distance_m,"fat_moves":moves,"fat_total":stats["total"],"fat_skipped":stats["skipped"],"fat_corner":stats["corner"],"fat_straight":stats["straight"],"fat_endpoint_updates":endpoint_updates,"fat_max_distance_m":float(fat_max_distance_m)}
+    _log(f"[OffsetCore] links={len(ordered)}; changed={len(changed)}; spacing={spacing:.3f}m; control={control_distance_m:.3f}m; main=EXACTLY_ONE_SLOT0_PER_EDGE; relative=GROUP_CONTINUITY; ordinary_corner_control=NOT_USED; fat={stats['total']}; fat_skipped={stats['skipped']}")
     return summary
