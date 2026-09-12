@@ -31,22 +31,49 @@ FAT_TRACE_DESIGN = "DAR463_H1A1"
 FAT_TRACE_LINKS = {"L3", "L4"}
 FAT_TRACE_NODE = "N0020"
 FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"
-FAT_TRACE_FAT_POINT = (-6.924924275, 39.455387000)
+FAT_TRACE_EPS_M = 0.05
 
-def _fat_trace_focus(design, feature_name=""):
-    if not isinstance(design, dict):
-        return False
-    link = str(design.get("link", "")).upper().strip()
-    text = " ".join(str(design.get(k, "")) for k in ("name", "fdt", "link")).upper()
-    seq = " ".join(str(x) for x in (design.get("sequence", []) or [])).upper()
-    return (FAT_TRACE_DESIGN in text and link in FAT_TRACE_LINKS and
-            (FAT_TRACE_NODE in seq or FAT_TRACE_FAT in str(feature_name).upper()))
 
 def _fat_trace_point(point):
     try:
         return f"({float(point.x()):.6f},{float(point.y()):.6f})"
     except Exception:
         return str(point)
+
+
+def _fat_trace_feature_name(feature):
+    try:
+        index = feature.fields().indexOf("Name")
+        return str(feature[index] or "") if index >= 0 else ""
+    except Exception:
+        return ""
+
+
+def _fat_trace_item_text(item):
+    if isinstance(item, (list, tuple)):
+        return " ".join(str(x) for x in item).upper()
+    return str(item).upper()
+
+
+def _fat_trace_seq_match(item):
+    return FAT_TRACE_NODE in _fat_trace_item_text(item)
+
+
+def _fat_trace_link_match(design):
+    if not isinstance(design, dict):
+        return False
+    link = str(design.get("link", "")).upper().strip()
+    text = " ".join(
+        str(design.get(k, ""))
+        for k in ("name", "fdt", "link", "_link_id")
+    ).upper()
+    return FAT_TRACE_DESIGN in text and link in FAT_TRACE_LINKS
+
+
+def _fat_trace_focus(design, feature_name=""):
+    if not _fat_trace_link_match(design):
+        return False
+    return any(_fat_trace_seq_match(x) for x in (design.get("sequence_ids", []) or [])) or FAT_TRACE_FAT.upper() in str(feature_name).upper()
 DEFAULT_SPACING_M = 0.50
 DEFAULT_CONTROL_M = 0.30
 DEFAULT_FAT_MAX_DISTANCE_M = 3.0
@@ -66,10 +93,7 @@ CORNER_RETURN_TURN = "RETURN_TURN"        # special return/takeoff context
 
 
 def _log(message, level=Qgis.Info):
-    try:
-        QgsMessageLog.logMessage(str(message), LOG_TAG, level)
-    except Exception:
-        pass
+    QgsMessageLog.logMessage(str(message), LOG_TAG, level)
 
 
 def get_settings():
@@ -726,6 +750,18 @@ def _geometry(segment, slot_by_edge, spacing, work, edge_crs, control):
         return old
 
     nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)
+    if segment.get("_fat_trace_design"):
+        seq = segment.get("_fat_trace_sequence_ids", []) or []
+        seg_index = int(segment.get("_fat_trace_segment_index", -1))
+        for seq_pos, item in enumerate(seq):
+            if _fat_trace_seq_match(item):
+                local_index = seq_pos - seg_index
+                if 0 <= local_index < len(nodes):
+                    _log(
+                        f"[FAT-TRACE][04 ORIGINAL-NODE] link={segment.get('_fat_trace_link','')}; "
+                        f"segment={seg_index}; node={FAT_TRACE_NODE}; "
+                        f"node_index={local_index}; original={_fat_trace_point(nodes[local_index])}"
+                    )
     if len(nodes) != len(edges) + 1:
         raise RuntimeError("Offset Core: edge_sequence 与 route nodes 数量不一致")
 
@@ -781,6 +817,20 @@ def _geometry(segment, slot_by_edge, spacing, work, edge_crs, control):
                 spacing,
                 return_context=bool(segment.get("_odn_return_end")) and edge_index + 1 == len(slots) - 1,
             )
+            if segment.get("_fat_trace_design"):
+                seq = segment.get("_fat_trace_sequence_ids", []) or []
+                seg_index = int(segment.get("_fat_trace_segment_index", -1))
+                node_positions = {pos - seg_index for pos, item in enumerate(seq) if _fat_trace_seq_match(item)}
+                if (edge_index + 1) in node_positions:
+                    _log(
+                        f"[FAT-TRACE][05 FINAL-CORNER] link={segment.get('_fat_trace_link','')}; "
+                        f"segment={seg_index}; node={FAT_TRACE_NODE}; edge={edge_index}; "
+                        f"decision={decision}; physical_node={_fat_trace_point(b)}; "
+                        f"corner={_corner_debug_points(corner_points)}"
+                    )
+                    segment["_fat_trace_final_corner"] = [
+                        [float(p.x()), float(p.y())] for p in corner_points
+                    ]
             corner_decisions.append(decision)
             _log(
                 f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "
@@ -910,8 +960,27 @@ def _fat_target(ref, design, feature, fat_layer, edge_crs, work):
     nearest = _nearest_on_route(design, anchor, edge_crs, work)
     if nearest is None:
         return None, anchor, {"reason": "无法从最终 Offset Cable 几何确定 FAT 落点"}
-    if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):
-        _log(f"[FAT-TRACE][TARGET] link={design.get('link','')}; feature_id={feature.id()}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; seq_pos={position}; anchor={_fat_trace_point(anchor)}; segment={nearest[1]}; distance={nearest[0]:.6f}; target={_fat_trace_point(nearest[2])}")
+    fat_name = _fat_trace_feature_name(feature)
+    if _fat_trace_link_match(design) and FAT_TRACE_FAT.upper() in fat_name.upper():
+        source = "FINAL_ROUTE_SEGMENT"
+        target = nearest[2]
+        for seg_index, seg in enumerate(design.get("segments", []) or []):
+            corner = seg.get("_fat_trace_final_corner")
+            if not corner:
+                continue
+            distances = [
+                (hypot(float(x)-target.x(), float(y)-target.y()), i, x, y)
+                for i, (x, y) in enumerate(corner)
+            ]
+            if distances:
+                distance, i, x, y = min(distances)
+                if distance <= FAT_TRACE_EPS_M:
+                    source = f"FINAL_CORNER segment={seg_index}; corner_index={i}; corner=({float(x):.6f},{float(y):.6f}); distance={distance:.6f}m"
+        _log(
+            f"[FAT-TRACE][06 TARGET] link={design.get('link','')}; feature_id={feature.id()}; "
+            f"fat_name={fat_name}; route_segment={nearest[1]}; anchor={_fat_trace_point(anchor)}; "
+            f"target={_fat_trace_point(target)}; source={source}"
+        )
     return nearest[2], anchor, {
         "segment_index": nearest[1],
         "distance": nearest[0],
@@ -940,6 +1009,25 @@ def _prepare_fat_moves(designs, fat_layer, edge_layer, work, fat_limit):
     }
 
     for feature_id, reference in references.items():
+        feature = features.get(int(feature_id))
+        if feature is None:
+            continue
+        fat_name = _fat_trace_feature_name(feature)
+        if FAT_TRACE_FAT.upper() not in fat_name.upper():
+            continue
+        owner_index = int(reference.get("design_index", -1))
+        owner = designs[owner_index] if 0 <= owner_index < len(designs) else {}
+        _log(
+            f"[FAT-TRACE][01 DISCOVERED] fat={fat_name}; feature_id={feature_id}; "
+            f"expected_owner=L3; ref_design_index={owner_index}; "
+            f"ref_seq_pos={reference.get('sequence_pos')}"
+        )
+        _log(
+            f"[FAT-TRACE][02 OWNER] fat={fat_name}; owner={owner.get('link','')}; "
+            f"expected=L3; design={owner.get('_link_id', owner.get('name', ''))}"
+        )
+
+    for feature_id, reference in references.items():
         feature = features.get(feature_id)
         if feature is None:
             stats["skipped"] += 1
@@ -957,6 +1045,8 @@ def _prepare_fat_moves(designs, fat_layer, edge_layer, work, fat_limit):
         if _fat_trace_focus(trace_design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):
             _log(f"[FAT-TRACE][DECISION] feature_id={feature_id}; link={trace_design.get('link','')}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; target={_fat_trace_point(target) if target else 'None'}; info={info}")
         if target is None or anchor is None:
+            if FAT_TRACE_FAT.upper() in _fat_trace_feature_name(feature).upper():
+                _log(f"[FAT-TRACE][07 MOVE] feature_id={feature_id}; link={trace_design.get('link','')}; accepted=False; reason=NO_TARGET_OR_ANCHOR; info={info}")
             stats["skipped"] += 1
             continue
 
@@ -966,6 +1056,8 @@ def _prepare_fat_moves(designs, fat_layer, edge_layer, work, fat_limit):
             else 0.0
         )
         if anchor_distance > max(0.01, float(fat_limit)):
+            if FAT_TRACE_FAT.upper() in _fat_trace_feature_name(feature).upper():
+                _log(f"[FAT-TRACE][07 MOVE] feature_id={feature_id}; link={trace_design.get('link','')}; accepted=False; reason=ANCHOR_DISTANCE; anchor_distance={anchor_distance:.6f}; limit={float(fat_limit):.6f}")
             stats["skipped"] += 1
             continue
 
@@ -973,6 +1065,8 @@ def _prepare_fat_moves(designs, fat_layer, edge_layer, work, fat_limit):
         target_layer = _tp(target_edge, edge_crs, fat_layer.crs())
         if _fat_trace_focus(trace_design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):
             _log(f"[FAT-TRACE][MOVE-PREP] feature_id={feature_id}; link={trace_design.get('link','')}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; target_edge={_fat_trace_point(target_edge)}; target_layer={_fat_trace_point(target_layer)}; anchor_distance={anchor_distance:.6f}; move_distance={hypot(current.x()-target.x(), current.y()-target.y()):.6f}; accepted=YES")
+        if FAT_TRACE_FAT.upper() in _fat_trace_feature_name(feature).upper():
+            _log(f"[FAT-TRACE][07 MOVE] feature_id={feature_id}; link={trace_design.get('link','')}; accepted=True; move_distance={hypot(current.x()-target.x(), current.y()-target.y()):.6f}; target={_fat_trace_point(target)}")
         moves[feature_id] = {
             "design_index": reference["design_index"],
             "sequence_pos": reference["sequence_pos"],
@@ -1062,6 +1156,8 @@ def _apply_fat_moves(layer, moves):
             if not layer.updateFeature(feature):
                 raise RuntimeError(f"无法写入 FAT feature {feature_id}")
             moved += 1
+            if FAT_TRACE_FAT.upper() in _fat_trace_feature_name(feature).upper():
+                _log(f"[FAT-TRACE][08 WRITEBACK] feature_id={feature_id}; written=True; target_layer={_fat_trace_point(target)}")
     return moved
 
 
@@ -1105,13 +1201,23 @@ def apply_offset_layout(
         if design.get("written") and not design.get("needs_resync"):
             continue
 
-        trace_design = _fat_trace_focus(design)
+        trace_design = _fat_trace_link_match(design)
+        if trace_design:
+            seq = design.get("sequence_ids", []) or []
+            _log(
+                f"[FAT-TRACE][03 OFFSET-ENTER] link={design.get('link','')}; "
+                f"node={FAT_TRACE_NODE}; sequence_count={len(seq)}; "
+                f"node_positions={[i for i,x in enumerate(seq) if _fat_trace_seq_match(x)]}"
+            )
         new_segments = []
         total = 0.0
         different = False
         for segment_index, segment in enumerate(design.get("segments", []) or []):
             segment["_fat_trace_design"] = bool(trace_design)
             segment["_fat_trace_segment_index"] = segment_index
+            if trace_design:
+                segment["_fat_trace_sequence_ids"] = list(design.get("sequence_ids", []) or [])
+                segment["_fat_trace_link"] = str(design.get("link", ""))
             edge_count = len(segment.get("edge_sequence", []) or [])
             by_edge = {
                 index: slot_map.get((design_index, segment_index, index), 0)
@@ -1131,7 +1237,7 @@ def apply_offset_layout(
                 control_distance_m,
             )
             if trace_design:
-                _log(f"[FAT-TRACE][FINAL-GEOMETRY] link={design.get('link','')}; segment={segment_index}; seq={design.get('sequence', [])}; slots={by_edge}; first={_fat_trace_point(new_points[0]) if new_points else 'None'}; last={_fat_trace_point(new_points[-1]) if new_points else 'None'}; corners={segment.get('_corner_decisions', [])}")
+                _log(f"[FAT-TRACE][FINAL-GEOMETRY] link={design.get('link','')}; segment={segment_index}; seq={design.get('sequence_ids', [])}; slots={by_edge}; first={_fat_trace_point(new_points[0]) if new_points else 'None'}; last={_fat_trace_point(new_points[-1]) if new_points else 'None'}; corners={segment.get('_corner_decisions', [])}")
             copied = dict(segment)
             if len(new_points) >= 2:
                 geometry = QgsGeometry.fromPolylineXY(new_points)
