@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fix undefined trace_design
+      - name: Fix remaining FAT trace scope
         shell: bash
         run: |
           set -euo pipefail
@@ -18,11 +18,15 @@ jobs:
           from pathlib import Path
           p = Path('cable_offset_core.py')
           s = p.read_text(encoding='utf-8')
-          old = 'if _fat_trace_focus(trace_design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):'
-          new = 'if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):'
-          if old not in s:
-              raise SystemExit('expected F821 line not found')
-          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          marker = 'def _prepare_fat_moves('
+          start = s.index(marker)
+          tail = s[start:]
+          old = 'if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):'
+          new = 'if _fat_trace_focus(trace_design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):'
+          if old not in tail:
+              raise SystemExit('expected remaining FAT trace scope line not found')
+          tail = tail.replace(old, new, 1)
+          p.write_text(s[:start] + tail, encoding='utf-8')
           PY
           python -m py_compile cable_offset_core.py
           python -m pip install --disable-pip-version-check -q ruff
