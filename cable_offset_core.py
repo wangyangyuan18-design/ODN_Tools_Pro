@@ -549,112 +549,84 @@ def _corner_decision(prev_slot, next_slot, return_context=False):
     return CORNER_MAIN_REACH_TURN
 
 
-def _same_lane_corner(node, in_a, in_b, out_a, out_b, slot, spacing):
-    if int(slot) == 0:
-        return [QgsPointXY(node)]
+def _lane_offset_line(node, direction, slot, spacing):
+    """Return the infinite cable lane line through the route corner.
+
+    Lane is a lateral constraint.  It must not be represented by an arbitrary
+    longitudinal run before/after the Pole.  This helper therefore constructs
+    only the true offset line: route vertex + perpendicular Lane offset.
+    """
+    anchor = _offset_lane_point(node, direction, slot, spacing)
+    return anchor, QgsPointXY(anchor.x() + direction[0], anchor.y() + direction[1])
+
+
+def _unified_lane_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spacing):
+    """Build every ordinary corner from the two actual offset-lane lines.
+
+    The previous D/E/F implementations used different artificial longitudinal
+    distances (run_in, run_out, cross_run, turn_run, main_anchor, etc.).
+    Those distances were the common source of the observed dog-leg/backtracking
+    geometry, with the apparent excursion changing with Lane magnitude and
+    edge length.
+
+    The correct primitive is simpler: intersect the incoming and outgoing
+    offset lane lines.  If they intersect at a reasonable distance, that is
+    the corner.  If the lines are parallel or the intersection is numerically
+    too far away, use a two-point bevel made only from the two lateral lane
+    anchors.  No point is created by travelling backward or forward along an
+    edge.
+    """
     in_dir = _safe_unit(in_a, in_b)
     out_dir = _safe_unit(out_a, out_b)
-    p1, p2 = _offset_line_through_node(node, in_dir, slot, spacing)
-    q1, q2 = _offset_line_through_node(node, out_dir, slot, spacing)
-    hit = _line_intersection(p1, p2, q1, q2)
-    limit = max(6.0 * float(spacing) * max(1, abs(int(slot))), 1.5)
-    if hit is not None and hypot(hit.x() - node.x(), hit.y() - node.y()) <= limit:
-        return [hit]
+    prev_slot = int(prev_slot)
+    next_slot = int(next_slot)
 
-    # Bevel fallback: two real lane-offset points.  Never return the physical
-    # Pole as a fallback for a non-zero Lane.
-    return [p1, q1]
+    incoming_anchor, incoming_next = _lane_offset_line(
+        node, in_dir, prev_slot, spacing
+    )
+    outgoing_anchor, outgoing_next = _lane_offset_line(
+        node, out_dir, next_slot, spacing
+    )
+
+    # Main -> Main is the actual Pole ownership point.
+    if prev_slot == 0 and next_slot == 0:
+        return [QgsPointXY(node)]
+
+    hit = _line_intersection(
+        incoming_anchor, incoming_next,
+        outgoing_anchor, outgoing_next,
+    )
+
+    # A real offset-line intersection is the cleanest corner.  Do not impose
+    # a small arbitrary run; the distance is determined by the two lane lines.
+    if hit is not None:
+        distance = hypot(hit.x() - node.x(), hit.y() - node.y())
+        max_reasonable = max(4.0 * float(spacing) * max(1, abs(prev_slot), abs(next_slot)), 2.0)
+        if distance <= max_reasonable:
+            return [hit]
+
+    # Parallel / near-parallel / distant intersection: direct bevel between
+    # the two true lane anchors.  These anchors differ only laterally from the
+    # Pole, so this fallback cannot create a longitudinal dog-leg.
+    if hypot(incoming_anchor.x() - outgoing_anchor.x(), incoming_anchor.y() - outgoing_anchor.y()) > 1e-7:
+        return [incoming_anchor, outgoing_anchor]
+    return [incoming_anchor]
+
+
+def _same_lane_corner(node, in_a, in_b, out_a, out_b, slot, spacing):
+    return _unified_lane_corner(node, in_a, in_b, out_a, out_b, slot, slot, spacing)
 
 
 def _early_turn_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spacing):
-    """D: turn before the cable reaches the main route line."""
-    in_dir = _safe_unit(in_a, in_b)
-    out_dir = _safe_unit(out_a, out_b)
-    d_prev = abs(int(prev_slot)) * float(spacing)
-    d_next = abs(int(next_slot)) * float(spacing)
-    run = max(float(spacing), d_prev, d_next)
-    edge_in_length = hypot(in_b.x() - in_a.x(), in_b.y() - in_a.y())
-    edge_out_length = hypot(out_b.x() - out_a.x(), out_b.y() - out_a.y())
-    run_in = _clamped_run(edge_in_length, 0.85 * run)
-    run_out = _clamped_run(edge_out_length, 0.55 * run)
-
-    incoming = _offset_lane_point(_point_back(node, in_dir, run_in), in_dir, prev_slot, spacing)
-    outgoing = _offset_lane_point(_point_forward(node, out_dir, run_out), out_dir, next_slot, spacing)
-
-    # Use the incoming offset line and the outgoing target lane line as a real
-    # connector. If they intersect near the route vertex, prefer that natural
-    # point; otherwise keep both non-Pole control points as a bevel.
-    incoming2 = QgsPointXY(incoming.x() + in_dir[0], incoming.y() + in_dir[1])
-    outgoing2 = QgsPointXY(outgoing.x() + out_dir[0], outgoing.y() + out_dir[1])
-    hit = _line_intersection(incoming, incoming2, outgoing, outgoing2)
-    if hit is not None:
-        limit = max(8.0 * float(spacing) * max(1, abs(int(prev_slot))), 2.0)
-        if hypot(hit.x() - node.x(), hit.y() - node.y()) <= limit:
-            return [hit, outgoing]
-    return [incoming, outgoing]
+    return _unified_lane_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spacing)
 
 
 def _main_reach_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spacing):
-    """F: leave Main Lane through the corner and enter the target lane directly.
-
-    The old implementation inserted ``main_anchor`` behind the route vertex
-    (0.45 * spacing = 0.225 m at the default spacing). For a Main Lane ->
-    side Lane transition this created the observed backward-then-forward
-    dog-leg. The corner must not travel backward after reaching the Pole.
-    """
-    out_dir = _safe_unit(out_a, out_b)
-    d_next = abs(int(next_slot)) * float(spacing)
-    run = max(float(spacing), d_next)
-    edge_out_length = hypot(out_b.x() - out_a.x(), out_b.y() - out_a.y())
-    run_out = _clamped_run(edge_out_length, 0.90 * run)
-
-    target_after = _offset_lane_point(
-        _point_forward(node, out_dir, run_out),
-        out_dir,
-        next_slot,
-        spacing,
-    )
-
-    _log(
-        f"[corner-debug] MAIN_REACH; spacing={float(spacing):.3f}; "
-        f"prev_slot={int(prev_slot)}; next_slot={int(next_slot)}; "
-        f"run_in=REMOVED; run_out={float(run_out):.3f}; "
-        f"main_anchor=REMOVED; node={_corner_debug_point(node)}; "
-        f"target_after={_corner_debug_point(target_after)}"
-    )
-    return [target_after]
+    return _unified_lane_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spacing)
 
 
 def _cross_main_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spacing):
-    """E: cross the Main Lane directly when the relative side changes.
-
-    The previous implementation inserted a longitudinal ``main_hold`` point
-    (0.45 * spacing = 0.225 m at the default 0.50 m spacing). That artificial
-    control point created the observed dog-leg. CROSS_MAIN now transitions
-    directly from the incoming offset lane to the outgoing target lane.
-    """
-    in_dir = _safe_unit(in_a, in_b)
-    out_dir = _safe_unit(out_a, out_b)
-    magnitude = max(abs(int(prev_slot)), abs(int(next_slot)), 1) * float(spacing)
-    edge_in_length = hypot(in_b.x() - in_a.x(), in_b.y() - in_a.y())
-    edge_out_length = hypot(out_b.x() - out_a.x(), out_b.y() - out_a.y())
-    cross_run = _clamped_run(edge_in_length, 0.65 * magnitude)
-    turn_run = _clamped_run(edge_out_length, 0.90 * magnitude)
-
-    incoming = _offset_lane_point(_point_back(node, in_dir, cross_run), in_dir, prev_slot, spacing)
-    target = _offset_lane_point(_point_forward(node, out_dir, turn_run), out_dir, next_slot, spacing)
-
-    _log(
-        f"[corner-debug] CROSS_MAIN; spacing={float(spacing):.3f}; "
-        f"prev_slot={int(prev_slot)}; next_slot={int(next_slot)}; "
-        f"magnitude={float(magnitude):.3f}; cross_run={float(cross_run):.3f}; "
-        f"turn_run={float(turn_run):.3f}; hold_run=REMOVED; "
-        f"node={_corner_debug_point(node)}; "
-        f"incoming={_corner_debug_point(incoming)}; "
-        f"target={_corner_debug_point(target)}"
-    )
-
-    return [incoming, target]
+    return _unified_lane_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spacing)
 
 
 def _build_corner_geometry(node, in_edge, out_edge, prev_slot, next_slot, spacing, return_context=False):
