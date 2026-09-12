@@ -16,6 +16,7 @@ def classFactory(iface):
     from .odn_project_integration import install_project_creation_integration
     from .link_design import LinkDesignDock
     from .fat_return import install_fat_return_button
+    from .link_design_features import install_link_design_feature_buttons
     from .plugin_undo import undo_last
     from .odn_link_rules import install_project_config_defaults
 
@@ -86,7 +87,10 @@ def classFactory(iface):
             if self._link_design_dock is None:
                 self._link_design_dock = LinkDesignDock(self.iface, self.iface.mainWindow())
                 install_fat_return_button(self._link_design_dock)
+                install_link_design_feature_buttons(self._link_design_dock)
                 self.iface.addDockWidget(Qt.LeftDockWidgetArea, self._link_design_dock)
+            else:
+                install_link_design_feature_buttons(self._link_design_dock)
             self._link_design_dock.show()
             self._link_design_dock.raise_()
             self._link_design_dock.activateWindow()
