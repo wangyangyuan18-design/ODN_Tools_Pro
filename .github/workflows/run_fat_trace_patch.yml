@@ -3,7 +3,8 @@ on:
   push:
     paths:
       - '.github/workflows/run_fat_trace_patch.trigger'
-
+permissions:
+  contents: write
 jobs:
   patch:
     runs-on: ubuntu-latest
