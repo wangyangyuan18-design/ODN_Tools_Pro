@@ -24,10 +24,6 @@ jobs:
           p = Path('cable_offset_core.py')
           s = p.read_text(encoding='utf-8')
 
-          # -----------------------------------------------------------------
-          # 1) Replace the old broad/fragile trace selector with an exact
-          #    DAR463 + L3/L4 + N0020 + target-FAT selector.
-          # -----------------------------------------------------------------
           block = re.compile(
               r'FAT_TRACE_DESIGN = .*?\n\ndef _fat_trace_point\(point\):\n.*?\nDEFAULT_SPACING_M =',
               re.S,
@@ -90,21 +86,9 @@ jobs:
           if n != 1:
               raise SystemExit('trace selector block not found')
 
-          # -----------------------------------------------------------------
-          # 2) FAT discovery/owner trace is emitted immediately after refs
-          #    are built. This gives the actual owner Link before geometry.
-          # -----------------------------------------------------------------
-          old = '''    moves = {}\n    stats = {\n        "total": len(references),\n'''
-          new = '''    moves = {}
-    stats = {
-        "total": len(references),
-'''
-          # Keep the existing block untouched; inject the trace between stats
-          # completion and the move loop using a stable marker.
           marker = '''    }\n\n    for feature_id, reference in references.items():\n'''
           inject = '''    }
 
-    # ---- FAT TRACE ①②: discovery + actual Owner Link --------------------
     for feature_id, reference in references.items():
         feature = features.get(int(feature_id))
         if feature is None:
@@ -117,38 +101,32 @@ jobs:
         owner_link = str(owner_design.get("link", ""))
         _log(
             f"[FAT-TRACE][01 DISCOVERED] fat={fat_name}; feature_id={feature_id}; "
-            f"ref_design_index={owner_index}; ref_seq_pos={reference.get('sequence_pos')}; "
-            f"expected_owner=L3"
+            f"ref_design_index={owner_index}; ref_seq_pos={reference.get('sequence_pos')}; expected_owner=L3"
         )
         _log(
-            f"[FAT-TRACE][02 OWNER] fat={fat_name}; owner={owner_link}; "
-            f"expected=L3; owner_design={_fat_trace_label(owner_design)}"
+            f"[FAT-TRACE][02 OWNER] fat={fat_name}; owner={owner_link}; expected=L3; "
+            f"owner_design={_fat_trace_label(owner_design)}"
         )
 
     for feature_id, reference in references.items():
 '''
           if marker not in s:
-              raise SystemExit('prepare_fat_moves marker 1 not found')
+              raise SystemExit('prepare_fat_moves marker not found')
           s = s.replace(marker, inject, 1)
 
-          # -----------------------------------------------------------------
-          # 3) Trace each L3/L4 entering the Offset Core and expose the
-          #    original N0020 position from route graph nodes.
-          # -----------------------------------------------------------------
           old = '''        trace_design = _fat_trace_focus(design)\n        new_segments = []\n'''
           new = '''        trace_design = _fat_trace_link_match(design)
         if trace_design:
             seq = design.get("sequence_ids", []) or []
             node_positions = [i for i, item in enumerate(seq) if _fat_trace_seq_match(item)]
             _log(
-                f"[FAT-TRACE][03 OFFSET-ENTER] link={_fat_trace_label(design)}; "
-                f"node={FAT_TRACE_NODE}; node_seq_positions={node_positions}; "
-                f"has_target_fat={any(FAT_TRACE_FAT in str(item).upper() for item in seq)}"
+                f"[FAT-TRACE][03 OFFSET-ENTER] link={_fat_trace_label(design)}; node={FAT_TRACE_NODE}; "
+                f"node_seq_positions={node_positions}"
             )
         new_segments = []
 '''
           if old not in s:
-              raise SystemExit('apply_offset trace enter marker not found')
+              raise SystemExit('offset enter marker not found')
           s = s.replace(old, new, 1)
 
           old = '''            segment["_fat_trace_design"] = bool(trace_design)\n            segment["_fat_trace_segment_index"] = segment_index\n'''
@@ -156,15 +134,12 @@ jobs:
             segment["_fat_trace_segment_index"] = segment_index
             if trace_design:
                 segment["_fat_trace_sequence_ids"] = list(design.get("sequence_ids", []) or [])
+                segment["_fat_trace_link"] = _fat_trace_label(design)
 '''
           if old not in s:
-              raise SystemExit('segment trace metadata marker not found')
+              raise SystemExit('segment metadata marker not found')
           s = s.replace(old, new, 1)
 
-          # -----------------------------------------------------------------
-          # 4/5) Inside _geometry, print the original route node and the
-          #      actual final corner generated at N0020 for each L3/L4.
-          # -----------------------------------------------------------------
           old = '''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)\n    if len(nodes) != len(edges) + 1:\n'''
           new = '''    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)
     if segment.get("_fat_trace_design"):
@@ -177,14 +152,14 @@ jobs:
         }
         for local_pos in sorted(x for x in local_positions if 0 <= x < len(nodes)):
             _log(
-                f"[FAT-TRACE][04 ORIGINAL-NODE] link=?; segment={seg_index}; "
+                f"[FAT-TRACE][04 ORIGINAL-NODE] link={segment.get('_fat_trace_link','')}; segment={seg_index}; "
                 f"node={FAT_TRACE_NODE}; local_node_index={local_pos}; "
                 f"original_route_node={_fat_trace_point(nodes[local_pos])}"
             )
     if len(nodes) != len(edges) + 1:
 '''
           if old not in s:
-              raise SystemExit('geometry node marker not found')
+              raise SystemExit('original node marker not found')
           s = s.replace(old, new, 1)
 
           old = '''            corner_decisions.append(decision)\n            _log(\n                f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "\n'''
@@ -193,12 +168,11 @@ jobs:
                 for pos, item in enumerate(segment.get("_fat_trace_sequence_ids", []) or [])
                 if _fat_trace_seq_match(item)
             }:
-                link_label = "?"
-                corner_points_text = _corner_debug_points(corner_points)
                 _log(
-                    f"[FAT-TRACE][05 FINAL-CORNER] link={link_label}; segment={segment.get('_fat_trace_segment_index')}; "
-                    f"node={FAT_TRACE_NODE}; edge={edge_index}; decision={decision}; "
-                    f"physical_node={_fat_trace_point(b)}; corner={corner_points_text}"
+                    f"[FAT-TRACE][05 FINAL-CORNER] link={segment.get('_fat_trace_link','')}; "
+                    f"segment={segment.get('_fat_trace_segment_index')}; node={FAT_TRACE_NODE}; "
+                    f"edge={edge_index}; decision={decision}; physical_node={_fat_trace_point(b)}; "
+                    f"corner={_corner_debug_points(corner_points)}"
                 )
                 segment.setdefault("_fat_trace_corner_points", []).append({
                     "node": FAT_TRACE_NODE,
@@ -211,67 +185,44 @@ jobs:
                 f"[corner] segment={segment.get('name', '')}; edge={edge_index}; "
 '''
           if old not in s:
-              raise SystemExit('corner trace injection marker not found')
+              raise SystemExit('final corner marker not found')
           s = s.replace(old, new, 1)
 
-          # Replace the placeholder link in the two new geometry logs by
-          # deriving it from the temporary segment metadata at call time.
-          s = s.replace(
-              'f"[FAT-TRACE][04 ORIGINAL-NODE] link=?; segment={seg_index}; "',
-              'f"[FAT-TRACE][04 ORIGINAL-NODE] segment={seg_index}; "',
-          )
-          s = s.replace(
-              'f"[FAT-TRACE][05 FINAL-CORNER] link={link_label}; segment={segment.get(\'_fat_trace_segment_index\')}; "',
-              'f"[FAT-TRACE][05 FINAL-CORNER] segment={segment.get(\'_fat_trace_segment_index\')}; "',
-          )
-
-          # -----------------------------------------------------------------
-          # 6) Target query: report the nearest final-geometry target and
-          #    whether it coincides with one of the traced final corners.
-          # -----------------------------------------------------------------
           old = '''    if _fat_trace_focus(design, str(feature["Name"]) if feature.fields().indexOf("Name") >= 0 else ""):\n        _log(f"[FAT-TRACE][TARGET] link={design.get('link','')}; feature_id={feature.id()}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; seq_pos={position}; anchor={_fat_trace_point(anchor)}; segment={nearest[1]}; distance={nearest[0]:.6f}; target={_fat_trace_point(nearest[2])}")\n'''
           new = '''    fat_name = _fat_trace_feature_name(feature)
-    trace_target = _fat_trace_link_match(design) and FAT_TRACE_FAT in fat_name.upper()
-    if trace_target:
+    if _fat_trace_link_match(design) and FAT_TRACE_FAT in fat_name.upper():
         hits = []
         for seg_index, segment in enumerate(design.get("segments", []) or []):
             for corner in segment.get("_fat_trace_corner_points", []) or []:
                 for point in corner.get("points", []) or []:
                     cp = QgsPointXY(float(point[0]), float(point[1]))
-                    d = hypot(cp.x() - nearest[2].x(), cp.y() - nearest[2].y())
-                    hits.append((d, seg_index, corner.get("edge"), corner.get("decision"), cp))
+                    hits.append((hypot(cp.x() - nearest[2].x(), cp.y() - nearest[2].y()), seg_index, corner, cp))
         hit = min(hits, key=lambda x: x[0]) if hits else None
-        if hit is not None and hit[0] <= FAT_TRACE_EPS_M:
-            source = f"CORNER segment={hit[1]} edge={hit[2]} decision={hit[3]} corner={_fat_trace_point(hit[4])} distance={hit[0]:.6f}m"
-        else:
-            source = "ROUTE_SEGMENT_NO_CORNER_MATCH" if hit is None else f"ROUTE_SEGMENT_NEAREST_CORNER_DISTANCE={hit[0]:.6f}m"
+        source = "NO_CORNER_DATA" if hit is None else (
+            f"CORNER seg={hit[1]} edge={hit[2].get('edge')} decision={hit[2].get('decision')} "
+            f"corner={_fat_trace_point(hit[3])} delta={hit[0]:.6f}m"
+            if hit[0] <= FAT_TRACE_EPS_M else
+            f"ROUTE_SEGMENT nearest_corner_delta={hit[0]:.6f}m"
+        )
         _log(
             f"[FAT-TRACE][06 TARGET] link={design.get('link','')}; feature_id={feature.id()}; "
-            f"fat_name={fat_name}; seq_pos={position}; anchor={_fat_trace_point(anchor)}; "
-            f"route_segment={nearest[1]}; route_distance={nearest[0]:.6f}; "
-            f"target={_fat_trace_point(nearest[2])}; source={source}"
+            f"fat_name={fat_name}; anchor={_fat_trace_point(anchor)}; route_segment={nearest[1]}; "
+            f"route_distance={nearest[0]:.6f}; target={_fat_trace_point(nearest[2])}; source={source}"
         )
 '''
           if old not in s:
-              raise SystemExit('target trace marker not found')
+              raise SystemExit('target marker not found')
           s = s.replace(old, new, 1)
 
-          # -----------------------------------------------------------------
-          # 7) Move decision: make accepted/rejected explicit, including the
-          #    exact reason for every rejection of the target FAT.
-          # -----------------------------------------------------------------
           old = '''        if target is None or anchor is None:\n            stats["skipped"] += 1\n            continue\n'''
           new = '''        if target is None or anchor is None:
             if FAT_TRACE_FAT in _fat_trace_feature_name(feature).upper():
-                _log(
-                    f"[FAT-TRACE][07 MOVE] feature_id={feature_id}; link={trace_design.get('link','')}; "
-                    f"accepted=False; reason=NO_TARGET_OR_ANCHOR"
-                )
+                _log(f"[FAT-TRACE][07 MOVE] feature_id={feature_id}; link={trace_design.get('link','')}; accepted=False; reason=NO_TARGET_OR_ANCHOR")
             stats["skipped"] += 1
             continue
 '''
           if old not in s:
-              raise SystemExit('move reject marker 1 not found')
+              raise SystemExit('move reject 1 marker not found')
           s = s.replace(old, new, 1)
 
           old = '''        if anchor_distance > max(0.01, float(fat_limit)):\n            stats["skipped"] += 1\n            continue\n'''
@@ -280,17 +231,15 @@ jobs:
                 _log(
                     f"[FAT-TRACE][07 MOVE] feature_id={feature_id}; link={trace_design.get('link','')}; "
                     f"accepted=False; reason=ANCHOR_DISTANCE; anchor_distance={anchor_distance:.6f}; "
-                    f"limit={float(fat_limit):.6f}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; "
-                    f"target={_fat_trace_point(target)}"
+                    f"limit={float(fat_limit):.6f}; target={_fat_trace_point(target)}"
                 )
             stats["skipped"] += 1
             continue
 '''
           if old not in s:
-              raise SystemExit('move reject marker 2 not found')
+              raise SystemExit('move reject 2 marker not found')
           s = s.replace(old, new, 1)
 
-          # Change the old generic accepted line to the concise explicit trace.
           old = '''            _log(f"[FAT-TRACE][MOVE-PREP] feature_id={feature_id}; link={trace_design.get('link','')}; fat_name={feature['Name'] if feature.fields().indexOf('Name') >= 0 else ''}; current={_fat_trace_point(current)}; anchor={_fat_trace_point(anchor)}; target_edge={_fat_trace_point(target_edge)}; target_layer={_fat_trace_point(target_layer)}; anchor_distance={anchor_distance:.6f}; move_distance={hypot(current.x()-target.x(), current.y()-target.y()):.6f}; accepted=YES")\n'''
           new = '''            _log(
                 f"[FAT-TRACE][07 MOVE] feature_id={feature_id}; link={trace_design.get('link','')}; "
@@ -303,25 +252,15 @@ jobs:
               raise SystemExit('move accepted marker not found')
           s = s.replace(old, new, 1)
 
-          # -----------------------------------------------------------------
-          # 8) Final layer write-back trace immediately around the actual
-          #    QgsFeature geometry update.
-          # -----------------------------------------------------------------
           old = '''        geometry = QgsGeometry.fromPointXY(QgsPointXY(target))\n        if feature.geometry().distance(geometry) > 1e-9:\n            feature.setGeometry(geometry)\n            if not layer.updateFeature(feature):\n'''
           new = '''        geometry = QgsGeometry.fromPointXY(QgsPointXY(target))
         trace_name = _fat_trace_feature_name(feature)
-        trace_link = ""
-        if trace_name.upper() == FAT_TRACE_FAT.upper():
-            try:
-                trace_link = str((summary or {}).get("fat_moves", {}).get(feature_id, {}).get("design_index", ""))
-            except Exception:
-                trace_link = ""
         if trace_name.upper() == FAT_TRACE_FAT.upper():
             before_point = _fat_trace_point(feature.geometry().centroid().asPoint())
             after_point = _fat_trace_point(QgsPointXY(target))
             _log(
                 f"[FAT-TRACE][08 WRITEBACK] feature_id={feature_id}; fat_name={trace_name}; "
-                f"design_index={trace_link}; before={before_point}; after={after_point}; "
+                f"before={before_point}; after={after_point}; "
                 f"changed={feature.geometry().distance(geometry) > 1e-9}"
             )
         if feature.geometry().distance(geometry) > 1e-9:
@@ -332,43 +271,13 @@ jobs:
               raise SystemExit('writeback marker not found')
           s = s.replace(old, new, 1)
 
-          # -----------------------------------------------------------------
-          # 9) Keep trace L3/L4 labels on corner logs by storing the design
-          #    label into every traced segment.
-          # -----------------------------------------------------------------
-          old = '''            if trace_design:\n                segment["_fat_trace_sequence_ids"] = list(design.get("sequence_ids", []) or [])\n'''
-          new = '''            if trace_design:
-                segment["_fat_trace_sequence_ids"] = list(design.get("sequence_ids", []) or [])
-                segment["_fat_trace_link"] = _fat_trace_label(design)
-'''
-          if old not in s:
-              raise SystemExit('segment link metadata marker not found')
-          s = s.replace(old, new, 1)
-
-          old = '''                _log(\n                    f"[FAT-TRACE][04 ORIGINAL-NODE] segment={seg_index}; "\n'''
-          new = '''                _log(
-                    f"[FAT-TRACE][04 ORIGINAL-NODE] link={segment.get(' _fat_trace_link','').strip() or '?'}; segment={seg_index}; "
-'''.replace("' _fat_trace_link", "'_fat_trace_link")
-          if old not in s:
-              raise SystemExit('original node link marker not found')
-          s = s.replace(old, new, 1)
-
-          old = '''                    f"[FAT-TRACE][05 FINAL-CORNER] segment={segment.get('_fat_trace_segment_index')}; "\n'''
-          new = '''                    f"[FAT-TRACE][05 FINAL-CORNER] link={segment.get('_fat_trace_link','')}; "
-                    f"segment={segment.get('_fat_trace_segment_index')}; "
-'''
-          if old not in s:
-              raise SystemExit('final corner link marker not found')
-          s = s.replace(old, new, 1)
-
           p.write_text(s, encoding='utf-8')
           PY
-
           python -m py_compile cable_offset_core.py
           git diff --check
-          git diff --stat
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add cable_offset_core.py
           git commit -m "debug: trace FAT owner corner target move writeback"
           git push
+
+          # trigger-only workflow update
+          echo "deep FAT trace workflow executed"
