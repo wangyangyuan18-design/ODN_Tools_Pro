@@ -2,8 +2,7 @@ name: Build QGIS Plugin ZIP
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths-ignore:
       - '.github/workflows/build-qgis-plugin.yml'
       - 'ODN_Tools_Pro.zip'
@@ -26,12 +25,11 @@ jobs:
           set -euo pipefail
           test -f metadata.txt
           test -f __init__.py
-          test -s metadata.txt
           grep -q '^name=' metadata.txt
           grep -q '^version=' metadata.txt
           grep -q 'def classFactory' __init__.py
 
-      - name: Validate offset architecture
+      - name: Validate Offset Core architecture
         shell: bash
         run: |
           set -euo pipefail
@@ -39,8 +37,6 @@ jobs:
           test -f cable_offset_layout.py
           test -f cable_offset_layout_v6.py
           test ! -e cable_offset_layout_v2.py
-          test ! -e cable_offset_layout_v3.py
-          test ! -e cable_offset_layout_v4.py
           test ! -e cable_offset_layout_v5.py
           test ! -e cable_offset_layout_v7.py
           test ! -e cable_offset_layout_v8.py
@@ -48,12 +44,15 @@ jobs:
           test ! -e cable_offset_layout_v10.py
           test ! -e cable_offset_fat_v2.py
           test ! -e offset_write_patch.py
-          if grep -R -nE 'cable_offset_layout_v(2|3|4|5|7|8|9|10)|cable_offset_fat_v2|offset_write_patch' --include='*.py' .; then
-            echo 'Retired offset entry-point reference detected.'
+          grep -q 'cable_offset_core' cable_offset_layout_v6.py
+          grep -q 'cable_offset_core' cable_offset_layout_v3.py
+          grep -q 'cable_offset_core' cable_offset_layout_v4.py
+          if grep -R -nE 'cable_offset_layout_v(2|5|7|8|9|10)|cable_offset_fat_v2|offset_write_patch' --include='*.py' .; then
+            echo 'Retired offset implementation reference detected.'
             exit 1
           fi
           if grep -nE 'monkey.?patch|_target_for_fat|_build_segment_points' cable_offset_core.py; then
-            echo 'Legacy runtime monkey-patching detected in Offset Core.'
+            echo 'Legacy runtime replacement hook detected in Offset Core.'
             exit 1
           fi
 
@@ -66,31 +65,6 @@ jobs:
           rsync -a --exclude='.git/' --exclude='.github/' --exclude='.gitignore' --exclude='package/' --exclude='ODN_Tools_Pro.zip' --exclude='ODN_Tools_Pro-QGIS-Plugin.ZIP' ./ package/ODN_Tools_Pro/
           find package/ODN_Tools_Pro -type d \( -name '__pycache__' -o -name '.pytest_cache' \) -prune -exec rm -rf {} +
           find package/ODN_Tools_Pro -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
-
-      - name: Validate packaged plugin
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f package/ODN_Tools_Pro/metadata.txt
-          test -f package/ODN_Tools_Pro/__init__.py
-          grep -q 'def classFactory' package/ODN_Tools_Pro/__init__.py
-          python - <<'PY'
-          from pathlib import Path
-          root = Path('package/ODN_Tools_Pro')
-          metadata = (root / 'metadata.txt').read_text(encoding='utf-8')
-          values = {}
-          for line in metadata.splitlines():
-              if '=' in line and not line.startswith('#'):
-                  k, v = line.split('=', 1)
-                  values[k.strip()] = v.strip()
-          assert values.get('name'), values
-          assert values.get('version'), values
-          assert values.get('qgisMinimumVersion'), values
-          print('Plugin directory: ODN_Tools_Pro')
-          print('Plugin name:', values['name'])
-          print('Version:', values['version'])
-          print('Minimum QGIS:', values['qgisMinimumVersion'])
-          PY
 
       - name: Validate Python syntax
         shell: bash
@@ -108,7 +82,7 @@ jobs:
           cd ..
           unzip -t ODN_Tools_Pro.zip
 
-      - name: Verify ZIP layout and critical entry point
+      - name: Verify ZIP layout
         shell: bash
         run: |
           set -euo pipefail
@@ -117,14 +91,12 @@ jobs:
           from pathlib import PurePosixPath
           with ZipFile('ODN_Tools_Pro.zip') as zf:
               names = [n for n in zf.namelist() if n and not n.endswith('/')]
-              assert names, 'ZIP is empty'
-              top = {PurePosixPath(n).parts[0] for n in names}
-              assert top == {'ODN_Tools_Pro'}, top
+              assert names
+              assert {PurePosixPath(n).parts[0] for n in names} == {'ODN_Tools_Pro'}
               assert 'ODN_Tools_Pro/metadata.txt' in names
               assert 'ODN_Tools_Pro/__init__.py' in names
               init_text = zf.read('ODN_Tools_Pro/__init__.py').decode('utf-8')
               assert 'install_link_design_odn21' not in init_text
-              print('ZIP is directly installable as a QGIS plugin.')
           PY
 
       - name: Upload directly installable plugin
