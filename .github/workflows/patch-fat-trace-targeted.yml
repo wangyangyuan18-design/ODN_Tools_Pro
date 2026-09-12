@@ -1,0 +1,184 @@
+name: Patch targeted FAT trace
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch targeted FAT trace
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('cable_offset_core.py')
+          s = p.read_text(encoding='utf-8')
+
+          old = '''FAT_TRACE_DESIGN = "DAR436_H1A1"
+          FAT_TRACE_LINKS = {"L3", "L4"}
+          FAT_TRACE_NODE = "N0020"
+          FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"
+
+          def _fat_trace_focus(design, feature_name=""):
+              if not isinstance(design, dict):
+                  return False
+              link = str(design.get("link", "")).upper().strip()
+              text = " ".join(str(design.get(k, "")) for k in ("name", "fdt", "link")).upper()
+              seq = " ".join(str(x) for x in (design.get("sequence", []) or [])).upper()
+              return (FAT_TRACE_DESIGN in text and link in FAT_TRACE_LINKS and
+                      (FAT_TRACE_NODE in seq or FAT_TRACE_FAT in str(feature_name).upper()))
+
+          def _fat_trace_point(point):
+          '''
+          new = '''FAT_TRACE_DESIGN = "DAR436_H1A1"
+          FAT_TRACE_LINKS = {"L3", "L4"}
+          FAT_TRACE_NODE = "N0020"
+          FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"
+
+          def _fat_trace_link_match(design):
+              if not isinstance(design, dict):
+                  return False
+              link = str(design.get("link", "")).upper().strip()
+              text = " ".join(
+                  str(design.get(k, ""))
+                  for k in ("name", "fdt", "link", "_link_id")
+              ).upper()
+              return FAT_TRACE_DESIGN in text and link in FAT_TRACE_LINKS
+
+          def _fat_trace_node_match(design):
+              if not isinstance(design, dict):
+                  return False
+              values = []
+              for key in ("sequence", "sequence_ids"):
+                  values.extend(design.get(key, []) or [])
+              for segment in design.get("segments", []) or []:
+                  values.extend(segment.get("sequence_ids", []) or [])
+                  values.extend(segment.get("nodes", []) or [])
+              return FAT_TRACE_NODE in " ".join(str(x) for x in values).upper()
+
+          def _fat_trace_focus(design, feature_name="", require_node=True):
+              if not _fat_trace_link_match(design):
+                  return False
+              if not require_node:
+                  return True
+              return _fat_trace_node_match(design) or FAT_TRACE_FAT in str(feature_name).upper()
+
+          def _fat_trace_label(design):
+              return str(
+                  design.get("_link_id")
+                  or design.get("name")
+                  or f"{design.get('fdt', '')} {design.get('link', '')}"
+              ).strip()
+
+          def _fat_trace_point(point):
+          '''
+          if old not in s:
+              raise SystemExit('target trace block not found')
+          s = s.replace(old, new, 1)
+
+          marker = '''def _fat_target(ref, design, feature, fat_layer, edge_crs, work):\n'''
+          helper = '''def _fat_trace_owner_candidates(designs, references, features):
+              """Resolve FATs adjacent to N0020 on the traced Link.
+
+              FAT ownership is taken from the actual sequence reference, never
+              from the FAT display name.  This deliberately tolerates the known
+              DAR436/DAR463 name discrepancy in the test case.
+              """
+              result = []
+              for feature_id, reference in references.items():
+                  design_index = reference.get("design_index")
+                  if not (0 <= int(design_index) < len(designs)):
+                      continue
+                  design = designs[int(design_index)]
+                  if not _fat_trace_link_match(design):
+                      continue
+                  sequence_ids = design.get("sequence_ids", []) or []
+                  pos = int(reference.get("sequence_pos", -1))
+                  neighbors = []
+                  if 0 <= pos - 1 < len(sequence_ids):
+                      neighbors.append(str(sequence_ids[pos - 1]))
+                  if 0 <= pos + 1 < len(sequence_ids):
+                      neighbors.append(str(sequence_ids[pos + 1]))
+                  if FAT_TRACE_NODE not in " ".join(neighbors).upper():
+                      continue
+                  feature = features.get(int(feature_id))
+                  name = ""
+                  if feature is not None:
+                      try:
+                          if feature.fields().indexOf("Name") >= 0:
+                              name = str(feature["Name"] or "")
+                      except Exception:
+                          pass
+                  result.append({
+                      "feature_id": int(feature_id),
+                      "name": name,
+                      "design_index": int(design_index),
+                      "sequence_pos": pos,
+                      "link": str(design.get("link", "")),
+                  })
+              return result
+
+
+          def _fat_target(ref, design, feature, fat_layer, edge_crs, work):
+'''
+          if marker not in s:
+              raise SystemExit('fat target marker not found')
+          s = s.replace(marker, helper, 1)
+
+          old_start = '''    features = {int(feature.id()): feature for feature in fat_layer.getFeatures()}
+              references, duplicates = _fat_refs(designs)
+              if duplicates:
+'''
+          new_start = '''    features = {int(feature.id()): feature for feature in fat_layer.getFeatures()}
+              references, duplicates = _fat_refs(designs)
+
+              traced = [
+                  (index, design)
+                  for index, design in enumerate(designs or [])
+                  if _fat_trace_focus(design, require_node=False)
+              ]
+              if traced:
+                  for design_index, design in traced:
+                      _log(
+                          f"[FAT-TRACE][TARGET-LINK] link={_fat_trace_label(design)}; "
+                          f"design_index={design_index}; node={FAT_TRACE_NODE}; "
+                          f"node_in_sequence={_fat_trace_node_match(design)}"
+                      )
+                      for owner in _fat_trace_owner_candidates(designs, references, features):
+                          if owner["design_index"] == design_index:
+                              _log(
+                                  f"[FAT-TRACE][FAT-OWNER] link={owner['link']}; "
+                                  f"node={FAT_TRACE_NODE}; feature_id={owner['feature_id']}; "
+                                  f"fat_name={owner['name']}; seq_pos={owner['sequence_pos']}; "
+                                  f"owner_design_index={owner['design_index']}"
+                              )
+                  _log(
+                      f"[FAT-TRACE][PREP-START] design={FAT_TRACE_DESIGN}; "
+                      f"links=L3,L4; node={FAT_TRACE_NODE}; "
+                      f"owning_fat_candidates="
+                      f"{sum(1 for x in _fat_trace_owner_candidates(designs, references, features))}"
+                  )
+              if duplicates:
+'''
+          if old_start not in s:
+              raise SystemExit('prepare start block not found')
+          s = s.replace(old_start, new_start, 1)
+
+          p.write_text(s, encoding='utf-8')
+          PY
+
+          python -m py_compile cable_offset_core.py
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cable_offset_core.py
+          git diff --cached --check
+          git commit -m "fix: target FAT trace to DAR436 L3 L4 N0020"
+          git push
