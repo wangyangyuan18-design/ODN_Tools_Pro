@@ -1,2 +1,0 @@
-Problem 2 fix: restore pre-cross-segment-corner geometry.
-The regression was caused by directly replacing segment boundary endpoints with corner points, which made a cable turn before occupying the physical pole.
