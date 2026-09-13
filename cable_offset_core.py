@@ -957,30 +957,6 @@ def _fat_target(ref, design, feature, fat_layer, edge_crs, work):
     if anchor is None:
         return None, None, {"reason": "无法确定 FAT 锚点"}
 
-    # For an intermediate FAT at a real cross-segment corner, use the exact
-    # Corner Core point instead of nearest-route projection.
-    boundary_targets = design.get("_boundary_corner_targets", {}) or {}
-    boundary_info = boundary_targets.get(position)
-    if boundary_info:
-        raw_point = boundary_info.get("point") or []
-        if len(raw_point) >= 2:
-            target = QgsPointXY(float(raw_point[0]), float(raw_point[1]))
-            target_distance = hypot(target.x() - anchor.x(), target.y() - anchor.y())
-            fat_name = _fat_trace_feature_name(feature)
-            if _fat_trace_focus(design, fat_name):
-                _log(
-                    f"[FAT-TRACE][06 TARGET] link={design.get('link','')}; "
-                    f"feature_id={feature.id()}; fat_name={fat_name}; "
-                    f"route_segment={boundary_info.get('segment_index')}; "
-                    f"anchor={_fat_trace_point(anchor)}; target={_fat_trace_point(target)}; "
-                    f"source=BOUNDARY_CORNER; decision={boundary_info.get('decision')}"
-                )
-            return target, anchor, {
-                "segment_index": boundary_info.get("segment_index"),
-                "distance": target_distance,
-                "mode": "boundary_corner",
-            }
-
     nearest = _nearest_on_route(design, anchor, edge_crs, work)
     if nearest is None:
         return None, anchor, {"reason": "无法从最终 Offset Cable 几何确定 FAT 落点"}
@@ -1099,7 +1075,7 @@ def _prepare_fat_moves(designs, fat_layer, edge_layer, work, fat_limit):
             "target_work": target,
             "anchor": anchor,
             "move_distance": hypot(current.x() - target.x(), current.y() - target.y()) if current else 0.0,
-            "mode": info.get("mode", "final_route_geometry"),
+            "mode": "final_route_geometry",
             "route_decisions": designs[reference["design_index"]].get("_corner_decisions", []),
         }
 
@@ -1190,125 +1166,6 @@ def commit_fat_landing_points(fat_layer, summary):
     summary["fat_written"] = moved
     return moved
 
-
-
-def _join_internal_segment_corners(
-    design, design_index, slot_map, spacing, work, edge_crs, target_segments
-):
-    """Reuse the existing Corner Core across an intermediate FAT boundary.
-
-    A FAT remains a true endpoint when it is terminal, a straight-through
-    intermediate node, or FATRETURN. Only an intermediate FAT at a real
-    route turn is promoted into the existing ordinary Corner/Transition path.
-    """
-    segments = target_segments if target_segments is not None else (design.get("segments", []) or [])
-    sequence_ids = design.get("sequence_ids", []) or []
-    if len(segments) < 2:
-        design["_boundary_corner_targets"] = {}
-        return 0
-
-    # Never reuse a target from a previous offset pass.
-    design["_boundary_corner_targets"] = {}
-    changed = 0
-    for boundary_index in range(len(segments) - 1):
-        if boundary_index + 1 >= len(sequence_ids):
-            continue
-        boundary_item = sequence_ids[boundary_index + 1]
-        kind = _kind(boundary_item)
-        if not kind.startswith("FAT") or kind.startswith("FATRETURN"):
-            continue
-
-        left = segments[boundary_index]
-        right = segments[boundary_index + 1]
-        left_edges = [
-            e for raw in left.get("edge_sequence", []) or []
-            if (e := _base._canonical_edge(raw))
-        ]
-        right_edges = [
-            e for raw in right.get("edge_sequence", []) or []
-            if (e := _base._canonical_edge(raw))
-        ]
-        if not left_edges or not right_edges:
-            continue
-
-        left_nodes = _base._extract_route_graph_nodes(left, work, edge_crs, edge_crs)
-        right_nodes = _base._extract_route_graph_nodes(right, work, edge_crs, edge_crs)
-        if len(left_nodes) != len(left_edges) + 1 or len(right_nodes) != len(right_edges) + 1:
-            continue
-
-        node = QgsPointXY(left_nodes[-1])
-        next_node = QgsPointXY(right_nodes[0])
-        if hypot(node.x() - next_node.x(), node.y() - next_node.y()) > 1e-6:
-            continue
-        if len(left_nodes) < 2 or len(right_nodes) < 2:
-            continue
-
-        turn_angle = _turn_angle(left_nodes[-2], node, right_nodes[1])
-        if turn_angle < 5.0:
-            continue
-
-        prev_edge = left_edges[-1]
-        next_edge = right_edges[0]
-        prev_slot = int(slot_map.get((design_index, boundary_index, len(left_edges) - 1), 0))
-        next_slot = int(slot_map.get((design_index, boundary_index + 1, 0), 0))
-
-        _WORK_EDGE_POINTS.clear()
-        for edge in (prev_edge, next_edge):
-            a, b = _base._edge_points(edge)
-            _WORK_EDGE_POINTS[edge] = (_tp(a, edge_crs, work), _tp(b, edge_crs, work))
-
-        decision, corner_points = _build_corner_geometry(
-            node, prev_edge, next_edge, prev_slot, next_slot, spacing, return_context=False
-        )
-        if not corner_points:
-            continue
-
-        corner_point = min(
-            corner_points,
-            key=lambda point: hypot(point.x() - node.x(), point.y() - node.y()),
-        )
-        corner_edge = _tp(corner_point, work, edge_crs)
-        target = [float(corner_edge.x()), float(corner_edge.y())]
-
-        left_points = list(left.get("points", []) or [])
-        right_points = list(right.get("points", []) or [])
-        if not left_points or not right_points:
-            continue
-
-        # Preserve the physical Pole/Main-Lane arrival. The Corner Core point
-        # is recorded as the exact FAT boundary target; the normal FAT endpoint
-        # replacement stage applies it later.
-        corner_target = [float(corner_edge.x()), float(corner_edge.y())]
-        boundary_targets = design.setdefault("_boundary_corner_targets", {})
-        boundary_targets[int(boundary_index + 1)] = {
-            "point": corner_target,
-            "segment_index": boundary_index,
-            "decision": decision,
-        }
-
-        left.setdefault("_corner_decisions", []).append(decision)
-        left["_segment_boundary_corner"] = True
-        right["_segment_boundary_corner"] = True
-
-        if _fat_trace_link_match(design):
-            trace_corner = [[float(p.x()), float(p.y())] for p in corner_points]
-            left["_fat_trace_final_corner"] = trace_corner
-            right["_fat_trace_final_corner"] = trace_corner
-            _log(
-                f"[FAT-TRACE][05 FINAL-CORNER] link={design.get('link','')}; "
-                f"boundary={boundary_index}; node={FAT_TRACE_NODE}; "
-                f"decision={decision}; physical_node={_fat_trace_point(node)}; "
-                f"corner={_corner_debug_points(corner_points)}"
-            )
-            _log(
-                f"[FAT-TRACE][BOUNDARY-CORNER] link={design.get('link','')}; "
-                f"boundary={boundary_index}; angle={turn_angle:.3f}; "
-                f"prev_slot={prev_slot}; next_slot={next_slot}; "
-                f"target={_fat_trace_point(corner_point)}; endpoint_mutation=SKIPPED"
-            )
-        changed += 1
-
-    return changed
 
 def apply_offset_layout(
     designs,
@@ -1411,23 +1268,6 @@ def apply_offset_layout(
             else:
                 new_segments.append(copied)
                 total += float(copied.get("distance", 0.0) or 0.0)
-
-        boundary_corner_count = _join_internal_segment_corners(
-            design,
-            design_index,
-            slot_map,
-            spacing,
-            work,
-            edge_crs,
-            new_segments,
-        )
-        if boundary_corner_count:
-            # Metadata only. Keep the geometry from the existing Corner/Main-Lane
-            # pipeline unchanged until FAT endpoint replacement.
-            for segment_index, segment in enumerate(new_segments):
-                all_corner_decisions[f"{design_index}:{segment_index}"] = list(
-                    segment.get("_corner_decisions", []) or []
-                )
 
         if different:
             design["segments"] = new_segments
