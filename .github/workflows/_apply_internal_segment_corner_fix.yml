@@ -1,0 +1,43 @@
+name: Apply internal segment corner fix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/_apply_internal_segment_corner_fix.yml'
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply minimal cross-segment corner fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('cable_offset_core.py')
+          s = p.read_text(encoding='utf-8')
+          helper = r'''\n\ndef _join_internal_segment_corners(design, design_index, slot_map, spacing, work, edge_crs):\n    """Join ordinary corners that lie exactly on a Link sequence boundary.\n\n    Link Design stores each consecutive FDT/FAT pair as a separate segment.\n    Therefore an intermediate FAT is the end of one segment and the start of\n    the next segment. The per-segment geometry loop cannot see both edges at\n    that boundary, so the normal corner core is otherwise never called there.\n\n    This helper deliberately reuses the existing _build_corner_geometry()\n    decision/geometry rules. It only supplies the missing adjacent edges and\n    writes the resulting corner back to the two touching segment endpoints.\n    Special FATRETURN endpoints are left untouched.\n    """\n    segments = design.get("segments", []) or []\n    sequence_ids = design.get("sequence_ids", []) or []\n    if len(segments) < 2:\n        return 0\n    changed = 0\n    for boundary_index in range(len(segments) - 1):\n        if boundary_index + 1 >= len(sequence_ids):\n            continue\n        boundary_item = sequence_ids[boundary_index + 1]\n        kind = _kind(boundary_item)\n        if not kind.startswith("FAT") or kind.startswith("FATRETURN"):\n            continue\n        left = segments[boundary_index]\n        right = segments[boundary_index + 1]\n        left_edges = [e for raw in left.get("edge_sequence", []) or [] if (e := _base._canonical_edge(raw))]\n        right_edges = [e for raw in right.get("edge_sequence", []) or [] if (e := _base._canonical_edge(raw))]\n        if not left_edges or not right_edges:\n            continue\n        left_nodes = _base._extract_route_graph_nodes(left, work, edge_crs, edge_crs)\n        right_nodes = _base._extract_route_graph_nodes(right, work, edge_crs, edge_crs)\n        if len(left_nodes) != len(left_edges) + 1 or len(right_nodes) != len(right_edges) + 1:\n            continue\n        node = QgsPointXY(left_nodes[-1])\n        next_node = QgsPointXY(right_nodes[0])\n        if hypot(node.x() - next_node.x(), node.y() - next_node.y()) > 1e-6:\n            continue\n        prev_edge = left_edges[-1]\n        next_edge = right_edges[0]\n        prev_slot = int(slot_map.get((design_index, boundary_index, len(left_edges) - 1), 0))\n        next_slot = int(slot_map.get((design_index, boundary_index + 1, 0), 0))\n        _WORK_EDGE_POINTS.clear()\n        for edge in (prev_edge, next_edge):\n            a, b = _base._edge_points(edge)\n            _WORK_EDGE_POINTS[edge] = (_tp(a, edge_crs, work), _tp(b, edge_crs, work))\n        decision, corner_points = _build_corner_geometry(\n            node, prev_edge, next_edge, prev_slot, next_slot, spacing, return_context=False\n        )\n        if not corner_points:\n            continue\n        left_points = list(left.get("points", []) or [])\n        right_points = list(right.get("points", []) or [])\n        if not left_points or not right_points:\n            continue\n        incoming_edge = _tp(corner_points[0], work, edge_crs)\n        outgoing_edge = _tp(corner_points[-1], work, edge_crs)\n        left_points[-1] = [float(incoming_edge.x()), float(incoming_edge.y())]\n        right_points[0] = [float(outgoing_edge.x()), float(outgoing_edge.y())]\n        left["points"] = left_points\n        right["points"] = right_points\n        for segment in (left, right):\n            points = segment.get("points", []) or []\n            if len(points) >= 2:\n                segment["distance"] = round(sum(hypot(float(points[i][0]) - float(points[i - 1][0]), float(points[i][1]) - float(points[i - 1][1])) for i in range(1, len(points))), 3)\n        left.setdefault("_corner_decisions", []).append(decision)\n        left["_segment_boundary_corner"] = True\n        right["_segment_boundary_corner"] = True\n        if design.get("_fat_trace_design"):\n            _log(\n                f"[FAT-TRACE][BOUNDARY-CORNER] link={design.get('link','')}; "\n                f"boundary={boundary_index}; node={FAT_TRACE_NODE}; decision={decision}; "\n                f"prev_slot={prev_slot}; next_slot={next_slot}; corner={_corner_debug_points(corner_points)}"\n            )\n        changed += 1\n    return changed\n'''
+          if '_join_internal_segment_corners(' not in s:
+              marker = '\ndef apply_offset_layout(\n'
+              if marker not in s:
+                  raise SystemExit('apply_offset_layout marker not found')
+              s = s.replace(marker, helper + marker, 1)
+
+          marker = '''        if different:\n            design["segments"] = new_segments\n            design["length"] = round(total, 3)\n            changed.add(design_index)\n'''
+          replacement = '''        boundary_corner_count = _join_internal_segment_corners(\n            design, design_index, slot_map, spacing, work, edge_crs\n        )\n        if boundary_corner_count:\n            different = True\n            new_segments = [dict(seg) for seg in (design.get("segments", []) or [])]\n            total = sum(float(seg.get("distance", 0.0) or 0.0) for seg in new_segments)\n\n        if different:\n            design["segments"] = new_segments\n            design["length"] = round(total, 3)\n            changed.add(design_index)\n'''
+          if marker not in s:
+              raise SystemExit('geometry commit marker not found')
+          s = s.replace(marker, replacement, 1)
+
+          p.write_text(s, encoding='utf-8')
+          PY
+          python -m py_compile cable_offset_core.py
+          git diff --check
+          git add cable_offset_core.py
+          git rm .github/workflows/_apply_internal_segment_corner_fix.yml
+          git commit -m "fix: join corners across link segment boundaries"
+          git push
