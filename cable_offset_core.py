@@ -364,6 +364,15 @@ def _plan(designs, dc, edge_layer, spacing):
     reserved_cache = {}
     slots = {}
     uses_by_edge = {}
+    segment_edge_counts = {}
+    for design_index, design in enumerate(designs or []):
+        for segment_index, segment in enumerate(design.get("segments", []) or []):
+            edges = [
+                e
+                for raw in segment.get("edge_sequence", []) or []
+                if (e := _base._canonical_edge(raw))
+            ]
+            segment_edge_counts[(design_index, segment_index)] = len(edges)
     for use in pending:
         uses_by_edge.setdefault(use.edge_key, []).append(use)
     for uses in uses_by_edge.values():
@@ -386,9 +395,21 @@ def _plan(designs, dc, edge_layer, spacing):
         )
 
     def previous_slot(use):
-        if use.edge_index <= 0:
-            return None
-        return slots.get((use.design_index, use.segment_index, use.edge_index - 1))
+        if use.edge_index > 0:
+            return slots.get((use.design_index, use.segment_index, use.edge_index - 1))
+
+        # A route may be split into multiple segments at FAT/FDT boundaries.
+        # The first edge of the next segment is still the continuation of the
+        # same cable, so inherit the last assigned lane from the immediately
+        # preceding non-empty segment.  This affects lane continuity only;
+        # final corner geometry remains responsible for the Physical Pole.
+        previous_segment = use.segment_index - 1
+        while previous_segment >= 0:
+            count = segment_edge_counts.get((use.design_index, previous_segment), 0)
+            if count:
+                return slots.get((use.design_index, previous_segment, count - 1))
+            previous_segment -= 1
+        return None
 
     slot_changes = 0
     continuity_preserved = 0
