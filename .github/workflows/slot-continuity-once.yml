@@ -1,0 +1,31 @@
+name: Apply slot continuity fix once
+
+on:
+  push:
+    paths:
+      - 'tools/patch_slot_continuity.py'
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patch
+        run: |
+          python tools/patch_slot_continuity.py
+          python -m py_compile cable_offset_core.py
+          git diff --check
+          rm -f tools/patch_slot_continuity.py .github/workflows/slot-continuity-once.yml
+      - name: Commit source only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add cable_offset_core.py
+          if git diff --cached --quiet; then
+            echo 'ERROR: no source changes created'
+            exit 1
+          fi
+          git commit -m 'fix: preserve lane continuity across segment boundaries'
+          git push origin HEAD:slot-continuity-fix
