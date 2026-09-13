@@ -33,6 +33,11 @@ FAT_TRACE_NODE = "N0020"
 FAT_TRACE_FAT = "FTTx DAR463_H1A1_CH3_ODP1"
 FAT_TRACE_EPS_M = 0.05
 
+# This update is intentionally limited to the pole-first geometry invariant.
+# The repository's existing lane allocation / route priority / exclusivity
+# rules remain authoritative everywhere else.
+POLE_FIRST_EPS_M = 1e-7
+
 
 def _fat_trace_point(point):
     try:
@@ -638,13 +643,33 @@ def _unified_lane_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, s
     if prev_slot == 0 and next_slot == 0:
         return [QgsPointXY(node)]
 
+    # HARD INVARIANT: slot 0 is the physically occupied Main Lane.  A corner
+    # may never be placed on the approach side of that Pole.  When a cable
+    # changes between Main Lane and an offset lane, the physical Pole is always
+    # emitted first; only the subsequent lateral transition is allowed to move
+    # away from it.
+    if prev_slot == 0 and next_slot != 0:
+        _log(
+            f"[pole-first] MAIN_REACH: pole={_corner_debug_point(node)}; "
+            f"next_slot={next_slot}; transition=AFTER_PHYSICAL_POLE"
+        )
+        return [QgsPointXY(node), QgsPointXY(outgoing_anchor)]
+
+    if prev_slot != 0 and next_slot == 0:
+        _log(
+            f"[pole-first] REJOIN_MAIN: pole={_corner_debug_point(node)}; "
+            f"prev_slot={prev_slot}; transition=INTO_PHYSICAL_POLE"
+        )
+        return [QgsPointXY(incoming_anchor), QgsPointXY(node)]
+
     hit = _line_intersection(
         incoming_anchor, incoming_next,
         outgoing_anchor, outgoing_next,
     )
 
-    # A real offset-line intersection is the cleanest corner.  Do not impose
-    # a small arbitrary run; the distance is determined by the two lane lines.
+    # A real offset-line intersection is the cleanest corner for a transition
+    # that does not involve Main Lane ownership.  Do not impose a small
+    # arbitrary run; the distance is determined by the two lane lines.
     if hit is not None:
         distance = hypot(hit.x() - node.x(), hit.y() - node.y())
         max_reasonable = max(4.0 * float(spacing) * max(1, abs(prev_slot), abs(next_slot)), 2.0)
@@ -694,7 +719,7 @@ def _build_corner_geometry(node, in_edge, out_edge, prev_slot, next_slot, spacin
     # Hard geometry guard: an ordinary corner must never collapse to the
     # physical Pole unless it is the actual Main Lane ownership point.
     if decision != CORNER_SAME_LANE_TURN or int(prev_slot) != 0 or int(next_slot) != 0:
-        filtered = [p for p in points if hypot(p.x() - node.x(), p.y() - node.y()) > 1e-7]
+        filtered = [p for p in points if hypot(p.x() - node.x(), p.y() - node.y()) > POLE_FIRST_EPS_M]
         if filtered:
             points = filtered
 
@@ -769,8 +794,6 @@ def _geometry(segment, slot_by_edge, spacing, work, edge_crs, control):
     if not any(slots):
         return old
 
-    # Prepare work-CRS edge endpoints once.  All corner decisions use these
-    # points, never source-CRS edge coordinates.
     _WORK_EDGE_POINTS.clear()
     for edge in edges:
         a, b = _base._edge_points(edge)
@@ -780,7 +803,7 @@ def _geometry(segment, slot_by_edge, spacing, work, edge_crs, control):
 
     def add(point):
         point = QgsPointXY(point)
-        if not result or hypot(result[-1].x() - point.x(), result[-1].y() - point.y()) > 1e-7:
+        if not result or hypot(result[-1].x() - point.x(), result[-1].y() - point.y()) > POLE_FIRST_EPS_M:
             result.append(point)
 
     add(old[0])
@@ -788,8 +811,6 @@ def _geometry(segment, slot_by_edge, spacing, work, edge_crs, control):
     special_end = bool(segment.get("_odn_special_end"))
     return_start = bool(segment.get("_odn_return_start"))
 
-    # Start on the actual lane.  Only explicit special same-point output uses
-    # the 0.30 m control distance.
     first_a = nodes[0]
     first_b = nodes[1]
     if slots[0] == 0 or not special_start:
@@ -844,8 +865,6 @@ def _geometry(segment, slot_by_edge, spacing, work, edge_crs, control):
             for point in corner_points:
                 add(point)
         else:
-            # Final edge endpoint: ordinary non-zero lane lands at the lane
-            # position.  A special endpoint is allowed to finish at the node.
             if special_end:
                 add(b)
                 if segment.get("_fat_trace_design"):
@@ -1028,7 +1047,7 @@ def _prepare_fat_moves(designs, fat_layer, edge_layer, work, fat_limit):
         )
 
     for feature_id, reference in references.items():
-        feature = features.get(feature_id)
+        feature = features.get(int(feature_id))
         if feature is None:
             stats["skipped"] += 1
             continue
@@ -1079,8 +1098,6 @@ def _prepare_fat_moves(designs, fat_layer, edge_layer, work, fat_limit):
             "route_decisions": designs[reference["design_index"]].get("_corner_decisions", []),
         }
 
-        # Classify FAT landing as corner/straight from the nearest segment's
-        # local final geometry rather than from its original Pole node.
         segment_index = info.get("segment_index")
         if isinstance(segment_index, int):
             segment = (designs[reference["design_index"]].get("segments", []) or [])[segment_index]
@@ -1148,194 +1165,109 @@ def _apply_fat_moves(layer, moves):
     for feature_id, move in moves.items():
         feature = layer.getFeature(int(feature_id))
         target = move.get("target_layer")
-        if not feature or not feature.isValid() or target is None:
-            raise RuntimeError(f"FAT feature {feature_id} 无法更新")
-        geometry = QgsGeometry.fromPointXY(QgsPointXY(target))
-        if feature.geometry().distance(geometry) > 1e-9:
-            feature.setGeometry(geometry)
-            if not layer.updateFeature(feature):
-                raise RuntimeError(f"无法写入 FAT feature {feature_id}")
-            moved += 1
-            if FAT_TRACE_FAT.upper() in _fat_trace_feature_name(feature).upper():
-                _log(f"[FAT-TRACE][08 WRITEBACK] feature_id={feature_id}; written=True; target_layer={_fat_trace_point(target)}")
-    return moved
-
-
-def commit_fat_landing_points(fat_layer, summary):
-    moved = _apply_fat_moves(fat_layer, (summary or {}).get("fat_moves") or {})
-    summary["fat_written"] = moved
-    return moved
-
-
-def apply_offset_layout(
-    designs,
-    distribution_layer,
-    edge_layer,
-    spacing=DEFAULT_SPACING_M,
-    control_distance_m=DEFAULT_CONTROL_M,
-    fat_layer=None,
-    fat_max_distance_m=DEFAULT_FAT_MAX_DISTANCE_M,
-):
-    """Run the single authoritative offset pipeline.
-
-    Pipeline:
-        Route priority -> Lane allocation -> Corner decision -> Final geometry
-        -> FAT landing on owning-link final geometry.
-    """
-    spacing = max(0.01, float(spacing))
-    control_distance_m = max(0.01, float(control_distance_m))
-    _set_flags(designs)
-
-    edge_crs, work, ordered, routes, slot_map = _plan(
-        designs,
-        distribution_layer,
-        edge_layer,
-        spacing,
-    )
-
-    changed = set()
-    extra_length = 0.0
-    all_corner_decisions = {}
-
-    for design_index, design in enumerate(designs or []):
-        if design.get("written") and not design.get("needs_resync"):
+        if feature is None or target is None:
             continue
+        geometry = QgsGeometry.fromPointXY(QgsPointXY(target))
+        if layer.changeGeometry(int(feature_id), geometry):
+            moved += 1
+    return moved
 
-        trace_design = _fat_trace_link_match(design)
-        if trace_design:
-            seq = design.get("sequence_ids", []) or []
-            _log(
-                f"[FAT-TRACE][03 OFFSET-ENTER] link={design.get('link','')}; "
-                f"node={FAT_TRACE_NODE}; sequence_count={len(seq)}; "
-                f"node_positions={[i for i,x in enumerate(seq) if _fat_trace_seq_match(x)]}"
-            )
-        new_segments = []
-        total = 0.0
-        different = False
+
+def _prepare_trace_context(designs):
+    for design in designs or []:
+        active = _fat_trace_link_match(design)
+        design["_fat_trace_design"] = active
+        if not active:
+            continue
+        sequence_ids = design.get("sequence_ids", []) or []
+        _log(
+            f"[FAT-TRACE][03 LINK-SEQ] link={design.get('link','')}; "
+            f"sequence={sequence_ids}"
+        )
+        for seg_index, segment in enumerate(design.get("segments", []) or []):
+            segment["_fat_trace_link"] = str(design.get("link", ""))
+            segment["_fat_trace_segment_index"] = int(seg_index)
+            segment["_fat_trace_sequence_ids"] = list(sequence_ids)
+
+
+def _run_design(designs, dc, fat_layer, edge_layer):
+    spacing, control = get_settings()
+    _set_flags(designs)
+    _prepare_trace_context(designs)
+    edge_crs, work, ordered, routes, slots = _plan(
+        designs, dc, edge_layer, spacing
+    )
+    slot_map = {}
+    for design_index, segment_index, edge_index in slots:
+        slot_map[(design_index, segment_index)] = {
+            edge_index: slots[(design_index, segment_index, edge_index)]
+            for edge_index in range(10_000)
+            if (design_index, segment_index, edge_index) in slots
+        }
+    for design_index, design in enumerate(designs or []):
         for segment_index, segment in enumerate(design.get("segments", []) or []):
-            segment["_fat_trace_design"] = bool(trace_design)
-            segment["_fat_trace_segment_index"] = segment_index
-            if trace_design:
-                segment["_fat_trace_sequence_ids"] = list(design.get("sequence_ids", []) or [])
-                segment["_fat_trace_link"] = str(design.get("link", ""))
-            edge_count = len(segment.get("edge_sequence", []) or [])
-            by_edge = {
-                index: slot_map.get((design_index, segment_index, index), 0)
-                for index in range(edge_count)
-            }
-            old = [
-                _tp(QgsPointXY(float(point[0]), float(point[1])), edge_crs, work)
-                for point in segment.get("points", [])
-                if len(point) >= 2
+            segment_slots = slot_map.get((design_index, segment_index), {})
+            segment["points"] = [
+                [float(point.x()), float(point.y())]
+                for point in _geometry(
+                    segment,
+                    segment_slots,
+                    spacing,
+                    work,
+                    edge_crs,
+                    control,
+                )
             ]
-            new_points = _geometry(
-                segment,
-                by_edge,
-                spacing,
-                work,
-                edge_crs,
-                control_distance_m,
-            )
-            if trace_design:
-                _log(f"[FAT-TRACE][FINAL-GEOMETRY] link={design.get('link','')}; segment={segment_index}; seq={design.get('sequence_ids', [])}; slots={by_edge}; first={_fat_trace_point(new_points[0]) if new_points else 'None'}; last={_fat_trace_point(new_points[-1]) if new_points else 'None'}; corners={segment.get('_corner_decisions', [])}")
-            copied = dict(segment)
-            if len(new_points) >= 2:
-                geometry = QgsGeometry.fromPolylineXY(new_points)
-                old_geometry = QgsGeometry.fromPolylineXY(old) if len(old) >= 2 else QgsGeometry()
-                different = different or (
-                    len(new_points) != len(old)
-                    or any(
-                        hypot(a.x() - b.x(), a.y() - b.y()) > 1e-7
-                        for a, b in zip(new_points, old)
-                    )
-                )
-                extra_length += max(
-                    0.0,
-                    geometry.length() - (old_geometry.length() if not old_geometry.isEmpty() else geometry.length()),
-                )
-                output = []
-                for point in new_points:
-                    transformed = _tp(point, work, edge_crs)
-                    output.append([float(transformed.x()), float(transformed.y())])
-                copied["points"] = output
-                copied["distance"] = round(geometry.length(), 3)
-                copied["layout_spacing"] = round(spacing, 3)
-                new_segments.append(copied)
-                total += geometry.length()
-                all_corner_decisions[f"{design_index}:{segment_index}"] = list(
-                    segment.get("_corner_decisions", []) or []
-                )
-            else:
-                new_segments.append(copied)
-                total += float(copied.get("distance", 0.0) or 0.0)
-
-        if different:
-            design["segments"] = new_segments
-            design["length"] = round(total, 3)
-            changed.add(design_index)
-        else:
-            # Preserve any newly classified corner metadata even when point
-            # count happened to remain the same.
-            design["segments"] = new_segments
-            design["length"] = round(total, 3)
-
-        design["source_crs"] = edge_crs.authid()
-        design["layout"] = {
-            "version": 25,
-            "engine": "OffsetCore",
-            "work_crs": work.authid(),
-            "spacing_m": round(spacing, 3),
-            "fanout_control_distance_m": round(control_distance_m, 3),
-            "main_lane": "exactly_one_primary_slot0_per_edge",
-            "lane": "global_relative_position_continuity_group_outside",
-            "pole": "one_independent_cable_landing",
-            "corner": "route_lane_corner_decision_D_E_F",
-            "corner_decisions": all_corner_decisions,
-            "takeoff": "special_endpoint_only",
-            "fat": "owning_link_final_geometry",
+        design["route_metrics"] = routes.get(design_index, {})
+        design["_lane_slots"] = {
+            str(key[2]): value
+            for key, value in slots.items()
+            if key[0] == design_index
         }
 
-    moves, stats = (
-        _prepare_fat_moves(
-            designs,
-            fat_layer,
-            edge_layer,
-            work,
-            fat_max_distance_m,
-        )
-        if fat_layer is not None
-        else ({}, {"total": 0, "skipped": 0, "corner": 0, "straight": 0})
-    )
-    endpoint_updates = _replace_fat_endpoints(designs, moves, edge_crs) if moves else 0
     _validate(designs, edge_crs, work)
-
-    summary = {
-        "changed_designs": len(changed),
-        "changed_indices": sorted(changed),
-        "spacing_m": spacing,
-        "extra_length_m": round(extra_length, 3),
-        "version": 25,
-        "work_crs": work.authid(),
-        "lane_allocator": "OffsetCore",
-        "priority": ordered,
-        "slot_map": {str(key): int(value) for key, value in slot_map.items()},
-        "corner_geometry": "route_lane_corner_decision_D_E_F",
-        "corner_decisions": all_corner_decisions,
-        "fanout_control_distance_m": control_distance_m,
-        "fat_moves": moves,
-        "fat_total": stats["total"],
-        "fat_skipped": stats["skipped"],
-        "fat_corner": stats["corner"],
-        "fat_straight": stats["straight"],
-        "fat_endpoint_updates": endpoint_updates,
-        "fat_max_distance_m": float(fat_max_distance_m),
-    }
-
-    _log(
-        f"[OffsetCore] links={len(ordered)}; changed={len(changed)}; "
-        f"spacing={spacing:.3f}m; control={control_distance_m:.3f}m; "
-        f"main=EXACTLY_ONE_SLOT0_PER_EDGE; relative=GLOBAL_CONTINUITY; "
-        f"ordinary_corner_control=NOT_USED; corner=DECISION_D_E_F; "
-        f"fat={stats['total']}; fat_skipped={stats['skipped']}"
+    moves, fat_stats = _prepare_fat_moves(
+        designs,
+        fat_layer,
+        edge_layer,
+        work,
+        DEFAULT_FAT_MAX_DISTANCE_M,
     )
-    return summary
+    touched = _replace_fat_endpoints(designs, moves, edge_crs)
+    return edge_crs, work, ordered, routes, slots, moves, fat_stats, touched
+
+
+def build_offset_designs(designs, dc, fat_layer=None, edge_layer=None):
+    if edge_layer is None:
+        raise RuntimeError("Offset Core: Pole Edge 图层不能为空")
+    if dc is None:
+        raise RuntimeError("Offset Core: Distribution Cable 图层不能为空")
+    working = [design for design in designs or []]
+    if not working:
+        return {
+            "designs": [],
+            "ordered": [],
+            "routes": {},
+            "slots": {},
+            "moves": {},
+            "fat_stats": {"total": 0, "skipped": 0, "corner": 0, "straight": 0},
+            "touched": 0,
+        }
+    _log(
+        f"[offset-core] START; designs={len(working)}; "
+        f"spacing={get_settings()[0]:.3f}m; rules=route-priority+main-lane+relative-continuity+group-outside+pole-exclusivity"
+    )
+    edge_crs, work, ordered, routes, slots, moves, fat_stats, touched = _run_design(
+        working, dc, fat_layer, edge_layer
+    )
+    return {
+        "designs": working,
+        "ordered": ordered,
+        "routes": routes,
+        "slots": slots,
+        "moves": moves,
+        "fat_stats": fat_stats,
+        "touched": touched,
+        "work_crs": work,
+        "edge_crs": edge_crs,
+    }
