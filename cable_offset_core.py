@@ -423,8 +423,6 @@ def _plan(designs, dc, edge_layer, spacing):
             if (use.design_index, use.segment_index, use.edge_index) not in assigned
         ]
 
-        # Determine the physical side from the existing lane first;
-        # fall back to route geometry only for a newly joining cable.
         side_groups = {1: [], -1: []}
         for use in non_main:
             previous = previous_slot(use)
@@ -436,8 +434,6 @@ def _plan(designs, dc, edge_layer, spacing):
 
         for side in (1, -1):
             members = side_groups[side]
-            # Existing cables are ordered by their former relative distance;
-            # new members are then inserted deterministically by route rank.
             members.sort(
                 key=lambda item: (
                     0 if item[1] not in (None, 0) else 1,
@@ -463,8 +459,6 @@ def _plan(designs, dc, edge_layer, spacing):
                         continuity_preserved += 1
                 magnitude += 1
 
-        # Defensive completion. This should never be reached, but guarantees
-        # that malformed input cannot leave a pending cable without a lane.
         for use in uses:
             key = (use.design_index, use.segment_index, use.edge_index)
             if key in assigned:
@@ -511,6 +505,8 @@ def _plan(designs, dc, edge_layer, spacing):
         f"side-stable={side_stable}; compressed={compressed_edges}"
     )
     return edge_crs, work, ordered, routes, slots
+
+
 def _corner_debug_point(point):
     try:
         return f"({float(point.x()):.6f},{float(point.y()):.6f})"
@@ -570,18 +566,11 @@ def _clamped_run(edge_length, requested):
 
 
 def _corner_decision(prev_slot, next_slot, return_context=False):
-    """Return the explicit D/E/F/SAME decision before geometry is generated.
-
-    The key distinction is not the mathematical intersection of two offset
-    lines; it is which side of the Main Lane the cable occupies before and
-    after the route vertex, and whether that relation crosses slot 0.
-    """
+    """Return the explicit D/E/F/SAME decision before geometry is generated."""
     prev_slot = int(prev_slot)
     next_slot = int(next_slot)
 
     if return_context:
-        # A Return / special endpoint still uses explicit takeoff geometry;
-        # it is not treated as an ordinary corner.
         return CORNER_RETURN_TURN
 
     if prev_slot == next_slot:
@@ -592,62 +581,31 @@ def _corner_decision(prev_slot, next_slot, return_context=False):
         return CORNER_EARLY_TURN
     if prev_slot * next_slot < 0:
         return CORNER_CROSS_MAIN_TURN
-
-    # Same side, but changing lane number. Moving toward slot 0 is an early
-    # change; moving farther away happens only after the route vertex.
     if abs(next_slot) < abs(prev_slot):
         return CORNER_EARLY_TURN
     return CORNER_MAIN_REACH_TURN
 
 
 def _lane_offset_line(node, direction, slot, spacing):
-    """Return the infinite cable lane line through the route corner.
-
-    Lane is a lateral constraint.  It must not be represented by an arbitrary
-    longitudinal run before/after the Pole.  This helper therefore constructs
-    only the true offset line: route vertex + perpendicular Lane offset.
-    """
+    """Return the true lateral Lane line through the route vertex."""
     anchor = _offset_lane_point(node, direction, slot, spacing)
     return anchor, QgsPointXY(anchor.x() + direction[0], anchor.y() + direction[1])
 
 
 def _unified_lane_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, spacing):
-    """Build every ordinary corner from the two actual offset-lane lines.
-
-    The previous D/E/F implementations used different artificial longitudinal
-    distances (run_in, run_out, cross_run, turn_run, main_anchor, etc.).
-    Those distances were the common source of the observed dog-leg/backtracking
-    geometry, with the apparent excursion changing with Lane magnitude and
-    edge length.
-
-    The correct primitive is simpler: intersect the incoming and outgoing
-    offset lane lines.  If they intersect at a reasonable distance, that is
-    the corner.  If the lines are parallel or the intersection is numerically
-    too far away, use a two-point bevel made only from the two lateral lane
-    anchors.  No point is created by travelling backward or forward along an
-    edge.
-    """
     in_dir = _safe_unit(in_a, in_b)
     out_dir = _safe_unit(out_a, out_b)
     prev_slot = int(prev_slot)
     next_slot = int(next_slot)
 
-    incoming_anchor, incoming_next = _lane_offset_line(
-        node, in_dir, prev_slot, spacing
-    )
-    outgoing_anchor, outgoing_next = _lane_offset_line(
-        node, out_dir, next_slot, spacing
-    )
+    incoming_anchor, incoming_next = _lane_offset_line(node, in_dir, prev_slot, spacing)
+    outgoing_anchor, outgoing_next = _lane_offset_line(node, out_dir, next_slot, spacing)
 
-    # Main -> Main is the actual Pole ownership point.
     if prev_slot == 0 and next_slot == 0:
         return [QgsPointXY(node)]
 
-    # HARD INVARIANT: slot 0 is the physically occupied Main Lane.  A corner
-    # may never be placed on the approach side of that Pole.  When a cable
-    # changes between Main Lane and an offset lane, the physical Pole is always
-    # emitted first; only the subsequent lateral transition is allowed to move
-    # away from it.
+    # HARD INVARIANT: Main Lane slot 0 is the true physical Pole occupation
+    # point.  Offset geometry is allowed only after that point is reached.
     if prev_slot == 0 and next_slot != 0:
         _log(
             f"[pole-first] MAIN_REACH: pole={_corner_debug_point(node)}; "
@@ -667,19 +625,13 @@ def _unified_lane_corner(node, in_a, in_b, out_a, out_b, prev_slot, next_slot, s
         outgoing_anchor, outgoing_next,
     )
 
-    # A real offset-line intersection is the cleanest corner for a transition
-    # that does not involve Main Lane ownership.  Do not impose a small
-    # arbitrary run; the distance is determined by the two lane lines.
     if hit is not None:
         distance = hypot(hit.x() - node.x(), hit.y() - node.y())
         max_reasonable = max(4.0 * float(spacing) * max(1, abs(prev_slot), abs(next_slot)), 2.0)
         if distance <= max_reasonable:
             return [hit]
 
-    # Parallel / near-parallel / distant intersection: direct bevel between
-    # the two true lane anchors.  These anchors differ only laterally from the
-    # Pole, so this fallback cannot create a longitudinal dog-leg.
-    if hypot(incoming_anchor.x() - outgoing_anchor.x(), incoming_anchor.y() - outgoing_anchor.y()) > 1e-7:
+    if hypot(incoming_anchor.x() - outgoing_anchor.x(), incoming_anchor.y() - outgoing_anchor.y()) > POLE_FIRST_EPS_M:
         return [incoming_anchor, outgoing_anchor]
     return [incoming_anchor]
 
@@ -716,10 +668,14 @@ def _build_corner_geometry(node, in_edge, out_edge, prev_slot, next_slot, spacin
     else:
         points = _same_lane_corner(node, in_a, in_b, out_a, out_b, prev_slot, spacing)
 
-    # Hard geometry guard: an ordinary corner must never collapse to the
-    # physical Pole unless it is the actual Main Lane ownership point.
-    if decision != CORNER_SAME_LANE_TURN or int(prev_slot) != 0 or int(next_slot) != 0:
-        filtered = [p for p in points if hypot(p.x() - node.x(), p.y() - node.y()) > POLE_FIRST_EPS_M]
+    # Preserve the physical Pole whenever the cable transitions to/from Main
+    # Lane.  Only corners entirely on non-zero Lanes use the old anti-collapse
+    # filtering.  Main-Lane ownership is a stronger invariant than offset join.
+    if int(prev_slot) != 0 and int(next_slot) != 0:
+        filtered = [
+            p for p in points
+            if hypot(p.x() - node.x(), p.y() - node.y()) > POLE_FIRST_EPS_M
+        ]
         if filtered:
             points = filtered
 
@@ -735,9 +691,6 @@ def _edge_points_work(edge):
     return _WORK_EDGE_POINTS.get(edge, _base._edge_points(edge))
 
 
-# Populated only for the duration of one geometry build.  It avoids repeatedly
-# transforming the same immutable edge endpoints and, more importantly, makes
-# it impossible for a work-CRS node to be compared with a source-CRS edge.
 _WORK_EDGE_POINTS = {}
 
 
