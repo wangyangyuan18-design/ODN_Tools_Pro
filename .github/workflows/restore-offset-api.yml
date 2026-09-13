@@ -1,0 +1,74 @@
+name: Restore offset API
+on:
+  push:
+    branches: [fix/restore-offset-api]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore compatibility entry point
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('cable_offset_core.py')
+          text = p.read_text(encoding='utf-8')
+          if 'def apply_offset_layout(' not in text:
+              text += r'''
+
+
+def apply_offset_layout(
+    designs,
+    distribution_layer,
+    edge_layer,
+    spacing=DEFAULT_SPACING_M,
+    control_distance_m=DEFAULT_CONTROL_M,
+    fat_layer=None,
+    fat_max_distance_m=DEFAULT_FAT_MAX_DISTANCE_M,
+):
+    """Compatibility entry point for Link Design's authoritative Offset Core."""
+    spacing = max(0.01, float(spacing))
+    control_distance_m = max(0.01, float(control_distance_m))
+    save_settings(spacing, control_distance_m)
+    result = build_offset_designs(
+        designs,
+        distribution_layer,
+        fat_layer=fat_layer,
+        edge_layer=edge_layer,
+    )
+    stats = result.get('fat_stats') or {}
+    return {
+        'changed_designs': len(result.get('designs') or []),
+        'changed_indices': list(range(len(result.get('designs') or []))),
+        'spacing_m': spacing,
+        'extra_length_m': 0.0,
+        'version': 26,
+        'work_crs': result.get('work_crs').authid() if result.get('work_crs') else '',
+        'lane_allocator': 'OffsetCore',
+        'priority': result.get('ordered') or [],
+        'slot_map': {str(k): int(v) for k, v in (result.get('slots') or {}).items()},
+        'corner_geometry': 'route_lane_corner_decision_D_E_F',
+        'corner_decisions': {},
+        'fanout_control_distance_m': control_distance_m,
+        'fat_moves': result.get('moves') or {},
+        'fat_total': int(stats.get('total', 0)),
+        'fat_skipped': int(stats.get('skipped', 0)),
+        'fat_corner': int(stats.get('corner', 0)),
+        'fat_straight': int(stats.get('straight', 0)),
+        'fat_endpoint_updates': int(result.get('touched', 0)),
+        'fat_max_distance_m': float(fat_max_distance_m),
+    }
+'''
+              p.write_text(text, encoding='utf-8')
+          Path('.github/workflows/restore-offset-api.yml').unlink(missing_ok=True)
+          PY
+      - name: Commit compatibility fix
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add cable_offset_core.py .github/workflows/restore-offset-api.yml
+          git commit -m "fix: restore offset layout compatibility entry point"
+          git push
