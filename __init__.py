@@ -3,6 +3,62 @@
 import os
 
 
+def _install_offset_core_compatibility():
+    """Restore the public Offset Core entry point used by Link Design.
+
+    The authoritative geometry remains in cable_offset_core.build_offset_designs().
+    This shim only restores the historical apply_offset_layout() API; it does not
+    introduce another geometry engine or alter lane/corner rules.
+    """
+    from . import cable_offset_core as offset_core
+
+    if hasattr(offset_core, "apply_offset_layout"):
+        return
+
+    def apply_offset_layout(
+        designs,
+        distribution_layer,
+        edge_layer,
+        spacing=offset_core.DEFAULT_SPACING_M,
+        control_distance_m=offset_core.DEFAULT_CONTROL_M,
+        fat_layer=None,
+        fat_max_distance_m=offset_core.DEFAULT_FAT_MAX_DISTANCE_M,
+    ):
+        spacing = max(0.01, float(spacing))
+        control_distance_m = max(0.01, float(control_distance_m))
+        offset_core.save_settings(spacing, control_distance_m)
+        result = offset_core.build_offset_designs(
+            designs,
+            distribution_layer,
+            fat_layer=fat_layer,
+            edge_layer=edge_layer,
+        )
+        stats = result.get("fat_stats") or {}
+        return {
+            "changed_designs": len(result.get("designs") or []),
+            "changed_indices": list(range(len(result.get("designs") or []))),
+            "spacing_m": spacing,
+            "extra_length_m": 0.0,
+            "version": 26,
+            "work_crs": result.get("work_crs").authid() if result.get("work_crs") else "",
+            "lane_allocator": "OffsetCore",
+            "priority": result.get("ordered") or [],
+            "slot_map": {str(k): int(v) for k, v in (result.get("slots") or {}).items()},
+            "corner_geometry": "route_lane_corner_decision_D_E_F",
+            "corner_decisions": {},
+            "fanout_control_distance_m": control_distance_m,
+            "fat_moves": result.get("moves") or {},
+            "fat_total": int(stats.get("total", 0)),
+            "fat_skipped": int(stats.get("skipped", 0)),
+            "fat_corner": int(stats.get("corner", 0)),
+            "fat_straight": int(stats.get("straight", 0)),
+            "fat_endpoint_updates": int(result.get("touched", 0)),
+            "fat_max_distance_m": float(fat_max_distance_m),
+        }
+
+    offset_core.apply_offset_layout = apply_offset_layout
+
+
 def classFactory(iface):
     from qgis.PyQt.QtGui import QIcon
     from qgis.PyQt.QtWidgets import QAction, QMenu
@@ -14,6 +70,10 @@ def classFactory(iface):
     from .odn_project_validation import install_validation_page
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
+
+    # Must run before link_design_core imports cable_offset_core.apply_offset_layout.
+    _install_offset_core_compatibility()
+
     from .link_design import LinkDesignDock
     from .fat_return import install_fat_return_button
     from .link_design_features import install_link_design_feature_buttons
