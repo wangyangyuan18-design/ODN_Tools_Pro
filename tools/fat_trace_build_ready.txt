@@ -1,1 +1,2 @@
 Final FAT trace source is implemented in cable_offset_core.py; this file intentionally triggers the standard plugin build from the patched source commit.
+Cross-segment FAT corner fix landed in 7cb87d0; build must validate that source commit and its successor.
