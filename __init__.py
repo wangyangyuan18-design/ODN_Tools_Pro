@@ -3,6 +3,47 @@
 import os
 
 
+def _install_coordinate_transform_compatibility():
+    """Guard Offset Core against projected coordinates mislabeled as geographic.
+
+    Link Design route points are stored in the Pole Edge CRS.  If a historical
+    layer/design reports EPSG:4326 while the actual coordinates are projected
+    metres (for example 550306, 9233979), QGIS rejects the transform before
+    Offset Core can run.  When the target CRS is a valid projected metre CRS,
+    use that target as the source CRS for this clearly invalid geographic
+    coordinate.  Normal geographic coordinates and all valid transforms are
+    untouched.
+    """
+    from qgis.core import QgsUnitTypes
+    from . import cable_offset_layout as offset_layout
+
+    if getattr(offset_layout, "_odn_coordinate_guard_installed", False):
+        return
+
+    original_transform_point = offset_layout._transform_point
+
+    def guarded_transform_point(point, source_crs, target_crs):
+        try:
+            x = float(point.x())
+            y = float(point.y())
+            if (
+                source_crs.isGeographic()
+                and (abs(x) > 180.0 or abs(y) > 90.0)
+                and target_crs.isValid()
+                and not target_crs.isGeographic()
+                and target_crs.mapUnits() == QgsUnitTypes.DistanceMeters
+            ):
+                # The coordinate is already in the projected target CRS.
+                # Do not feed UTM metres into an EPSG:4326 -> UTM transform.
+                return original_transform_point(point, target_crs, target_crs)
+        except Exception:
+            pass
+        return original_transform_point(point, source_crs, target_crs)
+
+    offset_layout._transform_point = guarded_transform_point
+    offset_layout._odn_coordinate_guard_installed = True
+
+
 def _install_offset_core_compatibility():
     """Restore the public Offset Core entry point used by Link Design.
 
@@ -71,6 +112,8 @@ def classFactory(iface):
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
 
+    # Install the coordinate guard before cable_offset_core is imported.
+    _install_coordinate_transform_compatibility()
     # Must run before link_design_core imports cable_offset_core.apply_offset_layout.
     _install_offset_core_compatibility()
 
